@@ -1,0 +1,1092 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, replace
+from email.message import Message
+from hashlib import sha256
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import ipaddress
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+from struct import unpack_from
+from threading import Lock, Timer
+from urllib.parse import parse_qs, quote, urlsplit
+from uuid import uuid4
+import webbrowser
+
+import ezdxf
+from ezdxf.lldxf.validator import is_valid_layer_name
+
+from auto_run import AutoRunReadback
+from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_contours
+from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
+from cut_journal import MAX_EVENTS, CutJournal
+from cut_plan import EPSILON_MM, prepare_cut_plan
+from machine import PlotterError, Simulator, build_plan, number
+from nesting import MAX_PART_NUMBER, NestingFitError, identify_parts, nest_paths
+from panel_diagnostics import compare_panel_samples
+from panel_readback import PanelReadback
+from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths
+from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
+
+
+ROOT = Path(__file__).resolve().parent
+PROFILE = ROOT.parent / "research" / "machine-profile.json"
+LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
+STAGING = ROOT / "staging"
+LOCAL_ADDRESS = "127.0.0.1"
+DEFAULT_PORT = 8765
+API_VERSION = 19
+CUT_TOOL = 4
+DEFAULT_FABRIC_WIDTH_MM = 1380
+ROLL_PASS_LENGTH_MM = 2450
+PREVIEW_PAGE_ADD_MM = 0.12
+WORKSPACE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "Plotter" / "workspace.json"
+MAX_JSON = 16 * 1024 * 1024
+MIME = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/simulation.js": ("simulation.js", "text/javascript; charset=utf-8"),
+}
+LOGGER = logging.getLogger("plotter")
+
+
+class RequestError(PlotterError):
+    def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(frozen=True)
+class RollRun:
+    plan_id: str
+    page: int
+    pages: int
+    first_page: int
+    feed_after_mm: float
+    state: str
+    completed_pages: int
+    points: int = 0
+    started_at: int | None = None
+    baseline_event: int | None = None
+
+    def snapshot(self):
+        next_page = self.page if self.state == "ready" else self.page + 1 if self.state == "advance" else None
+        return {"planId": self.plan_id, "page": self.page, "pages": self.pages, "firstPage": self.first_page,
+                "state": self.state,
+                "completedPages": self.completed_pages, "feedAfterMm": self.feed_after_mm, "nextPage": next_page}
+
+
+@dataclass(frozen=True)
+class CutProgress:
+    plan_id: str
+    filename: str
+    page: int
+    pages: int
+    first_page: int
+    points: int
+    start_x: float
+    end_x: float
+    state: str = "transferring"
+    receipt: str | None = None
+    started_at: int | None = None
+    ended_at: int | None = None
+    updated_at: int | None = None
+    index: int = 0
+    completed_pages: int = 0
+    fresh: bool = False
+    events: tuple = ()
+
+    def snapshot(self):
+        return {"planId": self.plan_id, "filename": self.filename, "page": self.page,
+                "pages": self.pages, "firstPage": self.first_page, "completedPages": self.completed_pages,
+                "index": self.index, "indexLimit": self.points, "state": self.state,
+                "startX": self.start_x, "endX": self.end_x, "fresh": self.fresh,
+                "startedAt": self.started_at, "endedAt": self.ended_at, "updatedAt": self.updated_at,
+                "events": list(self.events)}
+
+
+def drawing_key(job, filename, width, height, page_add, *, roll=False):
+    # A view or preferences save must not invalidate an unchanged drawing.
+    paths = [{"layer": path.get("layer", "0"), "closed": path.get("closed", False),
+              "points": [[float(x), float(y)] for x, y in path["points"]]} for path in job["paths"]]
+    optimize = job.get("optimize", True)
+    if roll or optimize:
+        for source, path in zip(job["paths"], paths):
+            part_number = source.get("partNumber")
+            if type(part_number) is int and 1 <= part_number <= MAX_PART_NUMBER:
+                path["partNumber"] = part_number
+    document = [filename, width, height, page_add, CUT_TOOL, paths, optimize]
+    if roll:
+        document.append(ROLL_PASS_LENGTH_MM)
+    return sha256(json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
+
+
+def translated_page_paths(page, max_x):
+    start_x = page["startX"]
+
+    def local_x(x):
+        local = x - start_x
+        # Subtraction at a late roll boundary can round just beyond the working span.
+        return max_x if max_x < local <= max_x + EPSILON_MM else local
+
+    return [{**path, "points": [[local_x(x), y] for x, y in path["points"]]} for path in page["paths"]]
+
+
+def describe_section_continuations(plan, job):
+    pages = plan["pages"]
+    part_spans = {}
+    seams_by_x = {}
+    for seam in plan["seams"]:
+        seams_by_x.setdefault(seam["x"], []).append(seam)
+    for position, page in enumerate(pages):
+        for path in page["paths"]:
+            index = path["index"]
+            part = job["paths"][index].get("partNumber")
+            key = ("part", part) if type(part) is int and 1 <= part <= MAX_PART_NUMBER else ("path", index)
+            span = part_spans.setdefault(key, [position, position])
+            span[1] = position
+
+    # A new session may begin only at a boundary that does not leave an unfinished part behind.
+    changes = [0] * (len(pages) + 1)
+    for first, last in part_spans.values():
+        if first != last:
+            changes[first + 1] += 1
+            changes[last + 1] -= 1
+    crossing = 0
+    for position, page in enumerate(pages):
+        crossing += changes[position]
+        page.update(canStart=crossing == 0, incomingSeams=seams_by_x.get(page["startX"], []),
+                    outgoingSeams=seams_by_x.get(page["endX"], []))
+    plan["hasContinuations"] = any(not page["canStart"] for page in pages)
+
+
+def encode_cut_section(page, width, height, page_add):
+    local_limit = width - max(page_add, COORDINATE_OFFSET_MM)
+    if local_limit + page_add > width:
+        local_limit = math.nextafter(local_limit, 0)
+    plan = build_plan({"paths": translated_page_paths(page, local_limit)}, width, height)
+    return prepare_single_page(plan, tool=CUT_TOOL, width=width, height=height, page_add_mm=page_add)
+
+
+def demo_drawing():
+    def contour(layer, points, closed=True):
+        return {"layer": layer, "points": points, "closed": closed}
+
+    return {
+        "filename": "Лекала · демонстрация.dxf",
+        "units": "mm",
+        "warnings": [],
+        "paths": [
+            contour("Контуры", [[0, 0], [580, 0], [588, 330], [595, 470], [618, 590], [640, 665], [597, 702],
+                                  [510, 763], [421, 808], [393, 773], [349, 742], [291, 731], [232, 742],
+                                  [183, 773], [158, 808], [70, 766], [-9, 710], [-58, 668], [-33, 590],
+                                  [-10, 466], [-4, 335]]),
+            contour("Контуры", [[760, 5], [1305, 5], [1311, 333], [1314, 475], [1339, 599], [1362, 666],
+                                  [1308, 713], [1234, 760], [1147, 805], [1111, 798], [1076, 785],
+                                  [1035, 779], [992, 785], [956, 798], [922, 805], [832, 759], [756, 713],
+                                  [704, 665], [729, 596], [753, 472], [756, 331]]),
+            contour("Контуры", [[1424, 620], [1886, 621], [1932, 747], [1964, 884], [1957, 950],
+                                  [1919, 1009], [1861, 1066], [1796, 1115], [1726, 1149], [1654, 1161],
+                                  [1585, 1147], [1511, 1110], [1442, 1058], [1393, 1006], [1355, 950],
+                                  [1349, 886], [1380, 748]]),
+            contour("Контуры", [[1424, 14], [1886, 14], [1932, 141], [1964, 276], [1957, 343],
+                                  [1919, 402], [1861, 458], [1796, 506], [1726, 540], [1654, 553],
+                                  [1585, 540], [1511, 503], [1442, 450], [1393, 397], [1355, 341],
+                                  [1349, 276], [1380, 140]]),
+            contour("Контуры", [[-16, 939], [659, 939], [659, 1101], [-16, 1101]]),
+            contour("Контуры", [[739, 939], [1041, 939], [1041, 1101], [739, 1101]]),
+            contour("Контуры", [[1101, 939], [1285, 939], [1285, 1101], [1101, 1101]]),
+            contour("Разметка", [[288, 126], [288, 647]], False),
+            contour("Разметка", [[1035, 126], [1035, 647]], False),
+            contour("Разметка", [[1654, 751], [1654, 1052]], False),
+            contour("Разметка", [[1654, 137], [1654, 443]], False),
+        ],
+    }
+
+
+def output_name(value):
+    if not isinstance(value, str):
+        value = "Раскрой"
+    name = re.split(r"[/\\]", value)[-1]
+    name = re.sub(r"\.(?:dxf|dwg)$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name)[:80].strip(" .")
+    if not name or re.fullmatch(r"(?i:con|prn|aux|nul|(?:com|lpt)[0-9¹²³])(?:\..*)?", name):
+        name = "Раскрой"
+    return f"{name}.dxf"
+
+
+def export_dxf(plan):
+    document = ezdxf.new("R2000", units=4)
+    document.encoding = "cp1251"
+    document.header["$MEASUREMENT"] = 1
+    modelspace = document.modelspace()
+    layers = {}
+    reserved = {name.casefold() for name in ("0", "Defpoints")}
+    for contour in plan.contours:
+        source = contour.layer
+        if source not in layers:
+            candidate = source if len(source) <= 100 and is_valid_layer_name(source) else "Контур"
+            if source != "0":
+                base = candidate
+                sequence = 1
+                while candidate.casefold() in reserved:
+                    sequence += 1
+                    candidate = f"{base}_{sequence}"
+                reserved.add(candidate.casefold())
+                document.layers.new(candidate)
+            layers[source] = candidate
+        attributes = {"layer": layers[source]}
+        if len(contour.points) == 2:
+            modelspace.add_line(*contour.points, dxfattribs=attributes)
+        else:
+            modelspace.add_lwpolyline(contour.points, format="xy", close=contour.closed, dxfattribs=attributes)
+    with io.StringIO() as output:
+        document.write(output)
+        return output.getvalue().encode(document.output_encoding, errors="dxfreplace")
+
+
+def single_page_xiao_settings(executable, machine_ip):
+    try:
+        data = executable.with_name("xparam.dat").read_bytes()
+        if len(data) != 3704:
+            return None
+        # Xiao 2022-09-18: prepared XY, paged X, one head, no page override/offsets.
+        expected = {2132: 1, 2444: 1, 2516: 0, 2532: 0, 3152: 0, 3524: CONTROLLER_PORT}
+        if any(unpack_from("<i", data, offset)[0] != value for offset, value in expected.items()):
+            return None
+        if unpack_from("<dd", data, 2476) != (0.0, 0.0):
+            return None
+        configured_ip = str(ipaddress.IPv4Address(bytes(unpack_from("<4i", data, 2092))))
+        if configured_ip != machine_ip:
+            return None
+        page_add = unpack_from("<d", data, 2540)[0]
+        return page_add if math.isfinite(page_add) and page_add >= 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+class PlotterServer(ThreadingHTTPServer):
+    def __init__(self, port, workspace_path=WORKSPACE_PATH):
+        profile = json.loads(PROFILE.read_text(encoding="utf-8"))
+        config = profile["observedComputerConfiguration"]
+        board = profile.get("observedControllerConfiguration", {})
+        bounds = board.get("workrectMm", config["workrectMm"])
+        width, height = bounds["x"], bounds["y"]
+        self.simulator = Simulator(width, height)
+        self.machine_ip = str(ipaddress.IPv4Address(config["machineIp"]))
+        self.xiao_path = Path(profile["software"]["path"])
+        self.workspace = WorkspaceStore(workspace_path)
+        self.workspace_lock = Lock()
+        self.upload_lock = Lock()
+        self.loaded_plan = None
+        self.roll = None
+        self.cut_progress = None
+        self.cut_journal = CutJournal(Path(workspace_path).with_name("cut-journal.json"))
+        self.controller = Controller(self.machine_ip, width, height,
+                                     upload_profile=lambda: single_page_xiao_settings(self.xiao_path, self.machine_ip),
+                                     z_travel=board.get("zTravelMm", 0),
+                                     auto_run_readback=AutoRunReadback.from_profile(board.get("autoRunReadback")),
+                                     manual_speed_readback=PanelReadback.from_profile(
+                                         board.get("manualSpeedReadback"), {"fastValue": "fast", "slowValue": "slow"}))
+        super().__init__((LOCAL_ADDRESS, port), Handler)
+        self.hosts = {f"{host}:{self.server_port}" for host in (LOCAL_ADDRESS, "localhost")}
+
+    @property
+    def default_fabric_width(self):
+        return min(DEFAULT_FABRIC_WIDTH_MM, self.simulator.height)
+
+    def status(self, simulation=None):
+        with self.workspace_lock:
+            cut_status = self.cut_status()
+        page_add = self.controller.upload_page_add()
+        return {
+            "mode": "controller",
+            "apiVersion": API_VERSION,
+            "nestingKeepsNotches": True,
+            "nestingPartRotation": True,
+            "pageRouteOptimization": True,
+            "prepareXiao": True,
+            **cut_status,
+            "machine": {
+                "ip": self.machine_ip,
+                "width": self.simulator.width,
+                "height": self.simulator.height,
+                "defaultFabricWidthMm": self.default_fabric_width,
+                "rollPassLengthMm": self.roll_pass_length(page_add),
+                "headCount": 1,
+                "directControl": True,
+                "directUpload": page_add is not None,
+                "directRoll": True,
+                "continuousRoll": True,
+                "liveCutProgress": True,
+                "stopDuringExternalRun": True,
+                "arbitraryNestRotation": True,
+                "optimizedNesting": True,
+                "verifiedJobUpload": True,
+                "persistentControl": True,
+                "coordinateMove": True,
+                "panelDiagnostics": True,
+                "actuators": self.controller.actuator_snapshot(),
+                "clampControl": True,
+                "independentClampControl": False,
+                "independentVacuumControl": True,
+                "autoRunReadback": self.controller.auto_run_readback is not None,
+                "uploadUncertain": self.controller.upload_uncertain,
+                "uploadInProgress": self.controller.upload_in_progress,
+                "controllerPort": CONTROLLER_PORT,
+                "holdLeaseMs": int(HOLD_LEASE_SECONDS * 1000),
+                "xiaoAvailable": self.xiao_path.is_file() or LOCALIZED_XIAO.is_file(),
+                "dwgAvailable": dwg_available(),
+            },
+            "simulation": simulation if simulation is not None else self.simulator.snapshot(),
+        }
+
+    def server_close(self):
+        self.controller.stop_active_hold()
+        super().server_close()
+
+    def roll_snapshot(self):
+        roll = self.roll
+        return roll.snapshot() if roll else None
+
+    def cut_status(self):
+        return {"roll": self.roll_snapshot(),
+                "cutProgress": self.cut_progress.snapshot() if self.cut_progress else None,
+                "cutJournal": self.cut_journal.snapshot()}
+
+    def record_cut_event(self, progress, kind, message):
+        event = self.cut_journal.record(progress.filename, progress.page, kind, message)
+        return replace(progress, events=(*progress.events, event)[-MAX_EVENTS:])
+
+    @staticmethod
+    def page_finished(page, result):
+        run = result.get("run", {})
+        return (
+            result.get("responded") is True and not result.get("busy") and result.get("position")
+            and not result.get("motionInhibited") and run.get("fresh") is True and run.get("state") == "completed"
+            and result.get("lastEvent", {}).get("code") not in ACTIVE_CONTROLLER_EVENTS
+            and type(page.started_at) is int and run.get("startedAt") == page.started_at
+            and type(run.get("endedAt")) is int and run["endedAt"] >= page.started_at
+            and run.get("completedPages") == 1
+            and (run.get("completedIndex") == page.points or type(run.get("index")) is int)
+            and run.get("indexLimit") == page.points
+        )
+
+    def observe_cut_progress(self, result):
+        progress = self.cut_progress
+        if not progress or progress.state == "transferring":
+            return
+        run = result.get("run", {})
+        state = run.get("state")
+        started_at = run.get("startedAt")
+        fresh = (result.get("responded") is True and not result.get("busy")
+                 and bool(result.get("position")) and run.get("fresh") is True)
+        if progress.state in ("completed", "advance", "cancelled"):
+            self.cut_progress = replace(progress, fresh=fresh, updated_at=run.get("updatedAt", progress.updated_at))
+            return
+
+        if progress.started_at is None and state != "idle":
+            if (type(started_at) is int and progress.receipt and
+                    run.get("startedReceipt") == progress.receipt):
+                progress = replace(progress, started_at=started_at)
+            elif self.roll and self.roll.state == "unknown" and progress.state == "ready":
+                progress = replace(progress, state="unknown")
+            elif progress.state == "ready" and fresh and result.get("jobReceipt") == progress.receipt:
+                self.cut_progress = replace(progress, fresh=True, updated_at=run.get("updatedAt"))
+                return
+        if progress.started_at is None or started_at != progress.started_at:
+            self.cut_progress = replace(progress, fresh=False)
+            return
+        if run.get("startedReceipt") not in (None, progress.receipt):
+            self.cut_progress = replace(progress, fresh=False)
+            return
+
+        index = run.get("completedIndex")
+        proof = progress.index
+        if fresh and run.get("indexLimit") == progress.points and type(index) is int and 0 <= index <= progress.points:
+            proof = max(proof, min(index, progress.points - 1))
+        progress = replace(progress, index=proof, fresh=fresh, updated_at=run.get("updatedAt"))
+        if fresh and state in ("running", "paused", "completed") and not any(
+                event["kind"] == "page_started" and event["page"] == progress.page for event in progress.events):
+            progress = self.record_cut_event(progress, "page_started", f"Начат рез прохода {progress.page}.")
+        if self.page_finished(progress, result):
+            complete = progress.page == progress.pages
+            progress = replace(progress, state="completed" if complete else "advance", index=progress.points,
+                               ended_at=run["endedAt"], completed_pages=progress.completed_pages + 1)
+            progress = self.record_cut_event(progress, "page_completed", f"Проход {progress.page} завершён.")
+            if complete:
+                message = f"Раскрой завершён. Проходов: {progress.completed_pages}."
+                progress = self.record_cut_event(progress, "cut_completed", message)
+        elif state == "cancelled":
+            progress = replace(progress, state=state, ended_at=run.get("endedAt"))
+            progress = self.record_cut_event(progress, "cut_cancelled", f"Рез прохода {progress.page} отменён.")
+        elif state in ("starting", "running", "pausing", "paused", "resuming", "feeding", "cancelling", "unknown", "error"):
+            if state in ("unknown", "error") and progress.state not in ("unknown", "error"):
+                progress = self.record_cut_event(
+                    progress, "cut_uncertain", f"Состояние реза прохода {progress.page} требует сверки на пульте.",
+                )
+            progress = replace(progress, state=state)
+        self.cut_progress = progress
+
+    def verify_roll_advance(self):
+        # Completion was already recorded before the operator moved the fabric.
+        # Check that the machine is still ready even if releasing the material reset the job index.
+        result = self.controller.read_live()
+        run = result.get("run", {})
+        if (result.get("responded") is not True or result.get("busy") or not result.get("position")
+                or result.get("motionInhibited") or result.get("externalMotion")
+                or run.get("fresh") is not True or run.get("state") not in ("idle", "ready", "completed", "cancelled")
+                or result.get("lastEvent", {}).get("code") in ACTIVE_CONTROLLER_EVENTS):
+            raise RequestError("Контроллер не подтвердил готовность к следующему проходу. Сверьте станок на пульте.",
+                               HTTPStatus.CONFLICT)
+
+    def bind_panel_run(self, roll, run):
+        receipt = run.get("startedReceipt")
+        started_at = run.get("startedAt")
+        if (run.get("startedFromPanel") is True and isinstance(receipt, str) and type(started_at) is int
+                and self.loaded_plan == (receipt, roll.plan_id, roll.page)):
+            self.loaded_plan = None
+            self.roll = replace(roll, state="running", started_at=started_at)
+        return self.roll
+
+    def observe_ready_roll(self, roll, result, run):
+        if not result.get("responded") or result.get("busy") or not run.get("fresh"):
+            return roll
+        adopted = self.bind_panel_run(roll, run)
+        if adopted is not roll:
+            return adopted
+
+        event = result.get("lastEvent", {}).get("code")
+        index = result.get("currentIndex")
+        has_progress = result.get("indexLimit") == roll.points and type(index) is int and index > 0
+        new_completion = event == 4 and roll.baseline_event not in (None, 4)
+        if event in (3, 9) or has_progress or new_completion:
+            self.loaded_plan = None
+            self.roll = replace(roll, state="unknown")
+        elif type(event) is int and event not in ACTIVE_CONTROLLER_EVENTS and event != roll.baseline_event:
+            self.roll = replace(roll, baseline_event=event)
+        return self.roll
+
+    def observe_roll(self, result):
+        roll = self.roll
+        if roll is None:
+            return
+        run = result.get("run", {})
+        if roll.state == "ready":
+            roll = self.observe_ready_roll(roll, result, run)
+        if (roll.state not in ("running", "unknown") or type(roll.started_at) is not int
+                or run.get("startedAt") != roll.started_at):
+            return
+        if self.page_finished(roll, result):
+            state = "completed" if roll.page == roll.pages else "advance"
+            self.roll = replace(roll, state=state, completed_pages=roll.completed_pages + 1)
+        elif roll.state == "unknown" and run.get("fresh") and run.get("state") in ("running", "paused", "feeding"):
+            self.roll = replace(roll, state="running")
+        elif run.get("state") in ("cancelled", "unknown", "error"):
+            state = "cancelled" if run["state"] == "cancelled" else "unknown"
+            if roll.state != state:
+                self.roll = replace(roll, state=state)
+
+    def verify_ready_roll(self):
+        result = self.controller.read_live()
+        self.observe_roll(result)
+        if (self.roll.state != "ready" or result.get("responded") is not True or result.get("busy")
+                or not result.get("position") or result.get("motionInhibited")
+                or not result.get("run", {}).get("fresh")
+                or result.get("lastEvent", {}).get("code") in ACTIVE_CONTROLLER_EVENTS):
+            raise RequestError("Контроллер не подтвердил готовность текущего прохода. Проверьте станок на пульте.",
+                               HTTPStatus.CONFLICT)
+
+    def read_live(self):
+        expected_roll = self.roll
+        expected_progress = self.cut_progress
+        result = self.controller.read_live()
+        with self.workspace_lock:
+            if self.roll is expected_roll:
+                self.observe_roll(result)
+            if self.cut_progress is expected_progress:
+                self.observe_cut_progress(result)
+                progress = self.cut_progress
+                if (result.get("position") and not result.get("busy") and progress and progress.fresh and progress.state in
+                        ("ready", "starting", "running", "pausing", "paused", "resuming", "cancelling")):
+                    position = result["position"]
+                    result["drawingPosition"] = {
+                        "planId": progress.plan_id, "page": progress.page,
+                        "x": progress.start_x + position["x"] - COORDINATE_OFFSET_MM,
+                        "y": position["y"] - COORDINATE_OFFSET_MM,
+                    }
+            result.update(self.cut_status())
+        return result
+
+    def reset_roll(self, data):
+        if data.get("stopped") is not True:
+            raise RequestError("Подтвердите остановку станка на штатном пульте.")
+        self.controller.require_control(data.get("controlToken"))
+        with self.upload_lock, self.workspace_lock:
+            self.controller.require_coordinate_move_idle()
+            roll = self.roll
+            if not roll or data.get("planId") != roll.plan_id:
+                raise RequestError("Рулонное задание изменилось.", HTTPStatus.CONFLICT)
+            result = self.controller.read_live()
+            self.observe_roll(result)
+            run = result.get("run", {})
+            transfer_error = run.get("state") == "error" and run.get("startedAt") is None
+            if (not result.get("responded") or result.get("busy") or not result.get("position")
+                    or result.get("motionInhibited") or not run.get("fresh")
+                    or (not transfer_error and run.get("state") not in ("idle", "ready", "completed", "cancelled"))
+                    or result.get("lastEvent", {}).get("code") in ACTIVE_CONTROLLER_EVENTS):
+                raise RequestError("Контроллер не подтвердил остановку. Сверьте состояние станка на пульте.")
+            self.controller.require_control(data.get("controlToken"))
+            self.roll = None
+            self.loaded_plan = None
+            self.cut_progress = None
+            return self.cut_status()
+
+    def plan(self, job):
+        position = self.simulator.snapshot()
+        return build_plan(job, self.simulator.width, self.simulator.height, (position["x"], position["y"]))
+
+    @staticmethod
+    def workspace_drawing(draft):
+        if draft is None:
+            raise RequestError("Сохраните текущую раскладку перед загрузкой.", HTTPStatus.CONFLICT)
+        excluded = set(draft["excluded"])
+        optimization = draft["optimization"]
+        job = {
+            "paths": [path for index, path in enumerate(draft["paths"]) if index not in excluded],
+            "optimize": optimization.get("routeApplied", True),
+        }
+        nesting = optimization.get("nesting")
+        if nesting is not None:
+            if nesting["widthMm"] is not None:
+                job["materialWidthMm"] = nesting["widthMm"]
+            job["materialMarginMm"] = nesting["marginMm"]
+        return job, draft["source"]["filename"]
+
+    def save_workspace(self, revision, draft):
+        with self.workspace_lock:
+            result = self.workspace.write(revision, draft)
+            if self.loaded_plan is not None:
+                current = None
+                if result["workspace"] is not None:
+                    job, filename = self.workspace_drawing(result["workspace"])
+                    current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
+                                          self.controller.upload_page_add(), roll=self.roll is not None)
+                if current != self.loaded_plan[1]:
+                    self.loaded_plan = None
+            return result
+
+    def cut_plan(self, job, filename, page_add=None, *, encoded_pages=None):
+        if not isinstance(filename, str) or not filename or len(filename) > 255:
+            raise RequestError("Укажите имя текущего чертежа.")
+        width, height = self.simulator.width, self.simulator.height
+        plan = prepare_cut_plan(job, width, height, PREVIEW_PAGE_ADD_MM if page_add is None else page_add,
+                                roll_pass_length_mm=ROLL_PASS_LENGTH_MM)
+        plan["planId"] = drawing_key(job, filename, width, height, page_add, roll=plan["mode"] == "roll")
+        plan["filename"] = filename
+        plan["tool"] = CUT_TOOL
+        plan["canPrepareXiao"] = bool(plan["pages"]) and not plan["issues"]
+        plan["canUpload"] = False
+        describe_section_continuations(plan, job)
+        if page_add is None or not plan["canPrepareXiao"]:
+            return plan
+        for page in plan["pages"]:
+            if not page["paths"]:
+                plan["uploadIssue"] = (f"На проходе {page['number']} нет резов. Сдвиньте детали ближе к началу "
+                                       "раскладки или откройте раскладку в Xiao.")
+                return plan
+            try:
+                encoded = encode_cut_section(page, width, height, page_add)
+            except (PlotterError, JobEncodingError) as error:
+                plan["uploadIssue"] = f"Проход {page['number']} нельзя загрузить. {error}"
+                return plan
+            page["pathEndIndices"] = list(encoded[0].path_end_indices)
+            if encoded_pages is not None:
+                encoded_pages.append(encoded)
+        plan["canUpload"] = True
+        return plan
+
+    def prepare_xiao(self, plan_id):
+        if not isinstance(plan_id, str) or re.fullmatch(r"[0-9a-f]{64}", plan_id) is None:
+            raise RequestError("Сначала подготовьте раскладку для Xiao.")
+        page_add = self.controller.upload_page_add()
+        with self.workspace_lock:
+            source, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            preview = self.cut_plan(source, filename, page_add)
+            if preview["planId"] != plan_id:
+                raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
+            if not preview["canPrepareXiao"]:
+                message = preview["issues"][0]["message"] if preview["issues"] else "В раскладке нет контуров."
+                raise RequestError(message)
+
+        # Xiao calculates its own section boundaries. Give it unbroken paths
+        # whenever a browser section would split a contour.
+        paths = source["paths"] if preview["seams"] else [
+            path for page in preview["pages"] for path in page["paths"]
+        ]
+        width = max(self.simulator.width, preview["bounds"]["maxX"])
+        plan = build_plan({"paths": paths}, width, self.simulator.height)
+        return output_name(filename), export_dxf(plan)
+
+    def roll_pass_length(self, page_add):
+        allowance = PREVIEW_PAGE_ADD_MM if page_add is None else page_add
+        return min(ROLL_PASS_LENGTH_MM, self.simulator.width - max(allowance, COORDINATE_OFFSET_MM))
+
+    def nest(self, data):
+        requested_width = data.get("widthMm")
+        width = self.default_fabric_width if requested_width is None else number(
+            requested_width, "Ширина полотна, мм", 1, self.simulator.height,
+        )
+        gap = number(data.get("gapMm", 10), "Зазор между деталями, мм", 0, 100)
+        margin = number(data.get("marginMm", 10), "Отступ от края, мм", 0, 100)
+        return nest_paths(
+            data.get("paths"), width_mm=width, gap_mm=gap, margin_mm=margin, rotation=data.get("rotation", "none"),
+            page_length_mm=self.roll_pass_length(self.controller.upload_page_add()),
+        )
+
+    def upload(self, data):
+        if not self.upload_lock.acquire(blocking=False):
+            raise RequestError("Дождитесь завершения передачи задания.", HTTPStatus.CONFLICT)
+        try:
+            self.controller.require_coordinate_move_idle()
+            return self.upload_page(data)
+        finally:
+            self.upload_lock.release()
+
+    def upload_page(self, data):
+        control_token = data.get("controlToken")
+        self.controller.require_control(control_token)
+        auto_run_off = data.get("autoRunOff")
+        if self.controller.auto_run_readback is None and auto_run_off is not True:
+            raise RequestError("Перед загрузкой подтвердите, что Auto Run выключен на штатном пульте.")
+        page_add = self.controller.upload_page_add()
+        if page_add is None:
+            raise RequestError("Сохранённый профиль Xiao не подходит для прямой передачи одного листа.")
+        with self.workspace_lock:
+            source, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            encoded_pages = []
+            preview = self.cut_plan(source, filename, page_add, encoded_pages=encoded_pages)
+            if preview["planId"] != data.get("planId"):
+                raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
+            if preview["issues"]:
+                raise RequestError(preview["issues"][0]["message"])
+            if not preview["canUpload"]:
+                raise RequestError(preview.get("uploadIssue", "Раскладка недоступна для прямой загрузки."))
+            page_number = data.get("page", 1)
+            if type(page_number) is not int or not 1 <= page_number <= len(preview["pages"]):
+                raise RequestError("Выберите допустимый проход раскладки.")
+            page = preview["pages"][page_number - 1]
+            is_roll = preview["mode"] == "roll"
+            previous = self.roll
+            if previous and (not is_roll or previous.plan_id != preview["planId"]):
+                raise RequestError("Сначала завершите или сбросьте предыдущее рулонное задание.", HTTPStatus.CONFLICT)
+            if previous is None and not page["canStart"]:
+                raise RequestError("Этот проход продолжает деталь с предыдущих проходов. Начните с прохода, "
+                                   "на котором деталь ещё не начата.", HTTPStatus.CONFLICT)
+            if previous is None and page_number != 1 and data.get("advanceConfirmed") is not True:
+                raise RequestError("Подтвердите положение начала выбранного прохода на станке.", HTTPStatus.CONFLICT)
+            if previous and previous.snapshot()["nextPage"] != page_number:
+                raise RequestError("Этот проход пока недоступен. Проверьте ход рулонного задания.", HTTPStatus.CONFLICT)
+            if preview["hasContinuations"] and data.get("advanceConfirmed") is not True:
+                raise RequestError("Подтвердите положение начала прохода у нуля станка.")
+            if previous and previous.state == "advance":
+                if data.get("advanceConfirmed") is not True:
+                    raise RequestError("Подтвердите протяжку ткани и положение рабочего нуля.")
+                self.verify_roll_advance()
+            elif previous:
+                self.verify_ready_roll()
+                previous = self.roll
+            job, finish = encoded_pages[page_number - 1]
+            self.loaded_plan = None
+            previous_progress = self.cut_progress
+            first_page = previous.first_page if previous else page_number
+            completed_pages = previous.completed_pages if previous else 0
+            previous_events = previous_progress.events if previous and previous_progress else ()
+            self.cut_progress = CutProgress(preview["planId"], filename, page_number, len(preview["pages"]),
+                                            first_page, job.point_count, page["startX"], page["endX"],
+                                            completed_pages=completed_pages, events=previous_events)
+            if is_roll:
+                self.roll = RollRun(preview["planId"], page_number, len(preview["pages"]), first_page,
+                                    page["feedAfterMm"], "transferring", completed_pages, job.point_count)
+        try:
+            result = self.controller.upload_job(job, finish, page_add, control_token=control_token, filename=filename,
+                                                auto_run_off=auto_run_off)
+        except ValueError:
+            with self.workspace_lock:
+                if is_roll:
+                    self.roll = replace(self.roll, state="unknown") if self.controller.upload_uncertain else previous
+                self.cut_progress = replace(self.cut_progress, state="unknown") if self.controller.upload_uncertain else previous_progress
+            raise
+        except Exception:
+            with self.workspace_lock:
+                if is_roll:
+                    self.roll = replace(self.roll, state="unknown")
+                self.cut_progress = replace(self.cut_progress, state="unknown")
+            raise
+        LOGGER.info("Передача листа: %s, подтверждено точек %s, завершение отправлено %s",
+                    result["phase"], result["points"], result["commitSent"])
+        with self.workspace_lock:
+            if result.get("jobReceipt"):
+                self.loaded_plan = (result["jobReceipt"], preview["planId"], page_number)
+                self.cut_progress = replace(self.cut_progress, receipt=result["jobReceipt"], state="ready")
+                self.cut_progress = self.record_cut_event(
+                    self.cut_progress, "page_ready", f"Проход {page_number} загружен.",
+                )
+            elif result.get("uploadUncertain"):
+                self.cut_progress = replace(self.cut_progress, state="unknown")
+            else:
+                self.cut_progress = previous_progress
+            if is_roll:
+                if result.get("jobReceipt"):
+                    self.roll = replace(self.roll, state="ready", baseline_event=result.get("baselineEvent", {}).get("code"))
+                elif result.get("uploadUncertain"):
+                    self.roll = replace(self.roll, state="unknown")
+                else:
+                    self.roll = previous
+            result.update(filename=filename, planId=preview["planId"], page=page_number, **self.cut_status())
+        return result
+
+    def operate(self, data):
+        action, token = data.get("action"), data.get("controlToken")
+        if action in ("cut", "range", "pause-cut", "resume-cut", "acknowledge-run"):
+            self.controller.require_control(token)
+        args = (action, data.get("token"), data.get("ready"), data.get("jobConfirmed"), data.get("recoverUpload"), token)
+        kwargs = {"job_receipt": data.get("jobReceipt"), "job_verified": data.get("jobVerified")}
+        if action == "move-to":
+            if not self.upload_lock.acquire(blocking=False):
+                raise RequestError("Дождитесь завершения передачи задания.", HTTPStatus.CONFLICT)
+            try:
+                result = self.controller.operate(*args, **kwargs, x=data.get("x"), y=data.get("y"))
+            finally:
+                self.upload_lock.release()
+            with self.workspace_lock:
+                result.update(self.cut_status())
+            return result
+        if action not in ("cut", "range"):
+            if action == "cancel-cut":
+                kwargs["confirmed_stop"] = True
+            result = self.controller.operate(*args, **kwargs)
+            with self.workspace_lock:
+                if action == "cancel-cut" and result.get("sent") and self.roll and self.roll.state == "ready":
+                    roll = self.roll
+                    if self.bind_panel_run(roll, result.get("run", {})) is roll:
+                        self.roll = replace(roll, state="unknown")
+                        self.loaded_plan = None
+                self.observe_cut_progress(result)
+                result.update(self.cut_status())
+            return result
+        if action == "cut" and data.get("jobVerified") is not True:
+            raise RequestError("Сверьте загруженный чертёж на штатном пульте.")
+        with self.workspace_lock:
+            job, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            roll = self.roll
+            page_number = roll.page if roll else 1
+            current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
+                                  self.controller.upload_page_add(), roll=roll is not None)
+            if (self.loaded_plan != (data.get("jobReceipt"), current, page_number) or data.get("planId") != current
+                    or roll and (roll.state != "ready" or roll.plan_id != current)):
+                raise RequestError("Текущая раскладка ещё не загружена на станок.", HTTPStatus.CONFLICT)
+            if roll and action == "cut":
+                self.verify_ready_roll()
+                roll = self.roll
+            result = self.controller.operate(*args, **kwargs)
+            if action == "cut" and result.get("sent") and self.cut_progress:
+                started_at = result.get("run", {}).get("startedAt")
+                self.cut_progress = replace(self.cut_progress, state="starting" if type(started_at) is int else "unknown",
+                                            started_at=started_at, fresh=False)
+            if roll and action == "cut" and result.get("sent"):
+                started_at = result.get("run", {}).get("startedAt")
+                self.roll = replace(roll, state="running" if type(started_at) is int else "unknown", started_at=started_at)
+                self.loaded_plan = None
+            result.update(self.cut_status())
+            return result
+
+    def reachability(self):
+        is_windows = os.name == "nt"
+        arguments = ["ping.exe", "-n", "1", "-w", "850"] if is_windows else ["ping", "-c", "1", "-W", "1"]
+        try:
+            process = subprocess.run(
+                [*arguments, self.machine_ip], capture_output=True, timeout=2.5,
+                creationflags=subprocess.CREATE_NO_WINDOW if is_windows else 0,
+            )
+            reachable = bool(re.search(rb"\bttl[= ]\s*\d+", process.stdout, re.I))
+            message = "Сетевой узел ответил на ping." if reachable else "Ответ на ping не получен."
+        except (OSError, subprocess.TimeoutExpired):
+            reachable = False
+            message = "Проверка ping недоступна или истекло время ожидания."
+        return {"reachable": reachable, "ip": self.machine_ip, "message": message}
+
+class Handler(BaseHTTPRequestHandler):
+    server: PlotterServer
+    server_version = "Plotter/1.0"
+    sys_version = ""
+
+    def setup(self):
+        self.request.settimeout(30)
+        super().setup()
+
+    def do_GET(self):
+        self.dispatch(self.get)
+
+    def do_POST(self):
+        self.dispatch(self.post)
+
+    def dispatch(self, route):
+        try:
+            host = self.headers.get("Host", "").lower()
+            origin = self.headers.get("Origin")
+            if host not in self.server.hosts or (origin and origin != f"http://{host}"):
+                raise RequestError("Приложение принимает запросы с локального адреса.", HTTPStatus.FORBIDDEN)
+            result = urlsplit(self.path)
+            if result.netloc or result.scheme or not self.path.startswith("/"):
+                raise RequestError("Недопустимый адрес запроса.")
+            route(result.path, result.query)
+        except RequestError as error:
+            self.json_response({"error": str(error)}, error.status)
+        except WorkspaceConflict as error:
+            self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
+        except NestingFitError as error:
+            self.json_response({
+                "error": str(error), "indices": error.indices,
+                "usableWidthMm": error.usable_width_mm,
+                "minimumPartWidthMm": error.minimum_part_width_mm,
+                "minimumWidthMm": error.minimum_width_mm,
+                "quarterTurnMinimumWidthMm": error.quarter_turn_minimum_width_mm,
+                "quarterTurnFits": error.quarter_turn_fits,
+                "blockedPartCount": error.blocked_part_count,
+            }, HTTPStatus.UNPROCESSABLE_ENTITY)
+        except ValueError as error:
+            self.json_response({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+        except Exception:
+            LOGGER.exception("Ошибка обработки %s", self.path)
+            self.json_response({"error": "Ошибка локального сервера. Подробности в журнале запуска."}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def get(self, path, query):
+        if path in MIME:
+            name, content_type = MIME[path]
+            self.respond((ROOT / "static" / name).read_bytes(), content_type)
+        elif path == "/api/status":
+            self.json_response(self.server.status())
+        elif path == "/api/demo":
+            self.json_response(demo_drawing())
+        elif path == "/api/workspace":
+            self.json_response(self.server.workspace.read())
+        elif path == "/api/reachability":
+            self.json_response(self.server.reachability())
+        else:
+            raise RequestError("Страница не найдена.", HTTPStatus.NOT_FOUND)
+
+    def post(self, path, query):
+        if path == "/api/import":
+            name = parse_qs(query, max_num_fields=4).get("filename", [""])[0]
+            if not name or len(name) > 255 or re.search(r"[/\\\x00-\x1f]", name):
+                raise RequestError("Передайте имя файла DXF или DWG.")
+            data = self.body(MAX_FILE_BYTES, "application/octet-stream")
+            self.json_response(import_drawing(data, name))
+        elif path == "/api/close-contours":
+            data = self.json_body(MAX_WORKSPACE_BYTES)
+            paths = drawing_paths(data.get("paths"))
+            excluded = excluded_paths(data.get("excluded", []), len(paths))
+            repaired = repair_closed_contours(paths, excluded, bridge_small_gaps=True)
+            self.json_response({"paths": repaired.paths, "closedCount": repaired.closed_count,
+                                "sources": repaired.sources, "excluded": repaired.excluded})
+        elif path == "/api/prepare-xiao":
+            data = self.json_body(16 * 1024)
+            open_in_xiao = data.get("openInXiao", False)
+            if type(open_in_xiao) is not bool:
+                raise RequestError("Укажите, нужно ли открыть подготовленный DXF в Xiao.")
+            filename, contents = self.server.prepare_xiao(data.get("planId"))
+            if open_in_xiao:
+                staged = self.stage(filename, contents)
+                self.json_response({"filename": staged.name, "path": str(staged), **self.open_in_xiao(staged)})
+            else:
+                self.respond(contents, "application/dxf", filename=filename)
+        elif path == "/api/roll-reset":
+            self.json_response(self.server.reset_roll(self.json_body(16 * 1024)))
+        elif path in ("/api/workspace", "/api/cut-plan", "/api/nest", "/api/nest-parts", "/api/command", "/api/plan", "/api/export", "/api/stage", "/api/reveal", "/api/open-in-xiao",
+                      "/api/controller", "/api/controller-position", "/api/controller-job",
+                      "/api/controller-hold", "/api/controller-operation", "/api/controller-feed-mode",
+                      "/api/controller-upload", "/api/controller-live", "/api/control-session",
+                      "/api/panel-snapshot", "/api/panel-compare"):
+            limit = MAX_WORKSPACE_BYTES if path in ("/api/workspace", "/api/cut-plan", "/api/nest", "/api/nest-parts") else MAX_JSON
+            if path in ("/api/panel-snapshot", "/api/panel-compare"):
+                limit = 16 * 1024
+            data = self.json_body(limit)
+            if path == "/api/workspace":
+                self.json_response(self.server.save_workspace(data.get("revision"), data.get("workspace")))
+            elif path == "/api/cut-plan":
+                self.json_response(self.server.cut_plan(data.get("job"), data.get("filename"), self.server.controller.upload_page_add()))
+            elif path == "/api/nest":
+                self.json_response(self.server.nest(data))
+            elif path == "/api/nest-parts":
+                self.json_response({"parts": identify_parts(data.get("paths"))})
+            elif path == "/api/command":
+                self.json_response(self.server.status(self.server.simulator.command(data)))
+            elif path == "/api/controller":
+                self.json_response(self.server.controller.read_status())
+            elif path == "/api/controller-live":
+                self.json_response(self.server.read_live())
+            elif path == "/api/panel-snapshot":
+                extended = data.get("extended", False)
+                if type(extended) is not bool:
+                    raise RequestError("Неверный режим диагностики.")
+                self.json_response(self.server.controller.read_panel_snapshot(extended=extended))
+            elif path == "/api/panel-compare":
+                self.json_response({"candidates": compare_panel_samples(data.get("samples"))})
+            elif path == "/api/control-session":
+                self.json_response(self.server.controller.control_session(
+                    data.get("action"), data.get("controlToken"), data.get("ready"),
+                ))
+            elif path == "/api/controller-position":
+                self.json_response(self.server.controller.read_position())
+            elif path == "/api/controller-job":
+                self.json_response(self.server.controller.read_job_index())
+            elif path == "/api/controller-feed-mode":
+                self.json_response(self.server.controller.read_feed_mode())
+            elif path == "/api/controller-upload":
+                self.json_response(self.server.upload(data))
+            elif path == "/api/controller-hold":
+                self.json_response(self.server.controller.hold(
+                    data.get("action"), data.get("session"), data.get("axis"), data.get("direction"),
+                    data.get("token"), data.get("ready"), data.get("controlToken"),
+                ))
+            elif path == "/api/controller-operation":
+                self.json_response(self.server.operate(data))
+            elif path == "/api/reveal":
+                self.reveal(data.get("filename"))
+            else:
+                plan = self.server.plan(data.get("job"))
+                if path == "/api/plan":
+                    self.json_response(plan.summary())
+                    return
+                filename = output_name(data.get("filename"))
+                contents = export_dxf(plan)
+                if path == "/api/export":
+                    self.respond(contents, "application/dxf", filename=filename)
+                else:
+                    staged = self.stage(filename, contents)
+                    result = {"filename": staged.name, "path": str(staged), "folder": str(STAGING)}
+                    if path == "/api/open-in-xiao":
+                        result.update(self.open_in_xiao(staged))
+                    self.json_response(result)
+        else:
+            raise RequestError("Команда не найдена.", HTTPStatus.NOT_FOUND)
+
+    def stage(self, filename, contents):
+        STAGING.mkdir(exist_ok=True)
+        if STAGING.resolve() != STAGING:
+            raise RequestError("Папка подготовки заданий должна находиться внутри приложения.")
+        unique = uuid4().hex[:10]
+        path = STAGING / f"{unique} - {filename}"
+        temporary = STAGING / f"{unique}.tmp"
+        try:
+            with temporary.open("xb") as file:
+                file.write(contents)
+            temporary.rename(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
+
+    def open_in_xiao(self, path):
+        from xiao_desktop import open_dxf
+
+        try:
+            mode = open_dxf(self.server.xiao_path, path, (LOCALIZED_XIAO,))
+        except (ValueError, OSError) as error:
+            return {"opened": False, "message": f"{error} DXF сохранён. Откройте его в Xiao вручную."}
+        if mode == "queued":
+            message = "DXF передан в окно Xiao. Проверьте, что чертёж открылся."
+        else:
+            message = "Xiao запущен с подготовленным DXF."
+        return {"opened": True, "message": message}
+
+    def reveal(self, filename):
+        if not isinstance(filename, str) or not re.fullmatch(r"[0-9a-f]{10} - [^/\\]+\.dxf", filename):
+            raise RequestError("Выберите подготовленный DXF.")
+        path = STAGING / filename
+        if path.resolve() != path or not path.is_file():
+            raise RequestError("Подготовленный файл не найден.", HTTPStatus.NOT_FOUND)
+        if os.name != "nt":
+            raise RequestError("Открытие папки доступно в Windows.")
+        subprocess.Popen(["explorer.exe", f"/select,{path}"], creationflags=subprocess.CREATE_NO_WINDOW)
+        self.json_response({"path": str(path)})
+
+    def body(self, maximum, content_type):
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
+            raise RequestError("Передайте обычное тело запроса без сжатия.")
+        headers = Message()
+        headers["Content-Type"] = self.headers.get("Content-Type", "")
+        if headers.get_content_type() != content_type:
+            raise RequestError("Неверный тип содержимого запроса.", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        length = self.headers.get("Content-Length", "")
+        if not re.fullmatch(r"[0-9]{1,12}", length) or int(length) < 1:
+            raise RequestError("Тело запроса пустое или размер не указан.")
+        if int(length) > maximum:
+            raise RequestError(f"Размер запроса превышает {maximum // (1024 * 1024)} МБ.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        data = self.rfile.read(int(length))
+        if len(data) != int(length):
+            raise RequestError("Получен неполный запрос.")
+        return data
+
+    def json_body(self, maximum=MAX_JSON):
+        try:
+            value = json.loads(self.body(maximum, "application/json").decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as error:
+            raise RequestError("Некорректные параметры запроса.") from error
+        if not isinstance(value, dict):
+            raise RequestError("Параметры запроса должны быть объектом JSON.")
+        return value
+
+    def json_response(self, value, status=HTTPStatus.OK):
+        self.respond(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def respond(self, contents, content_type, status=HTTPStatus.OK, filename=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(contents)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
+        if filename:
+            self.send_header("Content-Disposition", f"attachment; filename=plotter.dxf; filename*=UTF-8''{quote(filename, safe='')}")
+        self.end_headers()
+        self.wfile.write(contents)
+
+    def log_request(self, code="-", size="-"):
+        if str(code).startswith("5"):
+            super().log_request(code, size)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Локальное веб-приложение для плоттера Xiao.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--open", action="store_true", help="открыть приложение в браузере")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("ezdxf").setLevel(logging.WARNING)
+    with PlotterServer(args.port) as server:
+        url = f"http://{LOCAL_ADDRESS}:{server.server_port}"
+        print(f"Плоттер запущен: {url}", flush=True)
+        if args.open:
+            Timer(0.2, webbrowser.open, args=[url]).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()

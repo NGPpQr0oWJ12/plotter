@@ -1,0 +1,15 @@
+{
+  "software": {
+    "path": "C:\\Xiao\\xiao.exe"
+  },
+  "observedComputerConfiguration": {
+    "machineIp": "127.0.0.1",
+    "workrectMm": {
+      "x": 2500,
+      "y": 1650
+    }
+  },
+  "observedControllerConfiguration": {
+    "zTravelMm": 0
+  }
+}
