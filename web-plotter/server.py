@@ -28,6 +28,7 @@ import webbrowser
 import ezdxf
 from ezdxf.lldxf.validator import is_valid_layer_name
 
+from app_update import AppUpdates, UpdateError, read_version
 from auto_run import AutoRunReadback
 from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_contours
 from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
@@ -43,6 +44,7 @@ from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
 
 ROOT = Path(__file__).resolve().parent
+APP_VERSION = read_version(ROOT)
 PROFILE = ROOT.parent / "research" / "machine-profile.json"
 LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
@@ -55,6 +57,9 @@ HARDWARE_ROUTES = frozenset({"/api/status", "/api/cut-plan", "/api/controller", 
     "/api/controller-position", "/api/controller-job", "/api/controller-feed-mode", "/api/control-session",
     "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset",
     "/api/panel-snapshot", "/api/panel-compare", "/api/reachability", "/api/open-in-xiao", "/api/prepare-xiao"})
+RESTART_SAFE_ACTIONS = {
+    "/api/controller-hold": "stop", "/api/controller-operation": "cancel-cut", "/api/control-session": "disarm",
+}
 CUT_TOOL = 4
 DEFAULT_FABRIC_WIDTH_MM = 1380
 ROLL_PASS_LENGTH_MM = 2450
@@ -427,6 +432,7 @@ class PlotterState:
         page_add = self.controller.upload_page_add()
         return {
             "mode": "controller",
+            "appVersion": APP_VERSION,
             "apiVersion": API_VERSION,
             "demoAvailable": True,
             "demoMode": self.demo_mode,
@@ -998,6 +1004,12 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         PlotterState.__init__(self, profile, workspace, workspace_lock, central=bool(self.public_origin),
                               companion=bool(self.companion_origin))
         self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
+        install_root = None
+        if os.name == "nt" and self.local_companion_ui and os.environ.get("LOCALAPPDATA"):
+            candidate = (Path(os.environ["LOCALAPPDATA"]) / "Plotter" / "Companion").resolve()
+            if ROOT.parent == candidate and re.fullmatch(r"app-[a-f0-9]{32}", ROOT.name):
+                install_root = candidate
+        self.app_updates = AppUpdates(ROOT, APP_VERSION, install_root)
         ThreadingHTTPServer.__init__(self, (LOCAL_ADDRESS, port), Handler)
         self.hosts = {f"{host}:{self.server_port}" for host in (LOCAL_ADDRESS, "localhost")}
         if self.public_origin:
@@ -1041,6 +1053,18 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         self.controller.stop_active_hold()
         self.demo.controller.stop_active_hold()
         super().server_close()
+
+    def verify_update_idle(self):
+        for plotter in (self, self.demo):
+            if plotter.owns_drawing() or plotter.controller.control_is_armed():
+                raise UpdateError("Завершите текущий раскрой и выключите управление станком.")
+            try:
+                result = plotter.read_live()
+                plotter.verify_new_cut_idle(result)
+                if result.get("uploadUncertain") or plotter.owns_drawing():
+                    raise UpdateError("Сверьте состояние станка на штатном пульте перед обновлением.")
+            except RequestError as error:
+                raise UpdateError("Дождитесь остановки станка и попробуйте снова.") from error
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1105,7 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("Для управления станком подключите помощник на компьютере оператора.", HTTPStatus.FORBIDDEN)
             if self.server.central_mode and path in ("/api/stage", "/api/reveal"):
                 raise RequestError("Скачайте DXF на компьютер оператора.", HTTPStatus.FORBIDDEN)
-            route(path, result.query)
+            if (self.server.app_updates.supported and self.command == "POST"
+                    and path not in RESTART_SAFE_ACTIONS and path not in ("/api/app-update", "/api/controller-live")):
+                with self.server.app_updates.protected_request():
+                    route(path, result.query)
+            else:
+                route(path, result.query)
+        except UpdateError as error:
+            self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
         except RequestError as error:
             self.json_response({"error": str(error)}, error.status)
         except WorkspaceConflict as error:
@@ -1134,6 +1165,8 @@ class Handler(BaseHTTPRequestHandler):
             self.respond((ROOT / "static" / name).read_bytes(), content_type)
         elif path == "/api/status":
             self.json_response(self.plotter.status())
+        elif path == "/api/app-update":
+            self.json_response(self.server.app_updates.status())
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
@@ -1144,7 +1177,11 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError("Страница не найдена.", HTTPStatus.NOT_FOUND)
 
     def post(self, path, query):
-        if path == "/api/import":
+        if path == "/api/app-update":
+            data = self.json_body(4096)
+            self.server.app_updates.start(data.get("version"), self.server.verify_update_idle)
+            self.json_response(self.server.app_updates.status(), HTTPStatus.ACCEPTED)
+        elif path == "/api/import":
             name = parse_qs(query, max_num_fields=4).get("filename", [""])[0]
             if not name or len(name) > 255 or re.search(r"[/\\\x00-\x1f]", name):
                 raise RequestError("Передайте имя файла DXF или DWG.")
@@ -1201,7 +1238,17 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/api/panel-snapshot", "/api/panel-compare"):
                 limit = 16 * 1024
             data = self.json_body(limit)
-            if path == "/api/workspace":
+            if path in RESTART_SAFE_ACTIONS:
+                action = data.get("action")
+                with self.server.app_updates.protected_request(allow_restart=action == RESTART_SAFE_ACTIONS[path]):
+                    if path == "/api/control-session":
+                        result = self.plotter.controller.control_session(action, data.get("controlToken"), data.get("ready"))
+                    elif path == "/api/controller-hold":
+                        result = self.plotter.hold(data)
+                    else:
+                        result = self.plotter.operate(data)
+                self.json_response(result)
+            elif path == "/api/workspace":
                 self.json_response(self.server.save_workspace(data.get("revision"), data.get("workspace")))
             elif path == "/api/cut-plan":
                 self.json_response(self.plotter.cut_plan(
@@ -1224,10 +1271,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(self.plotter.controller.read_panel_snapshot(extended=extended))
             elif path == "/api/panel-compare":
                 self.json_response({"candidates": compare_panel_samples(data.get("samples"))})
-            elif path == "/api/control-session":
-                self.json_response(self.plotter.controller.control_session(
-                    data.get("action"), data.get("controlToken"), data.get("ready"),
-                ))
             elif path == "/api/controller-position":
                 self.json_response(self.plotter.controller.read_position())
             elif path == "/api/controller-job":
@@ -1236,10 +1279,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(self.plotter.controller.read_feed_mode())
             elif path == "/api/controller-upload":
                 self.json_response(self.plotter.upload(data))
-            elif path == "/api/controller-hold":
-                self.json_response(self.plotter.hold(data))
-            elif path == "/api/controller-operation":
-                self.json_response(self.plotter.operate(data))
             elif path == "/api/reveal":
                 self.reveal(data.get("filename"))
             else:

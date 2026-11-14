@@ -214,6 +214,11 @@ class DemoController:
     def _valid_control(self, token):
         return isinstance(token, str) and self._control is not None and self._control.token == token
 
+    def control_is_armed(self):
+        with self._lock:
+            self._advance()
+            return self._control is not None
+
     def require_control(self, token):
         with self._lock:
             self._advance()

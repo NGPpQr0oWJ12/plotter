@@ -119,6 +119,7 @@ stage() (
     # Virtual environments embed absolute paths. Build in the release's final directory.
     install -d -m 0755 "$final/web-plotter/static"
     install -m 0644 "$source"/web-plotter/*.py "$source/web-plotter/requirements.txt" "$final/web-plotter/"
+    install -m 0644 "$source/VERSION" "$final/VERSION"
     install -m 0644 "$source"/web-plotter/static/{app.js,index.html,simulation.js,style.css} "$final/web-plotter/static/"
     install -D -m 0644 "$source/research/machine-profile.example.json" "$final/research/machine-profile.example.json"
     python3 -m venv "$final/.venv"

@@ -3,6 +3,8 @@ param(
     [string]$CentralUrl,
     [string]$ProfilePath,
     [string]$CentralCa,
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
+    [string]$ExpectedVersion,
     [switch]$Graphical
 )
 
@@ -106,11 +108,26 @@ $taskName = "Xiao Plotter Companion ($($identity.User.Value))"
 $taskPath = '\'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Plotter\Companion'
 $installStatePath = Join-Path $installRoot 'install.json'
+$update = $PSBoundParameters.ContainsKey('ExpectedVersion')
+$versionPath = Join-Path $PSScriptRoot 'VERSION'
+$version = if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
+    (Get-Content -LiteralPath $versionPath -Raw).Trim()
+}
 $saved = $null
 if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
     $saved = Get-Content -LiteralPath $installStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+if ($update) {
+    if ($Graphical -or $CentralUrl -or $ProfilePath -or $CentralCa -or $version -cne $ExpectedVersion -or
+        !$saved.origin -or $saved.release -notmatch '^app-[a-f0-9]{32}$') {
+        throw 'The update does not match the installed companion or the expected release.'
+    }
+    $previousPath = Join-Path $installRoot $saved.release
+    $CentralUrl = $saved.origin
+    $ProfilePath = Join-Path $previousPath 'machine-profile.json'
+    $CentralCa = Join-Path $previousPath 'central-ca.pem'
+}
 if (!$CentralUrl) {
     $prompt = 'HTTPS address of the central Plotter server'
     if ($saved.origin) { $prompt += ' (Enter to keep the current address)' }
@@ -148,7 +165,10 @@ $profileContent = if ($ProfilePath -or !$Graphical) { Get-MachineProfile (([stri
 
 $previous = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue
 $wasRunning = $previous.State -eq 'Running'
-if ($wasRunning -and !$Graphical) {
+if ($update -and !$wasRunning) {
+    throw 'The installed companion task is no longer running.'
+}
+if ($wasRunning -and !$Graphical -and !$update) {
     throw 'The companion is running. Once the machine is idle, end the Xiao Plotter Companion task in Task Scheduler and rerun this installer.'
 }
 $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
@@ -163,7 +183,7 @@ if ($Graphical) {
 
 $packedRuntime = Join-Path $PSScriptRoot 'runtime'
 $hasPackedRuntime = Test-Path -LiteralPath (Join-Path $packedRuntime 'pythonw.exe') -PathType Leaf
-if ($Graphical -and !$hasPackedRuntime) { throw 'Во встроенном комплекте отсутствует Python.' }
+if (($Graphical -or $update) -and !$hasPackedRuntime) { throw 'Во встроенном комплекте отсутствует Python.' }
 $environmentPath = Join-Path $installRoot '.venv'
 $runtime = Join-Path $environmentPath 'Scripts\python.exe'
 $runtimeHidden = Join-Path $environmentPath 'Scripts\pythonw.exe'
@@ -207,6 +227,14 @@ Get-ChildItem -LiteralPath $PSScriptRoot -File -Filter '*.py' |
     Where-Object Name -NotLike 'test_*' |
     Copy-Item -Destination $applicationPath
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'static') -Destination $applicationPath -Recurse
+$updateWorker = Join-Path $PSScriptRoot 'apply-companion-update.ps1'
+foreach ($asset in @($versionPath, $updateWorker)) {
+    if (Test-Path -LiteralPath $asset -PathType Leaf) {
+        Copy-Item -LiteralPath $asset -Destination $applicationPath
+    } elseif ($Graphical -or $update) {
+        throw 'The companion package is missing a version or update worker.'
+    }
+}
 $installedProfile = Join-Path $applicationPath 'machine-profile.json'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $server = Join-Path $applicationPath 'server.py'
@@ -292,7 +320,7 @@ try {
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         try {
             $status = Invoke-RestMethod @statusRequest
-            if ($status.companionMode -eq $true) {
+            if ($status.companionMode -eq $true -and (!$version -or $status.appVersion -ceq $version)) {
                 $ready = $true
                 break
             }
@@ -301,9 +329,21 @@ try {
         }
         Start-Sleep -Milliseconds 500
     }
-    if (!$ready) { throw 'The installed task started but the local companion did not answer.' }
+    if (!$ready) { throw 'The installed companion did not report the expected version.' }
     $state = @{ origin = $origin; release = $release } | ConvertTo-Json -Compress
-    [IO.File]::WriteAllText($installStatePath, $state, $utf8)
+    $pendingState = Join-Path $installRoot "$release.json.tmp"
+    try {
+        [IO.File]::WriteAllText($pendingState, $state, $utf8)
+        if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
+            [IO.File]::Replace($pendingState, $installStatePath, [NullString]::Value)
+        } else {
+            [IO.File]::Move($pendingState, $installStatePath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $pendingState -PathType Leaf) {
+            Remove-Item -LiteralPath $pendingState -ErrorAction SilentlyContinue
+        }
+    }
 } catch {
     $failure = $_
     $cleanupWarnings = @()

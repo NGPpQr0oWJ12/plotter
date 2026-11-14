@@ -23,7 +23,11 @@ $pythonVersion = '3.13.17'
 $pythonHash = '9E35319BFFEDAB8B36AD44D8F377CB4F1733BCEC257A0B6D04D94F01486DDB38'
 $setupName = "Plotter-Companion-Setup-$version-x64.exe"
 $destination = Join-Path $output $setupName
-if (Test-Path -LiteralPath $destination) { throw "Installer already exists: $destination" }
+$updateName = "plotter-companion-v$version-windows-x64.zip"
+$updateDestination = Join-Path $output $updateName
+foreach ($artifact in @($destination, $updateDestination)) {
+    if (Test-Path -LiteralPath $artifact) { throw "Release artifact already exists: $artifact" }
+}
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $build = Join-Path ([IO.Path]::GetTempPath()) ('plotter-setup-build-' + [Guid]::NewGuid().ToString('N'))
@@ -49,6 +53,18 @@ try {
     Get-ChildItem -LiteralPath $source -File -Filter '*.py' | Where-Object Name -NotLike 'test_*' |
         Copy-Item -Destination $payload
     Copy-Item -LiteralPath (Join-Path $source 'static') -Destination $payload -Recurse
+    foreach ($script in @('install-companion.ps1', 'companion-profile.ps1', 'apply-companion-update.ps1')) {
+        $installerScript = Get-Content -LiteralPath (Join-Path $source $script) -Raw -Encoding UTF8
+        [IO.File]::WriteAllText((Join-Path $payload $script), $installerScript, [Text.UTF8Encoding]::new($true))
+    }
+    [IO.File]::WriteAllText((Join-Path $payload 'VERSION'), $version, [Text.Encoding]::ASCII)
+    $serverOptions = & (Join-Path $runtime 'python.exe') -B (Join-Path $payload 'server.py') --help | Out-String
+    if ($LASTEXITCODE -ne 0 -or $serverOptions -notmatch '--central-ca') {
+        throw 'Bundled runtime did not load companion support for an application-local CA.'
+    }
+    $updateArchive = Join-Path $build $updateName
+    [IO.Compression.ZipFile]::CreateFromDirectory($payload, $updateArchive, [IO.Compression.CompressionLevel]::Optimal, $false)
+
     $caFile = Join-Path $payload 'central-ca.pem'
     $prepareCa = @'
 from pathlib import Path
@@ -64,15 +80,7 @@ ssl.create_default_context(cafile=str(target))
 '@
     $prepareCa | & (Join-Path $runtime 'python.exe') - $certificate $caFile
     if ($LASTEXITCODE -ne 0) { throw 'The central CA must be a valid PEM or DER certificate.' }
-    foreach ($script in @('install-companion.ps1', 'companion-profile.ps1')) {
-        $installerScript = Get-Content -LiteralPath (Join-Path $source $script) -Raw -Encoding UTF8
-        [IO.File]::WriteAllText((Join-Path $payload $script), $installerScript, [Text.UTF8Encoding]::new($true))
-    }
     [IO.File]::WriteAllText((Join-Path $payload 'origin.txt'), $origin)
-    $serverOptions = & (Join-Path $runtime 'python.exe') -B (Join-Path $payload 'server.py') --help | Out-String
-    if ($LASTEXITCODE -ne 0 -or $serverOptions -notmatch '--central-ca') {
-        throw 'Bundled runtime did not load companion support for an application-local CA.'
-    }
 
     $bundle = Join-Path $build 'payload.zip'
     [IO.Compression.ZipFile]::CreateFromDirectory($payload, $bundle, [IO.Compression.CompressionLevel]::Optimal, $false)
@@ -86,7 +94,8 @@ ssl.create_default_context(cafile=str(target))
 
     New-Item -ItemType Directory -Path $output -Force | Out-Null
     Copy-Item -LiteralPath $exe -Destination $destination
-    Get-FileHash -LiteralPath $destination -Algorithm SHA256
+    Copy-Item -LiteralPath $updateArchive -Destination $updateDestination
+    Get-FileHash -LiteralPath $destination, $updateDestination -Algorithm SHA256
 } finally {
     $expected = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
     $resolved = (Resolve-Path -LiteralPath $build).ProviderPath

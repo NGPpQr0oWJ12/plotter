@@ -495,6 +495,10 @@ class Controller:
         except OSError as error:
             raise ControllerError("Не удалось проверить остановку. Проверьте станок на штатном пульте.") from error
 
+    def control_is_armed(self):
+        with self._hold_condition:
+            return self._control is not None and monotonic() < self._control.expires
+
     def require_control(self, token, for_upload=False, auto_run_off=None):
         with self._hold_condition:
             session = self._control

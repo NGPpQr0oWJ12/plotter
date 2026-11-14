@@ -46,6 +46,13 @@ let companionConnecting = false;
 let demoAvailable = false;
 let switchingMachineMode = false;
 let machineModeEpoch = 0;
+let appUpdate = null;
+let appUpdateTarget = null;
+let appUpdateSubmitting = false;
+let appUpdateRead = null;
+let appUpdateTimer;
+let appUpdateDeadline = 0;
+let appUpdateDiscoveryReads = 0;
 let machine = { ip: "—", width: 2500, height: 1650 };
 let nestingBackend = "checking";
 let live = { responded: false, busy: false, hold: {}, operations: {}, position: null };
@@ -280,7 +287,7 @@ function updateControl(node, property, value) {
 async function checkedFetch(url, options = {}, useCompanion = companionRoutes.has(url)) {
   let response;
   try {
-    const path = demoMode && url.startsWith("/api/") ? "/demo" + url : url;
+    const path = demoMode && url.startsWith("/api/") && url !== "/api/app-update" ? "/demo" + url : url;
     response = !demoMode && centralMode && companionConnected && useCompanion
       ? await companionFetch(url, options) : await fetch(path, { cache: "no-store", ...options });
   } catch (error) {
@@ -340,6 +347,104 @@ function jsonRequest(body, signal) {
   return {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
   };
+}
+
+function appUpdateSafe() {
+  return !busy() && !drawingLocked() && !drag && !runInProgress() && !controlActive() && !live.busy
+    && !live.stopAvailable && !needsMotionVerification() && !coordinateMoveBlocksControl()
+    && !currentUpload && !uploadUncertain && !xiaoHandoff && activeRun?.state !== "transferring";
+}
+
+function appUpdateInProgress() {
+  return appUpdate?.state === "preparing" || appUpdate?.state === "restarting";
+}
+
+function renderAppUpdate() {
+  const version = $("app-version");
+  const button = $("app-update");
+  const progress = appUpdateSubmitting || Boolean(appUpdateTarget) || appUpdateInProgress();
+  const message = appUpdate?.message || "";
+  const label = appUpdate?.state === "restarting" ? "Перезапускаем…"
+    : progress ? "Обновляем…" : appUpdate?.availableVersion ? `Обновить до ${appUpdate.availableVersion}` : "Обновить";
+  updateText(version, appUpdate?.version ?? "");
+  updateControl(version, "hidden", !appUpdate?.version);
+  updateControl(version, "title", message);
+  updateText(button, label);
+  updateControl(button, "hidden", !appUpdate?.supported || (!appUpdate.availableVersion && !progress));
+  updateControl(button, "disabled", progress || !appUpdateSafe());
+  updateControl(button, "title", message || (button.disabled && !progress ? "Завершите работу со станком перед обновлением." : ""));
+  updateText($("app-update-status"), message || (progress ? label : ""));
+}
+
+function scheduleAppUpdateRead(delay = 60_000) {
+  clearTimeout(appUpdateTimer);
+  appUpdateTimer = setTimeout(() => void readAppUpdate(), delay);
+}
+
+function readAppUpdate() {
+  if (appUpdateRead) return appUpdateRead;
+  appUpdateRead = (async () => {
+    const wasRestarting = appUpdate?.state === "restarting";
+    try {
+      const status = await getJson("/api/app-update", { signal: AbortSignal.timeout(3500) });
+      if (typeof status?.version !== "string") return;
+      appUpdate = status;
+      if (appUpdateTarget && status.version === appUpdateTarget) {
+        if (workspaceChange === workspaceSaved && !busy() && !drawingLocked() && !drag) {
+          location.reload();
+          return;
+        }
+      } else if (appUpdateTarget && status.state === "failed") {
+        appUpdateTarget = null;
+        notifyError(status.message || "Не удалось обновить программу.");
+      }
+    } catch {
+      // The server can be unavailable while Windows replaces it.
+    } finally {
+      appUpdateRead = null;
+      if (appUpdateTarget && Date.now() >= appUpdateDeadline) {
+        appUpdateTarget = null;
+        notifyError("Не удалось подтвердить обновление. Проверьте, запущена ли программа.");
+      }
+      if (wasRestarting !== (appUpdate?.state === "restarting")) renderControls();
+      else renderAppUpdate();
+      const discovering = appUpdate?.supported && !appUpdate.availableVersion && !appUpdate.message
+        && appUpdate.state === "idle" && appUpdateDiscoveryReads++ < 3;
+      scheduleAppUpdateRead(appUpdateTarget || appUpdateInProgress() || discovering ? 1500 : 60_000);
+    }
+  })();
+  return appUpdateRead;
+}
+
+async function applyAppUpdate() {
+  if (!appUpdate?.supported || !appUpdate.availableVersion || $("app-update").disabled || !appUpdateSafe()) return;
+  const target = appUpdate.availableVersion;
+  appUpdateSubmitting = true;
+  renderAppUpdate();
+  try {
+    if (workspaceChange !== workspaceSaved && !await persistWorkspace()) {
+      throw new Error("Сохраните рабочую область перед обновлением.");
+    }
+    if (!appUpdateSafe() || workspaceChange !== workspaceSaved) {
+      throw new Error("Завершите текущую операцию перед обновлением.");
+    }
+    appUpdateTarget = target;
+    appUpdateDeadline = Date.now() + 10 * 60_000;
+    try {
+      await checkedFetch("/api/app-update", jsonRequest({ version: target }, AbortSignal.timeout(8000)));
+    } catch (error) {
+      // The process may restart before its accepted response reaches the browser.
+      if (error.status !== undefined) throw error;
+      appUpdateDeadline = Date.now() + 30_000;
+    }
+  } catch (error) {
+    appUpdateTarget = null;
+    notifyError(messageFrom(error));
+  } finally {
+    appUpdateSubmitting = false;
+    renderAppUpdate();
+    scheduleAppUpdateRead(0);
+  }
 }
 
 function notifyError(message) {
@@ -1229,7 +1334,7 @@ function translatePath(path, dx, dy) {
 }
 
 function drawingLocked() {
-  return restoringWorkspace || isLoading || nestRequest !== null || contourRepair !== null
+  return restoringWorkspace || isLoading || nestRequest !== null || contourRepair !== null || appUpdate?.state === "restarting"
     || ["upload", "cut", "new-cut"].includes(pendingCommand) || runInProgress();
 }
 
@@ -2533,7 +2638,7 @@ function setMachineError(message = "") {
 }
 
 function busy() {
-  return Boolean(switchingMachineMode || pendingCommand || stopPending || activeHold);
+  return Boolean(switchingMachineMode || pendingCommand || stopPending || activeHold || appUpdate?.state === "restarting");
 }
 
 function controlActive() {
@@ -2817,6 +2922,7 @@ function renderHistoryControls(importing = drawingLocked()) {
 }
 
 function renderControls() {
+  renderAppUpdate();
   const armed = controlActive();
   const locked = busy();
   const importing = drawingLocked();
@@ -3088,10 +3194,11 @@ async function readConfiguration() {
   const epoch = liveEpoch;
   const modeEpoch = machineModeEpoch;
   try {
-    const { machine: configuration, apiVersion, roll, cutProgress: progress, demoAvailable: available,
+    const { machine: configuration, apiVersion, appVersion, roll, cutProgress: progress, demoAvailable: available,
       demoMode: reportedMode, centralMode: central, companionMode: companion } =
       await getJson("/api/status", { signal: AbortSignal.timeout(3500) });
     if (modeEpoch !== machineModeEpoch || !configuration || (reportedMode === true) !== demoMode) return false;
+    if (!appUpdate && typeof appVersion === "string") appUpdate = { version: appVersion };
     if (!companion) centralMode = central === true;
     demoAvailable = available === true;
     machine = { ...configuration, apiVersion, verifiedJobUpload: configuration.verifiedJobUpload === true };
@@ -3900,6 +4007,7 @@ $("canvas-import").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", (event) => void loadDrawing(event.target.files[0]));
 $("toast-close").addEventListener("click", () => { $("toast").hidden = true; });
 $("new-cut-button").addEventListener("click", openNewCutDialog);
+$("app-update").addEventListener("click", () => void applyAppUpdate());
 newCutDialog.addEventListener("close", () => {
   if (newCutDialog.returnValue === "confirm") void clearForNewCut();
 });
@@ -4012,6 +4120,7 @@ function resumeControlPolling() {
   if (control && machine.persistentControl === true) void renewControl();
 }
 window.addEventListener("focus", resumeControlPolling);
+window.addEventListener("focus", () => void readAppUpdate());
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") resumeControlPolling();
   else {
@@ -5071,4 +5180,5 @@ new ResizeObserver(() => {
 renderLive();
 void readConfiguration();
 void restoreWorkspace();
+void readAppUpdate();
 scheduleLiveRead(0);
