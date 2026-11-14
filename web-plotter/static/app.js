@@ -40,6 +40,7 @@ let demoMode = readStoredBoolean("plotter.demoMode");
 const companionAddress = "http://127.0.0.1:8767";
 const companionRoutes = new Set(["/api/status", "/api/cut-plan", "/api/controller-live", "/api/control-session",
   "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset"]);
+const systemRoutes = new Set(["/api/app-update", "/api/release-notes"]);
 let centralMode = false;
 let companionConnected = false;
 let companionConnecting = false;
@@ -53,6 +54,7 @@ let appUpdateRead = null;
 let appUpdateTimer;
 let appUpdateDeadline = 0;
 let appUpdateDiscoveryReads = 0;
+let releaseNotesRequest;
 let machine = { ip: "—", width: 2500, height: 1650 };
 let nestingBackend = "checking";
 let live = { responded: false, busy: false, hold: {}, operations: {}, position: null };
@@ -287,7 +289,7 @@ function updateControl(node, property, value) {
 async function checkedFetch(url, options = {}, useCompanion = companionRoutes.has(url)) {
   let response;
   try {
-    const path = demoMode && url.startsWith("/api/") && url !== "/api/app-update" ? "/demo" + url : url;
+    const path = demoMode && url.startsWith("/api/") && !systemRoutes.has(url) ? "/demo" + url : url;
     response = !demoMode && centralMode && companionConnected && useCompanion
       ? await companionFetch(url, options) : await fetch(path, { cache: "no-store", ...options });
   } catch (error) {
@@ -365,15 +367,58 @@ function renderAppUpdate() {
   const progress = appUpdateSubmitting || Boolean(appUpdateTarget) || appUpdateInProgress();
   const message = appUpdate?.message || "";
   const label = appUpdate?.state === "restarting" ? "Перезапускаем…"
-    : progress ? "Обновляем…" : appUpdate?.availableVersion ? `Обновить до ${appUpdate.availableVersion}` : "Обновить";
+    : progress ? "Обновляем помощник…" : "Обновить помощник";
+  const target = appUpdateTarget ?? appUpdate?.availableVersion;
+  const disabled = progress || !appUpdateSafe();
+  const tooltip = disabled && !progress ? "Завершите работу со станком перед обновлением." : "";
   updateText(version, appUpdate?.version ?? "");
   updateControl(version, "hidden", !appUpdate?.version);
   updateControl(version, "title", message);
   updateText(button, label);
-  updateControl(button, "hidden", !appUpdate?.supported || (!appUpdate.availableVersion && !progress));
-  updateControl(button, "disabled", progress || !appUpdateSafe());
-  updateControl(button, "title", message || (button.disabled && !progress ? "Завершите работу со станком перед обновлением." : ""));
+  updateControl(button, "hidden", !appUpdate?.supported || !target);
+  updateControl(button, "disabled", disabled);
+  updateControl(button, "title", [target ? `Версия ${target}` : "", message || tooltip].filter(Boolean).join(". "));
   updateText($("app-update-status"), message || (progress ? label : ""));
+}
+
+async function openReleaseNotes() {
+  const dialog = $("release-notes-dialog");
+  if (dialog.open) return;
+  const request = new AbortController();
+  releaseNotesRequest = request;
+  const title = $("release-notes-title");
+  const status = $("release-notes-status");
+  const list = $("release-notes-list");
+  const content = $("release-notes-content");
+  const installed = appUpdate?.version;
+  updateText(title, installed ? `Релиз ${installed}` : "Релиз");
+  list.replaceChildren();
+  list.hidden = true;
+  status.hidden = false;
+  updateText(status, "Загружаем список изменений…");
+  updateAttribute(content, "aria-busy", "true");
+  dialog.showModal();
+  try {
+    const result = await getJson("/api/release-notes", { signal: AbortSignal.any([request.signal, AbortSignal.timeout(8000)]) });
+    if (request.signal.aborted) return;
+    if (typeof result?.version !== "string" || !Array.isArray(result.notes)) throw new Error();
+    const notes = result.notes.filter((note) => typeof note === "string" && note.trim());
+    updateText(title, `Релиз ${result.version}`);
+    if (notes.length) {
+      const items = notes.map((note) => {
+        const item = document.createElement("li");
+        item.textContent = note;
+        return item;
+      });
+      list.replaceChildren(...items);
+      list.hidden = false;
+      status.hidden = true;
+    } else updateText(status, "Для этой версии список изменений отсутствует.");
+  } catch {
+    if (!request.signal.aborted) updateText(status, "Не удалось загрузить список изменений. Откройте релиз ещё раз.");
+  } finally {
+    if (releaseNotesRequest === request) updateAttribute(content, "aria-busy", "false");
+  }
 }
 
 function scheduleAppUpdateRead(delay = 60_000) {
@@ -4008,6 +4053,12 @@ $("file-input").addEventListener("change", (event) => void loadDrawing(event.tar
 $("toast-close").addEventListener("click", () => { $("toast").hidden = true; });
 $("new-cut-button").addEventListener("click", openNewCutDialog);
 $("app-update").addEventListener("click", () => void applyAppUpdate());
+$("release-notes-button").addEventListener("click", () => void openReleaseNotes());
+$("release-notes-dialog").addEventListener("close", () => {
+  releaseNotesRequest?.abort();
+  releaseNotesRequest = null;
+  $("release-notes-button").focus({ preventScroll: true });
+});
 newCutDialog.addEventListener("close", () => {
   if (newCutDialog.returnValue === "confirm") void clearForNewCut();
 });

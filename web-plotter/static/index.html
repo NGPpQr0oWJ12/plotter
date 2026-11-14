@@ -63,10 +63,11 @@
       </svg>
       </h1>
       <span id="app-version" class="app-version" hidden></span>
+      <button class="button topbar-secondary release-notes-button" id="release-notes-button" type="button" aria-haspopup="dialog" aria-controls="release-notes-dialog">Релиз</button>
     </div>
     <div class="topbar-actions">
       <span id="workspace-save" class="workspace-save" role="status" hidden></span>
-      <button class="button topbar-secondary" id="app-update" type="button" aria-describedby="app-update-status" hidden disabled>Обновить</button>
+      <button class="button topbar-secondary" id="app-update" type="button" aria-describedby="app-update-status" hidden disabled>Обновить помощник</button>
       <span id="app-update-status" class="visually-hidden" role="status"></span>
       <button class="button topbar-secondary" id="new-cut-button" type="button" hidden disabled>Новый раскрой</button>
       <input id="file-input" type="file" accept=".dxf,.dwg" hidden>
@@ -304,6 +305,19 @@
       <button type="button" role="menuitem" id="part-menu-delete" class="part-menu-delete" data-part-action="delete" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Удалить деталь</button>
     </div>
   </div>
+
+  <dialog class="plotter-dialog" id="release-notes-dialog" aria-labelledby="release-notes-title">
+    <header class="drawing-dialog-heading">
+      <h2 id="release-notes-title">Релиз</h2>
+      <form method="dialog">
+        <button class="icon-button" id="release-notes-close" type="submit" aria-label="Закрыть" title="Закрыть" autofocus><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </form>
+    </header>
+    <div class="drawing-dialog-body" id="release-notes-content" aria-busy="false">
+      <p id="release-notes-status" role="status"></p>
+      <ul class="release-notes-list" id="release-notes-list" hidden></ul>
+    </div>
+  </dialog>
 
   <dialog class="plotter-dialog" id="new-cut-dialog" aria-labelledby="new-cut-title" aria-describedby="new-cut-description">
     <header class="drawing-dialog-heading"><h2 id="new-cut-title">Начать новый раскрой?</h2></header>

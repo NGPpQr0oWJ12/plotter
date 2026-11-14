@@ -235,6 +235,13 @@ foreach ($asset in @($versionPath, $updateWorker)) {
         throw 'The companion package is missing a version or update worker.'
     }
 }
+$changelog = Join-Path $PSScriptRoot 'CHANGELOG.md'
+if (!(Test-Path -LiteralPath $changelog -PathType Leaf)) {
+    $changelog = Join-Path (Split-Path $PSScriptRoot -Parent) 'CHANGELOG.md'
+}
+if (Test-Path -LiteralPath $changelog -PathType Leaf) {
+    Copy-Item -LiteralPath $changelog -Destination $applicationPath
+}
 $installedProfile = Join-Path $applicationPath 'machine-profile.json'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $server = Join-Path $applicationPath 'server.py'

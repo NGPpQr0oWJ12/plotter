@@ -39,6 +39,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .topbar :focus-visible { outline-color:#ffffff; }
 .topbar-secondary { color:#fff; background:#2d2d2d; border-color:#757575; }
 .topbar-secondary:not(:disabled):hover { color:#fff; background:#404040; border-color:#bdbdbd; }
+.topbar .release-notes-button { min-height:32px; padding:4px 9px; font-size:12px; }
 .workspace-save { color:#dddddd; font-size:11px; text-align:right; }
 .workspace-save.failed { color:#ffd0a2; }
 .workspace { display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr); padding:10px; min-height:0; }
@@ -487,6 +488,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .drawing-dialog-body { padding:18px var(--dialog-gutter); font-size:16px; line-height:1.5; }
 .drawing-dialog-body > p:first-child { margin-top:0; }
 .drawing-dialog-body > p:last-child { margin-bottom:0; }
+.release-notes-list { display:grid; gap:8px; margin:0; padding-inline-start:22px; overflow-wrap:anywhere; }
 .dialog-actions { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:8px; padding:12px var(--dialog-gutter); border-top:1px solid var(--border); background:#f7f7f7; }
 .plotter-dialog .button { min-height:44px; padding:8px 12px; font-size:15px; line-height:1.3; white-space:normal; }
 #upload-confirm-target { margin:0 0 14px; }

@@ -28,7 +28,7 @@ import webbrowser
 import ezdxf
 from ezdxf.lldxf.validator import is_valid_layer_name
 
-from app_update import AppUpdates, UpdateError, read_version
+from app_update import AppUpdates, UpdateError, read_release_notes, read_version
 from auto_run import AutoRunReadback
 from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_contours
 from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
@@ -1167,6 +1167,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(self.plotter.status())
         elif path == "/api/app-update":
             self.json_response(self.server.app_updates.status())
+        elif path == "/api/release-notes":
+            self.json_response({"version": APP_VERSION, "notes": read_release_notes(ROOT, APP_VERSION)})
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":

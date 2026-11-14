@@ -21,7 +21,8 @@ from zipfile import BadZipFile, ZipFile
 
 VERSION_PATTERN = re.compile(r"(?:0|[1-9]\d{0,5})\.(?:0|[1-9]\d{0,5})\.(?:0|[1-9]\d{0,5})", re.ASCII)
 REPOSITORY = "NGPpQr0oWJ12/plotter"
-METADATA_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases"
+RELEASE_PAGE_SIZE = 30
 DOWNLOAD_HOSTS = frozenset({"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"})
 MAX_METADATA = 512 * 1024
 MAX_ARCHIVE = 160 * 1024 * 1024
@@ -55,6 +56,31 @@ def read_version(root):
     return None
 
 
+def read_release_notes(root, version):
+    if not release_version(version):
+        return []
+    for path in (root / "CHANGELOG.md", root.parent / "CHANGELOG.md"):
+        try:
+            with path.open(encoding="utf-8-sig") as changelog:
+                contents = changelog.read(256 * 1024)
+        except (OSError, UnicodeError):
+            continue
+        active = False
+        notes = []
+        for line in contents.splitlines():
+            if line.startswith("## "):
+                if active:
+                    break
+                active = line[3:].strip() == version
+            elif active and line.startswith("- "):
+                text = line[2:].strip()
+                if text:
+                    notes.append(text[:1000])
+        if active:
+            return notes[:30]
+    return []
+
+
 @dataclass(frozen=True)
 class Release:
     version: str
@@ -72,9 +98,9 @@ class GitHubRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch_latest(opener):
-    request = Request(METADATA_URL, headers={"Accept": "application/vnd.github+json",
-                                             "User-Agent": "Xiao-Plotter-Updater"})
+def fetch_release_page(opener, page):
+    url = f"{RELEASES_URL}?per_page={RELEASE_PAGE_SIZE}&page={page}"
+    request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "Xiao-Plotter-Updater"})
     try:
         with opener.open(request, timeout=15) as response:
             contents = response.read(MAX_METADATA + 1)
@@ -85,7 +111,23 @@ def fetch_latest(opener):
         raise UpdateError("Не удалось проверить релизы GitHub. Проверьте подключение к интернету.") from error
     if len(contents) > MAX_METADATA:
         raise UpdateError("Ответ GitHub о релизе слишком велик.")
-    return json.loads(contents)
+    releases = json.loads(contents)
+    if not isinstance(releases, list) or len(releases) > RELEASE_PAGE_SIZE:
+        raise UpdateError("GitHub вернул некорректный список релизов.")
+    return releases
+
+
+def find_companion_update(opener, current):
+    newest = None
+    for page in range(1, 5):
+        releases = fetch_release_page(opener, page)
+        for metadata in releases:
+            candidate = latest_update(metadata, newest.version if newest else current)
+            if candidate is not None:
+                newest = candidate
+        if len(releases) < RELEASE_PAGE_SIZE:
+            break
+    return newest
 
 
 def download_release(opener, release, destination):
@@ -189,8 +231,7 @@ class AppUpdates:
 
     def _refresh(self):
         try:
-            data = fetch_latest(build_opener(GitHubRedirect()))
-            available, message = latest_update(data, self.version), None
+            available, message = find_companion_update(build_opener(GitHubRedirect()), self.version), None
         except UpdateError as error:
             available, message = None, str(error)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):

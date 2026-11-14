@@ -22,6 +22,7 @@ if (Test-Path -LiteralPath $archivePath) {
 
 $files = @(
     'RELEASE.md',
+    'CHANGELOG.md',
     'package-release.ps1',
     'Запустить плоттер.cmd',
     'web-plotter/.gitignore',

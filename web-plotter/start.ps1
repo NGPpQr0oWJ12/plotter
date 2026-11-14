@@ -1,22 +1,57 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿[CmdletBinding()]
+param(
+    [ValidateRange(1, 65535)]
+    [int]$Port
+)
+
+$ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-$port = 8765
-$url = "http://127.0.0.1:$port"
-$running = $null
+$checkout = Split-Path -Parent $PSScriptRoot
+$version = (Get-Content -LiteralPath (Join-Path $checkout 'VERSION') -Raw).Trim()
+$defaultPorts = @(8765, 8766, 8768, 8769)
+$portRequested = $PSBoundParameters.ContainsKey('Port')
+if ($portRequested -and $Port -eq 8767) {
+    throw 'Порт 8767 зарезервирован для локального помощника Plotter.'
+}
+$probePorts = if ($portRequested -and $Port -notin $defaultPorts) { $defaultPorts + $Port } else { $defaultPorts }
 try {
-    $running = Invoke-RestMethod -Uri "$url/api/status" -TimeoutSec 2
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {
+        $_.LocalAddress -in @('127.0.0.1', '0.0.0.0', '::')
+    } | Select-Object -ExpandProperty LocalPort -Unique)
 } catch {
-    $running = $null
+    $listeners = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+        Where-Object { $_.Address.ToString() -in @('127.0.0.1', '0.0.0.0', '::') } |
+        Select-Object -ExpandProperty Port -Unique)
 }
-if ($running.mode -eq 'controller' -and $running.apiVersion -eq 21 -and $running.demoAvailable -and $running.machine.directRoll -and $running.machine.continuousRoll -and $running.machine.stopDuringExternalRun -and $running.machine.liveCutProgress -and $running.machine.coordinateMove -and $running.machine.optimizedNesting -and $running.machine.ip) {
-    Start-Process $url
-    exit 0
+$runningApps = @()
+foreach ($candidate in $probePorts) {
+    if ($candidate -notin $listeners) { continue }
+    try {
+        $status = Invoke-RestMethod -Uri "http://127.0.0.1:$candidate/api/status" -TimeoutSec 2 -MaximumRedirection 0
+    } catch {
+        continue
+    }
+    if ($status.mode -eq 'controller' -and $status.apiVersion -and $status.machine.ip -and
+        !$status.centralMode -and !$status.companionMode) {
+        $runningApps += [pscustomobject]@{ Port = $candidate; Status = $status }
+    }
 }
-if ($running.machine.ip) {
-    Write-Host 'На ПК уже запущена предыдущая версия программы плоттера.'
-    Write-Host 'Когда станок остановлен, закройте первое окно запуска и снова откройте «Запустить плоттер.cmd».'
+if ($runningApps.Count) {
+    $running = $runningApps[0]
+    if ($runningApps.Count -eq 1 -and (!$portRequested -or $Port -eq $running.Port) -and
+        $running.Status.appVersion -ceq $version) {
+        Start-Process "http://127.0.0.1:$($running.Port)/"
+        exit 0
+    }
+    $runningPorts = ($runningApps | Select-Object -ExpandProperty Port) -join ', '
+    Write-Host "Локальный Plotter уже запущен на порту $runningPorts."
+    Write-Host 'Если нужна другая версия или другой порт, остановите станок, закройте прежнее окно запуска и снова запустите Plotter.'
     exit 1
+}
+if (!$portRequested) { $Port = $defaultPorts | Where-Object { $_ -notin $listeners } | Select-Object -First 1 }
+if (!$Port -or $Port -in $listeners) {
+    throw 'Нет свободного порта для Plotter. Укажите другой порт, например «Запустить плоттер.cmd -Port 8770».'
 }
 
 $runtime = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
@@ -71,5 +106,6 @@ if (!(Test-Path -LiteralPath $converter) -and !$env:PLOTTER_DWG2DXF -and !(Get-C
     }
 }
 
-& $runtime server.py --port $port --open
+$serverArguments = @('server.py', '--port', $Port, '--open')
+& $runtime @serverArguments
 exit $LASTEXITCODE

@@ -1,20 +1,24 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][uri]$CentralUrl,
-    [Parameter(Mandatory = $true)][string]$CertificatePath,
-    [string]$OutputDirectory
+    [uri]$CentralUrl,
+    [string]$CertificatePath,
+    [string]$OutputDirectory,
+    [switch]$UpdateOnly
 )
 
 $ErrorActionPreference = 'Stop'
-if ($CentralUrl.Scheme -ne 'https' -or !$CentralUrl.Host -or $CentralUrl.UserInfo -or
+if (!$UpdateOnly -and (!$CentralUrl -or !$CertificatePath -or $CentralUrl.Scheme -ne 'https' -or
+    !$CentralUrl.Host -or $CentralUrl.UserInfo -or
     $CentralUrl.AbsolutePath -ne '/' -or $CentralUrl.Query -or $CentralUrl.Fragment -or
-    $CentralUrl.HostNameType -eq 'IPv6') {
-    throw 'Supply a plain HTTPS origin with an optional port.'
+    $CentralUrl.HostNameType -eq 'IPv6')) {
+    throw 'Supply a plain HTTPS origin and a CA certificate, or use -UpdateOnly.'
 }
-$origin = $CentralUrl.GetLeftPart([UriPartial]::Authority)
+if (!$UpdateOnly) {
+    $origin = $CentralUrl.GetLeftPart([UriPartial]::Authority)
+    $certificate = (Resolve-Path -LiteralPath $CertificatePath).ProviderPath
+}
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot 'dist' }
 $output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
-$certificate = (Resolve-Path -LiteralPath $CertificatePath).ProviderPath
 $source = Join-Path $PSScriptRoot 'web-plotter'
 $version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -25,7 +29,9 @@ $setupName = "Plotter-Companion-Setup-$version-x64.exe"
 $destination = Join-Path $output $setupName
 $updateName = "plotter-companion-v$version-windows-x64.zip"
 $updateDestination = Join-Path $output $updateName
-foreach ($artifact in @($destination, $updateDestination)) {
+$artifacts = @($updateDestination)
+if (!$UpdateOnly) { $artifacts += $destination }
+foreach ($artifact in $artifacts) {
     if (Test-Path -LiteralPath $artifact) { throw "Release artifact already exists: $artifact" }
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -58,12 +64,19 @@ try {
         [IO.File]::WriteAllText((Join-Path $payload $script), $installerScript, [Text.UTF8Encoding]::new($true))
     }
     [IO.File]::WriteAllText((Join-Path $payload 'VERSION'), $version, [Text.Encoding]::ASCII)
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'CHANGELOG.md') -Destination $payload
     $serverOptions = & (Join-Path $runtime 'python.exe') -B (Join-Path $payload 'server.py') --help | Out-String
     if ($LASTEXITCODE -ne 0 -or $serverOptions -notmatch '--central-ca') {
         throw 'Bundled runtime did not load companion support for an application-local CA.'
     }
     $updateArchive = Join-Path $build $updateName
     [IO.Compression.ZipFile]::CreateFromDirectory($payload, $updateArchive, [IO.Compression.CompressionLevel]::Optimal, $false)
+    if ($UpdateOnly) {
+        New-Item -ItemType Directory -Path $output -Force | Out-Null
+        Copy-Item -LiteralPath $updateArchive -Destination $updateDestination
+        Get-FileHash -LiteralPath $updateDestination -Algorithm SHA256
+        return
+    }
 
     $caFile = Join-Path $payload 'central-ca.pem'
     $prepareCa = @'

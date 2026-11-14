@@ -7,16 +7,20 @@ from unittest.mock import Mock
 from urllib.request import Request
 from zipfile import ZipFile
 
-from app_update import AppUpdates, GitHubRedirect, METADATA_URL, REQUIRED, Release, UpdateError, download_release, extract_update, fetch_latest, latest_update
+from app_update import (
+    AppUpdates, GitHubRedirect, RELEASES_URL, REQUIRED, Release, UpdateError,
+    download_release, extract_update, fetch_release_page, find_companion_update,
+    latest_update, read_release_notes,
+)
 
 
 class AppUpdateTests(unittest.TestCase):
     def test_public_requests_use_https_without_a_token_and_limit_download_size(self):
         opener = Mock()
-        opener.open.return_value = BytesIO(b'{"tag_name":"v1.6.0"}')
-        self.assertEqual(fetch_latest(opener)["tag_name"], "v1.6.0")
+        opener.open.return_value = BytesIO(b'[{"tag_name":"v1.6.0"}]')
+        self.assertEqual(fetch_release_page(opener, 1)[0]["tag_name"], "v1.6.0")
         request = opener.open.call_args.args[0]
-        self.assertEqual(request.full_url, METADATA_URL)
+        self.assertEqual(request.full_url, f"{RELEASES_URL}?per_page=30&page=1")
         self.assertIsNone(request.get_header("Authorization"))
         release = Release("1.6.0", "plotter-companion-v1.6.0-windows-x64.zip", 4, "0" * 64)
         with TemporaryDirectory() as directory:
@@ -51,6 +55,28 @@ class AppUpdateTests(unittest.TestCase):
         self.assertIsNone(latest_update({**release, "assets": []}, "1.9.9"))
         del release["assets"][0]["digest"]
         self.assertIsNone(latest_update(release, "1.9.9"))
+
+    def test_server_only_releases_do_not_hide_the_companion_update(self):
+        import json
+
+        asset = {"name": "plotter-companion-v1.5.3-windows-x64.zip", "digest": "sha256:" + "a" * 64,
+                 "state": "uploaded", "size": 512}
+        server_only = {"tag_name": "v1.5.4", "draft": False, "prerelease": False, "assets": []}
+        releases = [server_only, {**server_only, "tag_name": "v1.5.3", "assets": [asset]}]
+        opener = Mock()
+        opener.open.side_effect = lambda *args, **kwargs: BytesIO(json.dumps(releases).encode())
+        self.assertEqual(find_companion_update(opener, "1.5.2").version, "1.5.3")
+        self.assertIsNone(find_companion_update(opener, "1.5.3"))
+
+    def test_installed_release_reads_only_matching_changelog_section(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "CHANGELOG.md").write_text(
+                "# Notes\n\n## 1.5.3\n\n- Later\n\n## 1.5.2\n\n- Current\n- Other\n\n## 1.5.1\n- Earlier\n",
+                encoding="utf-8-sig",
+            )
+            self.assertEqual(read_release_notes(root, "1.5.2"), ["Current", "Other"])
+            self.assertEqual(read_release_notes(root, "1.5.4"), [])
 
     def test_extract_checks_digest_version_and_windows_paths(self):
         with TemporaryDirectory() as directory:
