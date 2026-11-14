@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import ssl
 import subprocess
 from struct import unpack_from
@@ -45,6 +46,7 @@ from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
 ROOT = Path(__file__).resolve().parent
 APP_VERSION = read_version(ROOT)
+COMPANION_INSTALLER = f"Plotter-Companion-Setup-{APP_VERSION}-x64.exe"
 PROFILE = ROOT.parent / "research" / "machine-profile.json"
 LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
@@ -988,12 +990,15 @@ class PlotterState:
 
 class PlotterServer(PlotterState, ThreadingHTTPServer):
     def __init__(self, port, workspace_path=WORKSPACE_PATH, *, profile_path=None, public_origin=None,
-                 companion_origin=None, central_ca=None):
+                 companion_origin=None, central_ca=None, companion_installer=None):
         if public_origin and companion_origin:
             raise ValueError("Выберите один режим сервера.")
         profile_path = Path(profile_path) if profile_path is not None else PROFILE
         profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
         self.public_origin = https_origin(public_origin) if public_origin else None
+        self.companion_installer = None
+        if self.public_origin and APP_VERSION:
+            self.companion_installer = Path(companion_installer) if companion_installer else ROOT.parent / COMPANION_INSTALLER
         self.companion_origin = https_origin(companion_origin) if companion_origin else None
         self.local_companion_ui = central_ca is not None
         if self.local_companion_ui and not self.companion_origin:
@@ -1168,7 +1173,21 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/app-update":
             self.json_response(self.server.app_updates.status())
         elif path == "/api/release-notes":
-            self.json_response({"version": APP_VERSION, "notes": read_release_notes(ROOT, APP_VERSION)})
+            installer = self.server.companion_installer
+            self.json_response({"version": APP_VERSION, "notes": read_release_notes(ROOT, APP_VERSION),
+                                "companionDownload": bool(installer and installer.is_file())})
+        elif path == "/api/companion-installer":
+            installer = self.server.companion_installer
+            if installer is None:
+                raise RequestError("Установщик помощника недоступен.", HTTPStatus.NOT_FOUND)
+            try:
+                source = installer.open("rb")
+            except (FileNotFoundError, IsADirectoryError) as error:
+                raise RequestError("Установщик помощника недоступен.", HTTPStatus.NOT_FOUND) from error
+            with source:
+                size = os.fstat(source.fileno()).st_size
+                self.response_headers(size, "application/octet-stream", HTTPStatus.OK, COMPANION_INSTALLER, COMPANION_INSTALLER)
+                shutil.copyfileobj(source, self.wfile, 256 * 1024)
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
@@ -1370,9 +1389,13 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
     def respond(self, contents, content_type, status=HTTPStatus.OK, filename=None):
+        self.response_headers(len(contents), content_type, status, filename)
+        self.wfile.write(contents)
+
+    def response_headers(self, size, content_type, status, filename=None, fallback_filename="plotter.dxf"):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(contents)))
+        self.send_header("Content-Length", str(size))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -1387,9 +1410,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Plotter-Companion")
             self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
         if filename:
-            self.send_header("Content-Disposition", f"attachment; filename=plotter.dxf; filename*=UTF-8''{quote(filename, safe='')}")
+            self.send_header("Content-Disposition", f"attachment; filename={fallback_filename}; filename*=UTF-8''{quote(filename, safe='')}")
         self.end_headers()
-        self.wfile.write(contents)
 
     def log_request(self, code="-", size="-"):
         if str(code).startswith("5"):

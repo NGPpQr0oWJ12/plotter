@@ -13,7 +13,7 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage:
-  sudo bash deploy/release.sh stage VERSION SOURCE_TREE
+  sudo bash deploy/release.sh stage VERSION SOURCE_TREE [COMPANION_INSTALLER]
   sudo bash deploy/release.sh activate VERSION
   sudo bash deploy/release.sh rollback
 EOF
@@ -106,7 +106,7 @@ check_state() {
 }
 
 stage() (
-    local version=$1 source=$2 final=$root/releases/$1 preview= preview_started=0 ready=0
+    local version=$1 source=$2 installer=${3:-} final=$root/releases/$1 preview= preview_started=0 ready=0
     valid_version "$version" || fail "Invalid version label."
     [[ -f $source/web-plotter/server.py && -f $source/web-plotter/requirements.txt ]] || fail "Source tree lacks web-plotter files."
     [[ ! -e $final ]] || fail "Release directory already exists. Use a new version label."
@@ -120,6 +120,11 @@ stage() (
     install -d -m 0755 "$final/web-plotter/static"
     install -m 0644 "$source"/web-plotter/*.py "$source/web-plotter/requirements.txt" "$final/web-plotter/"
     install -m 0644 "$source/VERSION" "$final/VERSION"
+    if [[ -n $installer ]]; then
+        [[ -s $installer && ${installer##*/} == "Plotter-Companion-Setup-$version-x64.exe" ]] ||
+            fail "Installer must be the Windows EXE for this version."
+        install -m 0644 -- "$installer" "$final/${installer##*/}"
+    fi
     if [[ -f $source/CHANGELOG.md ]]; then
         install -m 0644 "$source/CHANGELOG.md" "$final/CHANGELOG.md"
     fi
@@ -141,6 +146,11 @@ stage() (
         "$final/.venv/bin/python" -B server.py --central --port "$PREVIEW_PORT" --profile "$profile" \
         --workspace "$preview/workspace.json" --public-origin "$origin"
     wait_http "http://127.0.0.1:$PREVIEW_PORT" || fail "Candidate failed isolated health checks."
+    if [[ -n $installer ]]; then
+        curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$PREVIEW_PORT/api/release-notes" |
+            python3 -c 'import json,sys; notes=json.load(sys.stdin); assert notes["version"] == sys.argv[1] and notes["companionDownload"] is True' "$version"
+        cmp -- "$installer" "$final/Plotter-Companion-Setup-$version-x64.exe"
+    fi
     systemctl stop plotter-preview.service
     preview_started=0
     touch "$final/.staged"
@@ -235,7 +245,7 @@ switch_release() (
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then usage; exit 0; fi
 case ${1:-} in
-    stage) [[ $# == 3 ]] || { usage >&2; exit 2; } ;;
+    stage) [[ $# == 3 || $# == 4 ]] || { usage >&2; exit 2; } ;;
     activate) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
     rollback) [[ $# == 1 ]] || { usage >&2; exit 2; } ;;
     *) usage >&2; exit 2 ;;
@@ -261,7 +271,7 @@ exec 9>"$root/.release.lock"
 flock -n 9 || fail "Another Plotter release command is running."
 
 case $1 in
-    stage) stage "$2" "$(realpath -- "$3")" ;;
+    stage) stage "$2" "$(realpath -- "$3")" "${4:-}" ;;
     activate)
         valid_version "$2" || fail "Invalid version label."
         switch_release "$root/releases/$2"

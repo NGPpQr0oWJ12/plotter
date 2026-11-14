@@ -130,6 +130,42 @@ class ServerFlowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Сохранённая раскладка изменилась"):
                 central.prepare_xiao(linked_plan["exportPlanId"], shared_export=True)
 
+    @unittest.skipIf(os.name == "nt", "central workspaces use Linux file locking")
+    def test_central_release_advertises_and_streams_the_local_installer(self):
+        from server import APP_VERSION, COMPANION_INSTALLER
+
+        directory = Path(self.directory.name)
+        installer = directory / COMPANION_INSTALLER
+        with PlotterServer(0, directory / "central.json", profile_path=EXAMPLE_PROFILE,
+                           public_origin="https://plotter.example.invalid", companion_installer=installer) as central:
+            worker = Thread(target=central.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+            try:
+                with closing(HTTPConnection("127.0.0.1", central.server_port, timeout=5)) as connection:
+                    connection.request("GET", "/api/release-notes")
+                    self.assertFalse(json.loads(connection.getresponse().read())["companionDownload"])
+                    connection.request("GET", "/api/companion-installer")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, HTTPStatus.NOT_FOUND)
+                    response.read()
+
+                    payload = b"MZ" + b"\0" * (512 * 1024)
+                    installer.write_bytes(payload)
+                    connection.request("GET", "/api/release-notes")
+                    notes = json.loads(connection.getresponse().read())
+                    self.assertTrue(notes["companionDownload"])
+                    self.assertEqual(notes["version"], APP_VERSION)
+                    connection.request("GET", "/api/companion-installer")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, HTTPStatus.OK)
+                    self.assertEqual(response.getheader("Content-Type"), "application/octet-stream")
+                    self.assertIn(COMPANION_INSTALLER, response.getheader("Content-Disposition"))
+                    self.assertEqual(int(response.getheader("Content-Length")), len(payload))
+                    self.assertEqual(response.read(), payload)
+            finally:
+                central.shutdown()
+                worker.join()
+
     def test_notches_are_identified_and_persisted_without_changing_cut_paths(self):
         document = ezdxf.new(units=ezdxf.units.MM)
         document.layers.new("Надсечки")
