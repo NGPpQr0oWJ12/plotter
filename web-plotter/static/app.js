@@ -2827,9 +2827,11 @@ function renderControls() {
   updateAttribute(demoSwitch, "aria-checked", String(demoMode));
   updateControl(demoSwitch, "title", demoMode ? "Вернуться к реальному станку" : "Включить виртуальный станок");
   const connectButton = $("connect-companion");
+  const useLocalPanel = location.protocol === "http:";
   updateControl(connectButton, "hidden", !centralMode || companionConnected || demoMode);
   updateControl(connectButton, "disabled", companionConnecting || locked);
-  updateText(connectButton, companionConnecting ? "Подключаем…" : "Подключить помощник");
+  updateText(connectButton, useLocalPanel ? "Открыть панель станка"
+    : companionConnecting ? "Подключаем…" : "Подключить помощник");
   renderLayoutStatistics();
   if (importing) {
     closePartMenu();
@@ -3102,7 +3104,8 @@ async function readConfiguration() {
     }
     updateDrawing({ edited: false });
     renderLive();
-    if (centralMode && !demoMode && !companionConnected && !companionConnecting && readStoredBoolean("plotter.companion")) {
+    if (location.protocol === "https:" && centralMode && !demoMode && !companionConnected && !companionConnecting
+        && readStoredBoolean("plotter.companion")) {
       void connectCompanion();
     }
     return true;
@@ -3902,7 +3905,10 @@ newCutDialog.addEventListener("close", () => {
 });
 demoSwitch.addEventListener("click", () => void toggleDemoMode());
 $("arm-button").addEventListener("click", () => void armControl());
-$("connect-companion").addEventListener("click", () => void connectCompanion());
+$("connect-companion").addEventListener("click", () => {
+  if (location.protocol === "http:") window.open(companionAddress + "/", "_blank", "noopener");
+  else void connectCompanion();
+});
 $("verify-stop-button").addEventListener("click", () => void verifyStop());
 $("simulation-button").addEventListener("click", () => void playSimulation());
 $("run-acknowledge").addEventListener("click", () => void runControllerOperation("acknowledge-run"));

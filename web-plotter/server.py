@@ -15,12 +15,13 @@ import math
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 from struct import unpack_from
 from threading import Lock, Timer
 from urllib.parse import parse_qs, quote, urlsplit
-from urllib.error import URLError
-from urllib.request import build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
+from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
 from uuid import uuid4
 import webbrowser
 
@@ -111,27 +112,57 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class CompanionWorkspace:
-    """Read the authoritative saved drawing at upload/start; never mirror or accept it from the browser."""
+    """Keep the authoritative drawing at the central server."""
 
-    def __init__(self, path, origin):
+    def __init__(self, path, origin, ca_file=None):
         self.path = path
-        self.url = origin + "/api/workspace"
-        self.opener = build_opener(NoRedirect())
+        self.origin = origin
+        handlers = [NoRedirect()]
+        if ca_file:
+            handlers += [ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context(cafile=str(ca_file)))]
+        self.opener = build_opener(*handlers)
 
     def read(self):
+        return self._request("/api/workspace")
+
+    def write(self, expected_revision, workspace):
+        payload = {"revision": expected_revision, "workspace": validate_workspace(workspace)}
+        if workspace is None:
+            return self._request("/api/new-cut", {"revision": expected_revision, "stopped": True})
+        return self._request("/api/workspace", payload)
+
+    def _request(self, endpoint, payload=None):
+        request = Request(self.origin + endpoint)
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            if len(body) > MAX_WORKSPACE_BYTES:
+                raise ValueError("Файл рабочей области слишком велик.")
+            request = Request(request.full_url, body, {"Content-Type": "application/json", "Origin": self.origin})
         try:
-            with self.opener.open(self.url, timeout=4) as response:
+            with self.opener.open(request, timeout=12 if payload is not None else 4) as response:
                 contents = response.read(MAX_WORKSPACE_BYTES + 1)
             if len(contents) > MAX_WORKSPACE_BYTES:
                 raise ValueError("Workspace too large")
             data = json.loads(contents)
-            if not isinstance(data, dict) or type(data.get("revision")) is not int:
+            if not isinstance(data, dict) or type(data.get("revision")) is not int or "workspace" not in data:
                 raise ValueError("Invalid workspace")
             if data.get("workspace") is not None:
                 data["workspace"] = validate_workspace(data["workspace"])
             return data
+        except HTTPError as error:
+            with error:
+                if error.code in (400, 409):
+                    try:
+                        message = json.loads(error.read(4096)).get("error")
+                    except (OSError, ValueError, AttributeError, RecursionError):
+                        message = None
+                    if isinstance(message, str) and message:
+                        if error.code == 409:
+                            raise WorkspaceConflict(message) from error
+                        raise RequestError(message) from error
+            raise RequestError("Помощник не смог обратиться к общей раскладке.", HTTPStatus.BAD_GATEWAY) from error
         except (URLError, OSError, ValueError, RecursionError) as error:
-            raise RequestError("Помощник не смог прочитать общую раскладку на сервере.", HTTPStatus.BAD_GATEWAY) from error
+            raise RequestError("Помощник не смог обратиться к общей раскладке.", HTTPStatus.BAD_GATEWAY) from error
 
 
 @contextmanager
@@ -950,14 +981,18 @@ class PlotterState:
         return {"reachable": reachable, "ip": self.machine_ip, "message": message}
 
 class PlotterServer(PlotterState, ThreadingHTTPServer):
-    def __init__(self, port, workspace_path=WORKSPACE_PATH, *, profile_path=None, public_origin=None, companion_origin=None):
+    def __init__(self, port, workspace_path=WORKSPACE_PATH, *, profile_path=None, public_origin=None,
+                 companion_origin=None, central_ca=None):
         if public_origin and companion_origin:
             raise ValueError("Выберите один режим сервера.")
         profile_path = Path(profile_path) if profile_path is not None else PROFILE
         profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
         self.public_origin = https_origin(public_origin) if public_origin else None
         self.companion_origin = https_origin(companion_origin) if companion_origin else None
-        workspace = (CompanionWorkspace(Path(workspace_path), self.companion_origin) if self.companion_origin
+        self.local_companion_ui = central_ca is not None
+        if self.local_companion_ui and not self.companion_origin:
+            raise ValueError("Для центра сертификации укажите адрес центрального сервера.")
+        workspace = (CompanionWorkspace(Path(workspace_path), self.companion_origin, central_ca) if self.companion_origin
                      else WorkspaceStore(workspace_path, shared=bool(self.public_origin)))
         workspace_lock = Lock()
         PlotterState.__init__(self, profile, workspace, workspace_lock, central=bool(self.public_origin),
@@ -1028,7 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch(self.preflight)
 
     def preflight(self, path, query):
-        if not self.server.companion_mode or self.headers.get("Access-Control-Request-Method") not in ("GET", "POST"):
+        if (not self.server.companion_mode or self.server.local_companion_ui
+                or self.headers.get("Access-Control-Request-Method") not in ("GET", "POST")):
             raise RequestError("Этот запрос недоступен.", HTTPStatus.METHOD_NOT_ALLOWED)
         requested = {name.strip().lower() for name in self.headers.get("Access-Control-Request-Headers", "").split(",") if name.strip()}
         if requested - {"content-type", "x-plotter-companion"}:
@@ -1039,7 +1075,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             host = self.headers.get("Host", "").lower()
             origin = self.headers.get("Origin")
-            if self.server.companion_mode:
+            if self.server.local_companion_ui:
+                allowed = ((not origin and self.command == "GET") or origin == f"http://{host}")
+                if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    allowed = (allowed and self.command == "GET" and self.path == "/"
+                               and self.headers.get("Sec-Fetch-Mode") == "navigate")
+            elif self.server.companion_mode:
                 allowed = origin == self.server.companion_origin
                 if self.command == "POST":
                     allowed = allowed and self.headers.get("X-Plotter-Companion") == str(COMPANION_PROTOCOL)
@@ -1052,7 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("Недопустимый адрес запроса.")
             path = result.path
             self.plotter = self.server
-            if self.server.companion_mode and path not in HARDWARE_ROUTES | {"/api/new-cut"}:
+            if (self.server.companion_mode and not self.server.local_companion_ui
+                    and path not in HARDWARE_ROUTES | {"/api/new-cut"}):
                 raise RequestError("Этот запрос обслуживает сервер раскладки.", HTTPStatus.NOT_FOUND)
             if path.startswith("/demo/api/"):
                 self.plotter = self.server.demo
@@ -1139,7 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/roll-reset":
             self.json_response(self.plotter.reset_roll(self.json_body(16 * 1024)))
         elif path == "/api/new-cut":
-            if self.server.companion_mode:
+            if self.server.companion_mode and not self.server.local_companion_ui:
                 data = self.json_body(16 * 1024)
                 if data.get("stopped") is not True:
                     raise RequestError("Подтвердите, что плоттер остановлен.")
@@ -1293,10 +1335,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin" if self.server.local_companion_ui else "no-referrer")
         connect = f"; connect-src 'self' http://127.0.0.1:{COMPANION_PORT}" if self.server.central_mode else ""
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'" + connect)
-        if self.server.companion_mode and self.headers.get("Origin") == self.server.companion_origin:
+        if (self.server.companion_mode and not self.server.local_companion_ui
+                and self.headers.get("Origin") == self.server.companion_origin):
             self.send_header("Access-Control-Allow-Origin", self.server.companion_origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -1322,10 +1365,13 @@ def main():
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--public-origin")
     parser.add_argument("--central-url")
+    parser.add_argument("--central-ca", type=Path, help="сертификат центра сертификации для локальной панели")
     parser.add_argument("--open", action="store_true", help="открыть приложение в браузере")
     args = parser.parse_args()
     if args.central != bool(args.public_origin) or args.companion != bool(args.central_url):
         parser.error("Для --central задайте --public-origin, для --companion задайте --central-url.")
+    if args.central_ca and not args.companion:
+        parser.error("--central-ca используется с --companion.")
     if args.central and (not args.workspace or os.name == "nt"):
         parser.error("Для --central на Linux задайте общий файл через --workspace.")
     logging.basicConfig(level=logging.INFO)
@@ -1333,7 +1379,7 @@ def main():
     port = args.port if args.port is not None else (COMPANION_PORT if args.companion else DEFAULT_PORT)
     path = args.workspace or (args.profile.parent / "workspace.json" if args.companion else WORKSPACE_PATH)
     with PlotterServer(port, path, profile_path=args.profile, public_origin=args.public_origin,
-                       companion_origin=args.central_url) as server:
+                       companion_origin=args.central_url, central_ca=args.central_ca) as server:
         url = f"http://{LOCAL_ADDRESS}:{server.server_port}"
         print(f"Плоттер запущен: {url}", flush=True)
         if args.open:

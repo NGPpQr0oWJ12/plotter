@@ -1,6 +1,6 @@
 # Центральный плоттер на Ubuntu
 
-Пользователи открывают один согласованный HTTPS-адрес в локальной сети. Nginx передаёт запросы одному экземпляру Plotter через loopback. Старые workers Nginx завершают начатые запросы при перезагрузке конфигурации. Сервисы Plotter запускаются отдельными экземплярами systemd с собственными портами и виртуальными окружениями.
+Nginx передаёт запросы одному экземпляру Plotter через loopback. Старые workers Nginx завершают начатые запросы при перезагрузке конфигурации. Сервисы Plotter запускаются отдельными экземплярами systemd с собственными портами и виртуальными окружениями.
 
 Приложение использует общий файл `/srv/plotter/shared/workspace.json`. Резервная копия рабочей области и журнал находятся рядом. Во время переключения обновления защищены межпроцессной блокировкой и проверкой ревизии рабочей области. Кандидат на изолированном порту использует временную копию файлов. Команды станка выполняет локальная панель у станка. Центральная панель работает с подготовкой чертежей и экспортом.
 
@@ -38,7 +38,37 @@
    sudo install -m 0644 deploy/plotter.nginx.conf.example /etc/nginx/sites-available/plotter.conf
    ```
 
-   Замените `PLOTTER_HOST` и `PLOTTER_PORT` значениями из конфигурации. Ограничьте Nginx интерфейсом локальной сети и loopback для проверки релиза. Включите отдельный виртуальный хост, выполните `nginx -t` и перезагрузите Nginx. Журналирование приложения доступно через `journalctl -u 'plotter@*.service'`.
+   Замените `PLOTTER_HOST` и `PLOTTER_PORT` значениями из конфигурации, а `PLOTTER_ORIGIN` полным HTTPS-адресом. Ограничьте Nginx интерфейсом локальной сети и loopback для проверки релиза. Включите отдельный виртуальный хост, выполните `nginx -t` и перезагрузите Nginx. Журналирование приложения доступно через `journalctl -u 'plotter@*.service'`.
+
+## HTTP-адрес для браузеров в локальной сети
+
+Для рабочих мест в доверенной сети можно включить отдельный HTTP-виртуальный хост из `deploy/plotter.http.nginx.conf.example`. В примере браузеры открывают `http://plotter.example.invalid:8080`, а локальный помощник использует существующий центральный API `https://plotter.example.invalid:8443`. Адреса и порты замените согласованными значениями. Для HTTPS помощнику нужен проверяемый сертификат или явно настроенный доверенный сертификат УЦ. HTTP передаёт данные без шифрования. Ограничьте доступ к нему согласованной сетью и интерфейсом, включая правила брандмауэра.
+
+Задайте IPv4 интерфейса в `http_bind` и разрешённую подсеть CIDR в `lan_cidr`. Для HTTP на стандартном порту 80 и HTTPS на стандартном порту 443 оставьте порт только в отдельной переменной порта, опустив его из соответствующего значения `*_authority`. Используйте одно каноническое имя для сотрудников. HTTP-порт должен быть свободен на выбранном интерфейсе.
+
+```bash
+http_host=plotter.example.invalid
+http_port=8080
+http_authority=plotter.example.invalid:8080
+https_authority=plotter.example.invalid:8443
+http_bind=192.0.2.10
+lan_cidr=192.0.2.0/24
+
+sed -e "s|PLOTTER_HTTP_BIND|$http_bind|g" \
+    -e "s|PLOTTER_HTTP_PORT|$http_port|g" \
+    -e "s|PLOTTER_HTTP_HOST|$http_host|g" \
+    -e "s|PLOTTER_HTTP_AUTHORITY|$http_authority|g" \
+    -e "s|PLOTTER_HTTP_ORIGIN|http://$http_authority|g" \
+    -e "s|PLOTTER_HTTPS_AUTHORITY|$https_authority|g" \
+    -e "s|PLOTTER_HTTPS_ORIGIN|https://$https_authority|g" \
+    -e "s|PLOTTER_LAN_CIDR|$lan_cidr|g" \
+    deploy/plotter.http.nginx.conf.example |
+    sudo tee /etc/nginx/sites-available/plotter-http.conf >/dev/null
+sudo ln -s /etc/nginx/sites-available/plotter-http.conf /etc/nginx/sites-enabled/plotter-http.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+`https_authority` должен совпадать с именем и портом в существующем `PUBLIC_ORIGIN`. Оба хоста используют один upstream и одну рабочую область. HTTP-хост передаёт центральному приложению фиксированный HTTPS Host. Он заменяет Origin только при точном совпадении с настроенным HTTP-адресом. Запросы GET и HEAD проходят без Origin, а запросы с посторонним Origin, `null` либо без Origin при записи получают 403. Правила доступа к существующему HTTPS-адресу остаются в его конфигурации.
 
 ## Публикация и возврат версии
 

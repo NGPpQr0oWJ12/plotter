@@ -32,6 +32,7 @@ $files = @(
     'deploy/check-state.py',
     'deploy/deploy.conf.example',
     'deploy/plotter.nginx.conf.example',
+    'deploy/plotter.http.nginx.conf.example',
     'deploy/plotter@.service',
     'deploy/release.sh',
     'research/machine-profile.example.json',
@@ -101,6 +102,17 @@ try {
     $archive = [IO.Compression.ZipFile]::Open($stagedArchive, [IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($relativePath in $files) {
+            if ($relativePath.EndsWith('.sh')) {
+                $entry = $archive.CreateEntry("$entryRoot/$relativePath")
+                $writer = New-Object IO.StreamWriter($entry.Open(), $utf8)
+                try {
+                    $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot $relativePath))
+                    $writer.Write($source.Replace([string]([char]13) + [char]10, [string][char]10))
+                } finally {
+                    $writer.Dispose()
+                }
+                continue
+            }
             [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $archive, (Join-Path $PSScriptRoot $relativePath), "$entryRoot/$relativePath",
                 [IO.Compression.CompressionLevel]::Optimal

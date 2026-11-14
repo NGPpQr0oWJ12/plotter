@@ -16,7 +16,7 @@ import ezdxf
 from controller import ControllerError
 from cut_journal import CutJournal
 from server import CutProgress, PlotterServer, RollRun
-from workspace import WorkspaceStore
+from workspace import WorkspaceConflict, WorkspaceStore
 
 EXAMPLE_PROFILE = Path(__file__).resolve().parent.parent / "research" / "machine-profile.example.json"
 
@@ -75,6 +75,40 @@ class ServerFlowTests(unittest.TestCase):
 
     def save(self, workspace, revision=0):
         return self.request("/api/workspace", {"revision": revision, "workspace": workspace})["revision"]
+
+    def test_local_companion_serves_ui_and_only_allows_same_origin_mutations(self):
+        with patch("server.Controller", return_value=self.controller), patch("server.ssl.create_default_context"), \
+                PlotterServer(0, Path(self.directory.name) / "companion.json", profile_path=EXAMPLE_PROFILE,
+                              companion_origin="https://plotter.example.invalid", central_ca=Path("cert.pem")) as companion:
+            worker = Thread(target=companion.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+            host = f"127.0.0.1:{companion.server_port}"
+
+            def request(method, path, expected, headers=None, body=None):
+                with closing(HTTPConnection(host, timeout=5)) as connection:
+                    connection.request(method, path, headers=headers or {}, body=body)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected)
+                    self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+                    return response.read()
+
+            try:
+                request("GET", "/", HTTPStatus.OK, {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"})
+                request("GET", "/api/status", HTTPStatus.FORBIDDEN, {"Sec-Fetch-Site": "cross-site"})
+                self.assertTrue(json.loads(request("GET", "/api/status", HTTPStatus.OK))["companionMode"])
+                payload = json.dumps({"revision": 0, "workspace": drawing()})
+                headers = {"Content-Type": "application/json"}
+                request("POST", "/api/workspace", HTTPStatus.FORBIDDEN, headers, payload)
+                headers["Origin"] = "http://" + host
+                with patch.object(companion.workspace, "write", return_value={"revision": 1, "workspace": drawing()}) as save:
+                    request("POST", "/api/workspace", HTTPStatus.OK, headers, payload)
+                    save.assert_called_once_with(0, drawing())
+                    save.side_effect = WorkspaceConflict("shared revision advanced")
+                    request("POST", "/api/workspace", HTTPStatus.CONFLICT, headers, payload)
+                self.controller.operate.assert_not_called()
+            finally:
+                companion.shutdown()
+                worker.join()
 
     @unittest.skipIf(os.name == "nt", "central workspaces use Linux file locking")
     def test_shared_export_remains_available_with_the_companion_cut_plan(self):

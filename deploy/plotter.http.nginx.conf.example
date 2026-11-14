@@ -1,0 +1,32 @@
+server {
+    listen PLOTTER_HTTP_BIND:PLOTTER_HTTP_PORT;
+    server_name PLOTTER_HTTP_HOST;
+    client_max_body_size 128m;
+
+    allow PLOTTER_LAN_CIDR;
+    deny all;
+
+    location / {
+        # Reject other authorities even when this is the default vhost on the socket.
+        if ($http_host != "PLOTTER_HTTP_AUTHORITY") { return 403; }
+
+        set $plotter_http_request "$request_method:$http_origin";
+        set $plotter_http_upstream_origin "null";
+        if ($plotter_http_request ~ "^(GET|HEAD):$") {
+            set $plotter_http_upstream_origin "";
+        }
+        if ($http_origin = "PLOTTER_HTTP_ORIGIN") {
+            set $plotter_http_upstream_origin "PLOTTER_HTTPS_ORIGIN";
+        }
+        if ($plotter_http_upstream_origin = "null") { return 403; }
+
+        include /etc/nginx/plotter/upstream.conf;
+        proxy_http_version 1.1;
+        proxy_set_header Host "PLOTTER_HTTPS_AUTHORITY";
+        proxy_set_header Origin $plotter_http_upstream_origin;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_request_buffering on;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 120s;
+    }
+}
