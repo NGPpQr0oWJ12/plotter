@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/workplaces.css">
   <link rel="stylesheet" href="/designer-cad.css">
+  <link rel="stylesheet" href="/plotter-monochrome.css">
   <script src="/simulation.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
@@ -49,12 +50,7 @@
     <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/></symbol>
-  </svg>
-
-  <header class="topbar">
-    <div class="brand-group">
-      <h1 class="brand" aria-label="La Rocca">
-      <svg class="brand-logo" viewBox="0 0 900 176" fill="#fff" aria-hidden="true">
+    <symbol id="logo-la-rocca" viewBox="0 0 900 176">
         <path d="M 234.22 0.00 L 234.29 29.88 Q 234.29 30.42 233.75 30.41 Q 225.04 30.27 218.56 30.54 Q 198.08 31.39 183.48 44.66 Q 169.69 57.18 166.15 75.41 Q 165.07 80.98 165.04 95.26 Q 165.02 104.93 165.06 172.65 Q 165.06 173.21 164.50 173.21 L 136.05 173.21 Q 135.49 173.21 135.52 172.65 Q 135.62 170.97 135.37 169.51 Q 135.05 167.64 135.05 166.38 Q 135.10 149.00 134.22 130.46 Q 133.95 124.61 133.65 102.67 Q 133.55 95.79 133.72 84.05 Q 133.88 73.51 135.83 65.63 Q 138.74 53.89 141.92 47.45 Q 155.51 19.94 182.74 8.72 Q 199.27 1.91 219.26 0.00 L 234.22 0.00 Z"/>
         <path d="M 342.16 0.00 Q 372.43 2.05 393.82 21.81 Q 401.22 28.65 406.82 36.97 Q 427.45 67.64 420.45 104.69 Q 418.52 114.96 414.25 123.60 Q 409.23 133.78 403.40 141.13 C 388.27 160.20 365.55 172.49 340.83 173.18 Q 309.80 174.05 285.77 154.57 C 260.19 133.83 248.80 99.28 255.87 66.97 Q 255.99 66.39 256.58 66.44 Q 257.73 66.53 258.92 66.86 Q 270.58 70.06 283.45 74.21 A 1.09 1.09 0.0 0 1 284.21 75.31 Q 283.75 83.24 283.75 83.25 Q 282.50 110.10 301.59 128.38 C 308.73 135.22 318.90 140.23 328.96 141.99 Q 342.01 144.28 355.39 139.79 Q 364.54 136.72 372.59 129.91 C 390.47 114.76 397.14 90.24 389.15 67.43 Q 383.75 51.99 370.77 41.83 C 354.91 29.42 335.35 27.40 316.49 34.96 Q 315.86 35.22 315.57 34.60 L 303.52 8.49 A 0.89 0.89 0.0 0 1 303.98 7.30 Q 318.23 1.22 333.94 0.00 L 342.16 0.00 Z"/>
         <path d="M 813.37 0.00 Q 827.10 0.72 840.29 4.25 C 861.08 9.83 877.86 22.77 887.75 41.77 Q 893.23 52.27 896.06 63.19 Q 898.80 73.74 900.00 86.01 L 900.00 176.00 L 868.24 176.00 L 868.02 152.23 Q 868.01 150.97 867.07 151.81 Q 845.14 171.58 815.51 173.14 C 798.46 174.04 781.51 169.48 767.17 160.16 Q 758.28 154.37 751.85 147.43 Q 723.57 116.87 728.41 74.87 Q 730.59 55.95 741.23 39.21 Q 746.61 30.74 753.83 23.71 Q 776.08 2.02 808.48 0.00 L 813.37 0.00 Z M 811.5042 142.7997 A 56.10 54.49 90.2 0 0 866.1897 86.8902 A 56.10 54.49 90.2 0 0 811.8958 30.6003 A 56.10 54.49 90.2 0 0 757.2103 86.5098 A 56.10 54.49 90.2 0 0 811.5042 142.7997 Z"/>
@@ -62,25 +58,48 @@
         <path d="M 713.88 160.10 Q 700.49 168.47 685.91 171.61 Q 676.51 173.64 666.04 173.15 Q 640.12 171.94 620.54 157.20 Q 589.87 134.12 585.43 95.42 Q 584.32 85.77 585.72 75.47 Q 589.71 45.96 610.00 25.14 Q 617.16 17.80 625.55 12.64 Q 657.03 -6.73 694.65 4.04 A 0.96 0.95 -74.4 0 1 695.30 5.21 L 687.79 32.66 A 1.01 0.99 15.8 0 1 686.54 33.35 Q 660.70 25.85 640.07 39.28 Q 631.58 44.81 625.63 52.96 Q 614.89 67.67 614.77 85.92 Q 614.61 111.33 633.11 128.55 Q 644.30 138.97 659.59 141.89 C 672.15 144.29 685.51 141.56 696.50 135.10 A 0.43 0.42 57.3 0 1 697.06 135.23 L 714.01 159.51 A 0.42 0.40 -33.4 0 1 713.88 160.10 Z"/>
         <path d="M 101.68 72.44 A 0.45 0.44 -21.1 0 0 100.94 72.12 Q 91.04 80.97 77.76 80.58 C 60.57 80.09 47.99 67.87 44.52 51.32 Q 43.22 45.12 44.63 38.75 Q 46.28 31.32 49.14 26.65 Q 56.30 14.98 69.17 11.11 C 77.82 8.50 88.74 9.81 96.71 13.90 C 109.12 20.27 114.45 33.68 114.90 47.33 Q 115.29 59.08 114.92 81.55 Q 114.91 82.04 114.43 82.04 L 101.99 82.02 Q 101.57 82.02 101.57 81.61 L 101.68 72.44 Z M 78.2511 68.0472 A 22.85 22.24 90.9 0 0 100.8473 45.5493 A 22.85 22.24 90.9 0 0 78.9689 22.3528 A 22.85 22.24 90.9 0 0 56.3727 44.8507 A 22.85 22.24 90.9 0 0 78.2511 68.0472 Z"/>
         <path d="M 0.00 47.48 L 0.00 30.88 L 0.85 11.62 Q 0.88 10.98 1.51 10.98 L 12.11 10.99 Q 13.02 10.99 13.01 11.87 Q 12.97 21.24 12.99 41.77 Q 12.99 50.74 14.54 54.88 Q 18.52 65.55 30.30 68.98 Q 33.01 69.76 40.90 69.60 Q 41.38 69.59 41.38 70.05 L 41.36 81.53 Q 41.36 82.07 40.80 82.10 Q 27.97 82.83 16.73 76.77 Q 12.98 74.75 10.04 71.69 Q 0.45 61.72 0.00 47.48 Z"/>
-      </svg>
+    </symbol>
+  </svg>
+
+  <header class="topbar" id="workplace-topbar" hidden>
+    <div class="brand-group">
+      <h1 class="brand" aria-label="La Rocca">
+        <svg class="brand-logo" viewBox="0 0 900 176" fill="currentColor" aria-hidden="true"><use href="#logo-la-rocca"/></svg>
       </h1>
       <span id="app-version" class="app-version" hidden></span>
       <button class="button topbar-secondary release-notes-button" id="release-notes-button" type="button" aria-haspopup="dialog" aria-controls="release-notes-dialog">Релиз</button>
     </div>
     <div class="topbar-actions">
-      <nav class="workplace-tabs" aria-label="Рабочие места">
-        <button class="button" type="button" id="operator-tab" aria-pressed="true">Оператор</button>
-        <button class="button" type="button" id="designer-tab" aria-pressed="false">Конструктор</button>
-      </nav>
+      <span id="workplace-role" class="workplace-role"></span>
       <span id="workspace-save" class="workspace-save" role="status" hidden></span>
       <button class="button topbar-secondary" id="app-update" type="button" aria-describedby="app-update-status" hidden disabled>Обновить помощник</button>
       <span id="app-update-status" class="visually-hidden" role="status"></span>
       <button class="button topbar-secondary" id="new-cut-button" type="button" hidden disabled>Новый раскрой</button>
+      <button class="button topbar-secondary" id="workplace-exit" type="button">Выйти</button>
       <input id="file-input" type="file" accept=".dxf,.dwg" hidden>
     </div>
   </header>
 
-  <main class="workplace-page" id="workplace-page"></main>
+  <main class="role-picker" id="role-picker" aria-labelledby="role-picker-title">
+    <div class="role-picker-content">
+      <svg class="role-picker-logo" viewBox="0 0 900 176" fill="currentColor" role="img" aria-label="La Rocca"><use href="#logo-la-rocca"/></svg>
+      <h1 id="role-picker-title" tabindex="-1">Выберите рабочее место</h1>
+      <div class="role-picker-options">
+        <button class="role-choice role-choice-operator" type="button" id="operator-tab">
+          <svg class="icon role-choice-icon" aria-hidden="true"><use href="#i-nest"/></svg>
+          <strong>Оператор</strong><span>Наряды и раскрой</span>
+          <svg class="icon role-choice-arrow" aria-hidden="true"><use href="#i-arrow-right"/></svg>
+        </button>
+        <button class="role-choice role-choice-designer" type="button" id="designer-tab">
+          <svg class="icon role-choice-icon" aria-hidden="true"><use href="#i-drawing-file"/></svg>
+          <strong>Конструктор</strong><span>Лекала и подготовка нарядов</span>
+          <svg class="icon role-choice-arrow" aria-hidden="true"><use href="#i-arrow-right"/></svg>
+        </button>
+      </div>
+      <p id="role-picker-status" class="workplace-status" role="alert" hidden></p>
+    </div>
+  </main>
+  <main class="workplace-page" id="workplace-page" hidden></main>
   <main class="workspace" id="layout-workplace" hidden>
     <div class="workplace-dock" id="workplace-dock" hidden></div>
     <section class="drawing" aria-label="Раскладка">
@@ -308,11 +327,27 @@
       <button type="button" role="menuitemradio" data-part-rotation="" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>По общим настройкам</button>
     </div>
     <div class="part-menu-group" role="group" aria-label="Действия с деталью">
+      <button type="button" role="menuitem" id="part-menu-edit" data-part-action="edit" tabindex="-1" hidden>Редактировать в конструкторе</button>
       <button type="button" role="menuitem" data-part-action="placement" aria-haspopup="dialog" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>Размер и положение</button>
       <button type="button" role="menuitem" id="part-menu-exclude" data-part-action="exclude" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-minus"/></svg><span>Исключить из раскроя</span></button>
       <button type="button" role="menuitem" id="part-menu-delete" class="part-menu-delete" data-part-action="delete" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Удалить деталь</button>
     </div>
   </div>
+
+  <dialog class="plotter-dialog confirm-action-dialog" id="confirm-action-dialog" aria-labelledby="confirm-action-title">
+    <form method="dialog">
+      <header class="drawing-dialog-heading">
+        <h2 id="confirm-action-title"></h2>
+      </header>
+      <div class="drawing-dialog-body confirm-action-body">
+        <p id="confirm-action-message"></p>
+      </div>
+      <footer class="dialog-actions">
+        <button class="button" type="submit" value="cancel" id="confirm-action-cancel" autofocus>Отмена</button>
+        <button class="button primary" type="submit" value="confirm" id="confirm-action-submit"></button>
+      </footer>
+    </form>
+  </dialog>
 
   <dialog class="plotter-dialog" id="release-notes-dialog" aria-labelledby="release-notes-title">
     <header class="drawing-dialog-heading">
@@ -419,6 +454,7 @@
     </header>
     <form id="nest-form">
       <div class="drawing-dialog-body">
+        <p id="nest-scope"></p>
         <div class="drawing-fields">
           <label>Ширина полотна, мм<input id="nest-width" type="number" min="1" max="1650" step="any" placeholder="1380" value="1380"></label>
           <label>Длина полотна, мм<input id="nest-length" type="number" min="1" max="1000000000" step="any" placeholder="Без ограничения"></label>

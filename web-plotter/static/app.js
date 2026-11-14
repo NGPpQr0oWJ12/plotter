@@ -26,7 +26,7 @@ const CLOSE_ZOOM_SPACING_PX = 60;
 const ROTATION_SNAP_STEP = 45;
 const MEASUREMENT_SNAP_PX = 14;
 const MEASUREMENT_AXIS_THRESHOLD_PX = 5;
-const MEASUREMENT_COLORS = ["#2159bc", "#8c359a", "#a94b0e", "#007881", "#b1264f"];
+const MEASUREMENT_COLORS = ["#171717", "#535353", "#6c6c6c", "#343434", "#808080"];
 const sectionColors = ["#373737", "#5a5a5a", "#444444", "#686868"];
 const trackedHeadStates = new Set(["ready", "starting", "running", "pausing", "paused", "resuming", "cancelling"]);
 const number = (value) => formatNumber.format(value);
@@ -41,6 +41,7 @@ const companionAddress = "http://127.0.0.1:8767";
 const companionRoutes = new Set(["/api/status", "/api/cut-plan", "/api/controller-live", "/api/control-session",
   "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset", "/api/cut-context"]);
 let managedCut = null;
+let workplaces = null;
 let hardwareCutId = null;
 const layoutVisible = () => !$("layout-workplace").hidden;
 const layoutReadOnly = () => managedCut?.mode === "preview" || managedCut?.mode === "operator" && managedCut?.status === "done";
@@ -124,6 +125,7 @@ let contourRepairProposal = null;
 const contourCheckDialog = $("contour-check-dialog");
 let nestingSettings = null;
 let nestRequest = null;
+let nestSelection = new Set();
 let nestBlocking = [];
 let jobError = "";
 let isLoading = false;
@@ -1790,7 +1792,7 @@ function identifyDrawingParts() {
       for (const { number: id, indices, rotation, notchIndices } of result.parts) {
         const notches = new Set(notchIndices);
         for (const index of indices) {
-          numbered[index] = { ...paths[index], partNumber: paths[index].partNumber ?? id,
+          numbered[index] = { ...paths[index], partNumber: id,
             ...(rotation ? { partRotation: rotation } : {}),
             ...(Array.isArray(notchIndices) ? { notch: notches.has(index) } : {}) };
         }
@@ -2258,7 +2260,7 @@ function setNestStatus(message, blocking = [], error = true, offerRotation = fal
 
 function showNestingBackendStatus() {
   if (nestingBackend === "checking") setNestStatus("Проверяем версию программы…", [], false);
-  if (nestingBackend === "ready") setNestStatus("");
+  if (nestingBackend === "ready") setNestStatus(hasNestingPaths() ? "" : emptyNestingMessage());
   if (nestingBackend === "outdated") {
     setNestStatus("Запущена старая версия автораскладки. Когда станок остановлен, закройте окно запуска плоттера, снова откройте «Запустить плоттер.cmd» и нажмите «Проверить версию снова».");
   }
@@ -2299,6 +2301,21 @@ function applyNestingSettings() {
   $("nest-rotation").value = ["any", "quarter"].includes(nestingSettings?.rotation) ? "any" : "none";
 }
 
+function nestingIndices() {
+  const selected = nestSelection.size ? expandToWholeParts(nestSelection) : null;
+  return placed.flatMap((_, index) => !excluded.has(index) && (!selected || selected.has(index)) ? [index] : []);
+}
+
+function hasNestingPaths() {
+  return nestSelection.size
+    ? [...nestSelection].some(index => placed[index] && !excluded.has(index))
+    : placed.length > excluded.size;
+}
+
+function emptyNestingMessage() {
+  return nestSelection.size ? "В выделении нет деталей, включённых в раскрой." : "Нет деталей, включённых в раскрой.";
+}
+
 async function applyNesting() {
   if (drawingLocked() || !nestDialog.open || nestingBackend !== "ready" || !$("nest-form").reportValidity()) return;
   const indices = [];
@@ -2325,13 +2342,16 @@ async function applyNesting() {
   try {
     await identifyDrawingParts();
     if (signal.aborted) return;
-    for (const [index, path] of placed.entries()) {
-      if (excluded.has(index)) continue;
+    for (const index of nestingIndices()) {
+      const path = placed[index];
       const rotation = drawingParts.get(path.partNumber)?.rotation;
       paths.push(rotation ? { ...path, partRotation: rotation } : path);
       indices.push(index);
     }
-    if (!paths.length) return;
+    if (!paths.length) {
+      setNestStatus(emptyNestingMessage());
+      return;
+    }
     const layout = await getJson("/api/nest", jsonRequest({ paths, ...settings }, signal));
     if (abort.signal.aborted) return;
     if (runInProgress() || activeRun?.state === "transferring") {
@@ -2346,8 +2366,16 @@ async function applyNesting() {
       throw new Error("Полученная раскладка не подходит для заданной длины полотна и разбиения на проходы.");
     }
     const next = placed.slice();
+    const nextExcluded = new Set(excluded);
     indices.forEach((index, i) => { next[index] = layout.paths[i]; });
-    const moves = new Map(layout.placements.map((part) => [part.partNumber, part]));
+    if (nestSelection.size) {
+      const laidOut = new Set(indices);
+      for (const index of placed.keys()) if (!laidOut.has(index)) nextExcluded.add(index);
+    }
+    const moves = new Map();
+    for (const move of layout.placements) {
+      for (const member of move.indices) moves.set(paths[member].partNumber, move);
+    }
     for (const index of excluded) {
       const path = placed[index];
       const move = moves.get(path.partNumber);
@@ -2363,10 +2391,12 @@ async function applyNesting() {
         const dy = y - oldY;
         return [newX + cosine * dx - sine * dy, newY + sine * dx + cosine * dy];
       });
+      next[index].partNumber = move.partNumber;
       next[index].partAngle = normalizeAngle((path.partAngle ?? 0) + move.angle);
     }
     rememberDrawing("автораскладку");
     placed = next;
+    excluded = nextExcluded;
     nestingSettings = { ...settings, widthExplicit: Boolean(managedCut) || settings.widthMm !== defaultFabricWidthMm() };
     nestRequest = null;
     nestDialog.close();
@@ -2431,12 +2461,12 @@ function setSaveError(message = "") {
   status.classList.toggle("failed", Boolean(message));
 }
 
-function workspaceSnapshot() {
+function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
   if (!source) return null;
   return {
     source: { filename: source.filename, warnings: source.warnings || [] },
-    paths: placed,
-    excluded: [...excluded],
+    paths,
+    excluded: [...excludedIndices],
     view: {
       zoom: camera && baseCamera ? camera.width / baseCamera.width : 1,
       focusX: camera ? camera.x + camera.width / 2 : 0,
@@ -2460,6 +2490,14 @@ function scheduleWorkspaceSave() {
   saveTimer = setTimeout(() => void persistWorkspace(), 250);
 }
 
+function writeWorkspace(workspace, partCorrection = false) {
+  return getJson(managedCut ? "/api/operator-workspace" : "/api/workspace", jsonRequest({
+    revision: workspaceRevision, workspace,
+    ...(managedCut ? { action: "save", cutId: managedCut.id, mode: managedCut.mode } : {}),
+    ...(partCorrection ? { partCorrection: true } : {}),
+  }, AbortSignal.timeout(30_000)));
+}
+
 function persistWorkspace() {
   clearTimeout(saveTimer);
   if (savePromise) return savePromise;
@@ -2469,10 +2507,7 @@ function persistWorkspace() {
     try {
       while (workspaceSaved !== workspaceChange) {
         const change = workspaceChange;
-        const response = await getJson(managedCut ? "/api/operator-workspace" : "/api/workspace", jsonRequest({
-          revision: workspaceRevision, workspace: workspaceSnapshot(),
-          ...(managedCut ? { action: "save", cutId: managedCut.id, mode: managedCut.mode } : {}),
-        }, AbortSignal.timeout(30_000)));
+        const response = await writeWorkspace(workspaceSnapshot());
         if (managedCut) {
           if (managedCut.cutRevision !== response.cutRevision) resetCutPlan({ keepView: true });
           managedCut.cutRevision = response.cutRevision;
@@ -2616,7 +2651,7 @@ function requestCutPlan() {
   return promise;
 }
 
-function updateDrawing({ edited = true, keepView = edited, keepRotation = false, changedIndices = null } = {}) {
+function updateDrawing({ edited = true, keepView = edited, keepRotation = false, changedIndices = null, save = edited } = {}) {
   cancelCanvasGesture();
   if (!keepRotation) endFreeRotation();
   closePartMenu();
@@ -2646,7 +2681,7 @@ function updateDrawing({ edited = true, keepView = edited, keepRotation = false,
   } else renderPaths();
   if (changedIndices && keepRotation) renderFreeRotation();
   updateSelection();
-  if (edited) scheduleWorkspaceSave();
+  if (save) scheduleWorkspaceSave();
   if (changedIndices) {
     renderSelectionControls(drawingLocked());
     if (affectsCut) renderLayoutStatistics();
@@ -3949,6 +3984,10 @@ contourCheckDialog.addEventListener("close", () => {
 });
 $("nest-button").addEventListener("click", () => {
   cancelCanvasGesture();
+  nestSelection = new Set(selection);
+  $("nest-scope").textContent = nestSelection.size
+    ? "В раскрой попадут только выделенные детали. Остальные останутся на чертеже как исключённые."
+    : "В раскрой попадут все включённые детали.";
   applyNestingSettings();
   nestDialog.showModal();
   void checkNestingBackend();
@@ -4031,8 +4070,11 @@ function updateOptimizationControls() {
     updateText($("optimize-dismiss"), canApply ? "Отмена" : "Закрыть");
     renderRouteComparison(outdated, join);
   }
-  $("nest-apply").disabled = locked || nestingBackend !== "ready" || placed.length === excluded.size;
-  $("nest-apply").textContent = nestRequest ? "Рассчитываем…" : "Разложить на полотне";
+  if (nestDialog.open) {
+    const canApply = !locked && nestingBackend === "ready" && hasNestingPaths();
+    updateControl($("nest-apply"), "disabled", !canApply);
+    updateText($("nest-apply"), nestRequest ? "Рассчитываем…" : nestSelection.size ? "Разложить выделенное" : "Разложить на полотне");
+  }
   const closeLabel = nestRequest ? "Отменить расчёт" : "Закрыть";
   $("nest-cancel").title = closeLabel;
   $("nest-cancel").setAttribute("aria-label", closeLabel);
@@ -4699,6 +4741,7 @@ function openPartMenu(part, x, y) {
   updateText(status, omit ? "Исключена" : "В раскрое");
   status.classList.toggle("is-excluded", omit);
   const excludeAction = $("part-menu-exclude");
+  $("part-menu-edit").hidden = !canCorrectLayoutPart();
   updateText(excludeAction.querySelector("span"), omit ? "Вернуть в раскрой" : "Исключить из раскроя");
   updateAttribute(excludeAction.querySelector("use"), "href", omit ? "#i-plus" : "#i-minus");
   for (const button of partMenu.querySelectorAll("[data-part-rotation]")) {
@@ -4723,7 +4766,8 @@ for (const button of partMenuButtons) {
     if (button.dataset.partAction) {
       setMeasureMode(false);
       setSelection(new Set(part.indices));
-      if (button.dataset.partAction === "exclude") toggleSelectionExcluded();
+      if (button.dataset.partAction === "edit") void openLayoutPart(part);
+      else if (button.dataset.partAction === "exclude") toggleSelectionExcluded();
       else if (button.dataset.partAction === "delete") deleteSelection();
       else contourDialog.showModal();
       return;
@@ -4753,13 +4797,14 @@ for (const button of partMenuButtons) {
   });
 }
 partMenu.addEventListener("keydown", (event) => {
-  const index = partMenuButtons.indexOf(event.target);
-  const last = partMenuButtons.length - 1;
+  const available = partMenuButtons.filter(button => !button.hidden);
+  const index = available.indexOf(event.target);
+  const last = available.length - 1;
   if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
     event.preventDefault();
     const next = event.key === "Home" ? 0 : event.key === "End" ? last
       : (index + (event.key === "ArrowDown" ? 1 : last)) % partMenuButtons.length;
-    const target = partMenuButtons[next];
+    const target = available[next];
     const item = target.getBoundingClientRect();
     const menu = partMenu.getBoundingClientRect();
     if (item.bottom > menu.bottom - 5) partMenu.scrollTop += item.bottom - menu.bottom + 5;
@@ -4779,7 +4824,11 @@ window.addEventListener("scroll", (event) => {
 }, true);
 
 svg.addEventListener("contextmenu", (event) => {
-  if (camera && placed.length) event.preventDefault();
+  if (!camera || !placed.length) return;
+  event.preventDefault();
+  if (measureMode || event.target.closest("[data-canvas-page], [data-rotation-handle]")) return;
+  const index = contourAt(event, drawingPoint(event));
+  openPartMenu(drawingParts.get(placed[index]?.partNumber), event.clientX, event.clientY);
 });
 
 svg.addEventListener("dblclick", (event) => {
@@ -4788,7 +4837,9 @@ svg.addEventListener("dblclick", (event) => {
   lastPartClick = null;
   if (!click?.samePart || click.paths !== placed) return;
   event.preventDefault();
-  openPartMenu(drawingParts.get(click.number), event.clientX, event.clientY);
+  const part = drawingParts.get(click.number);
+  if (canCorrectLayoutPart()) void openLayoutPart(part);
+  else openPartMenu(part, event.clientX, event.clientY);
 });
 function drawMarquee(from, to, crossing) {
   const rect = $("selection-marquee");
@@ -5259,6 +5310,137 @@ function workspaceQuery(id, mode) {
   return `/api/operator-workspace?${new URLSearchParams({ cutId: id, mode })}`;
 }
 
+function canCorrectLayoutPart() {
+  return layoutVisible() && !layoutPreparation() && !drawingLocked() && !busy()
+    && !live.stopAvailable && !currentUpload && !xiaoHandoff && activeRun?.state !== "transferring";
+}
+
+let openingLayoutPart = false;
+
+function layoutPartEntities(paths) {
+  const entities = paths.map((path, index) => ({
+    id: `layout-${index}`, type: "polyline", points: path.points, layer: path.layer || "0", closed: path.closed,
+    ...(path.notch ? { notch: true } : {}),
+  }));
+  const outlines = entities.filter(entity => entity.closed && !entity.notch);
+  let checksRemaining = 250_000;
+  for (const mark of entities) {
+    if (!mark.notch) continue;
+    let closest = null;
+    let bestDistance = .05;
+    const endpoints = [mark.points[0], mark.points.at(-1)];
+    for (const outline of outlines) {
+      if (outline.points.length > checksRemaining) return entities;
+      checksRemaining -= outline.points.length;
+      for (let i = 0; i < outline.points.length; i++) {
+        const a = outline.points[i];
+        const b = outline.points[(i + 1) % outline.points.length];
+        for (const endpoint of endpoints) {
+          const distance = Math.hypot(...placementPointOffset(endpoint, a, b));
+          if (distance < bestDistance) {
+            closest = outline.id;
+            bestDistance = distance;
+          }
+        }
+      }
+    }
+    if (closest) mark.parentId = closest;
+  }
+  return entities;
+}
+
+async function openLayoutPart(part) {
+  if (!part || !workplaces || openingLayoutPart || !canCorrectLayoutPart()) return;
+  openingLayoutPart = true;
+  const originalPaths = placed;
+  const originalCut = managedCut;
+  const originals = part.indices.map(index => originalPaths[index]);
+  const layout = $("layout-workplace");
+  const blocked = () => busy() || drawingLocked() || live.stopAvailable || currentUpload || xiaoHandoff
+    || activeRun?.state === "transferring";
+  const validateContext = () => {
+    if (managedCut !== originalCut || blocked()) throw new Error("Дождитесь освобождения раскладки на плоттере.");
+    if (placed !== originalPaths || workspaceRevision === null) throw new Error("Раскладка изменилась. Откройте деталь заново.");
+  };
+  try {
+    if (!await persistWorkspace()) throw new Error("Сохраните текущую раскладку перед редактированием детали.");
+    validateContext();
+    cancelCanvasGesture();
+    endFreeRotation();
+    closePartMenu();
+    layout.hidden = true;
+    renderControls();
+    const name = `Деталь №${part.number}`;
+    workplaces.openLayoutPart({ name, entities: layoutPartEntities(originals) }, {
+      onBack() {
+        layout.hidden = false;
+        resizeCamera({ keepView: true });
+        renderControls();
+        svg.focus({ preventScroll: true });
+      },
+      async onSaveDocument({ entities }) {
+        validateContext();
+        const result = await getJson("/api/cad/paths", jsonRequest({ entities }, AbortSignal.timeout(30_000)));
+        validateContext();
+        if (!result.paths.some(path => path.closed && !path.notch)) {
+          throw new Error(`${name}: нужен хотя бы один замкнутый контур. Проверьте стыки или нажмите «Восстановить деталь».`);
+        }
+        const indices = new Set(part.indices);
+        const allExcluded = part.indices.every(index => excluded.has(index));
+        const replacement = result.paths.map((path, index) => ({
+          path: {
+            ...path, notch: Boolean(path.notch), partNumber: part.number,
+            ...(part.rotation ? { partRotation: part.rotation } : {}),
+            ...(originals[0].partAngle !== undefined ? { partAngle: originals[0].partAngle } : {}),
+          },
+          excluded: allExcluded || Boolean(result.sourceIds?.[index]?.length && result.sourceIds[index].every(id => {
+            const sourceIndex = /^layout-(\d+)$/.exec(id)?.[1];
+            return sourceIndex !== undefined && excluded.has(part.indices[Number(sourceIndex)]);
+          })),
+        }));
+        const next = [];
+        const nextExcluded = new Set();
+        const nextSelection = new Set();
+        for (const [index, path] of placed.entries()) {
+          if (index === part.indices[0]) {
+            for (const item of replacement) {
+              nextSelection.add(next.length);
+              if (item.excluded) nextExcluded.add(next.length);
+              next.push(item.path);
+            }
+          }
+          if (!indices.has(index)) {
+            if (excluded.has(index)) nextExcluded.add(next.length);
+            next.push(path);
+          }
+        }
+        let response;
+        try {
+          response = await writeWorkspace(workspaceSnapshot(next, nextExcluded), true);
+        } catch (error) {
+          if (error.status === 409 && /вкладк|редакц/i.test(messageFrom(error))) workspaceRevision = null;
+          throw error;
+        }
+        rememberDrawing("изменение детали в конструкторе");
+        workspaceRevision = response.revision;
+        if (managedCut) managedCut.cutRevision = response.cutRevision;
+        placed = next;
+        excluded = nextExcluded;
+        selection = nextSelection;
+        setSaveError();
+        updateDrawing({ save: false });
+        return { closeEditor: true };
+      },
+    });
+  } catch (error) {
+    layout.hidden = false;
+    renderControls();
+    setSaveError(messageFrom(error));
+  } finally {
+    openingLayoutPart = false;
+  }
+}
+
 async function navigateLayout(next, { resume = false } = {}) {
   if (busy() || (!resume && layoutVisible() && !layoutPreparation() && runInProgress())) {
     throw new Error("Дождитесь завершения текущего действия на плоттере.");
@@ -5367,8 +5549,15 @@ async function finishRegisteredCut() {
   renderControls();
 }
 
+async function releaseRegisteredCut() {
+  if (managedCut?.mode !== "operator" || !await persistWorkspace()) throw new Error("Сохраните раскладку перед возвращением в очередь.");
+  const response = await getJson("/api/cut-context", jsonRequest({ action: "release", cutId: managedCut.id, revision: workspaceRevision }));
+  applyJobStatus(response);
+  managedCut.status = response.status;
+}
+
 void import("/workplaces.js").then(({ mountWorkplaces }) => {
-  mountWorkplaces({ navigateLayout, addRegisteredParts, finishRegisteredCut,
+  workplaces = mountWorkplaces({ navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, onExit: disarmControl,
     request: (url, options) => fetch(url, { cache: "no-store", ...options }).then(async response => {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Сервер вернул ошибку ${response.status}.`);

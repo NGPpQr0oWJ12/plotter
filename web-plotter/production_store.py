@@ -1,7 +1,10 @@
+from collections import defaultdict
 from contextlib import closing, contextmanager
+from datetime import date, datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 from uuid import uuid4
 
@@ -14,6 +17,7 @@ from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, validate_workspace
 
 SCHEMA_VERSION = 1
 MAX_QUANTITY = 50_000
+MOSCOW_TIME = timezone(timedelta(hours=3))
 
 
 class RecordNotFound(PlotterError):
@@ -66,6 +70,31 @@ def check_revision(value, revision):
         raise WorkspaceConflict("Запись изменилась в другой вкладке. Заново откройте её.")
 
 
+def order_date(value, label):
+    if value is None:
+        return None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        try:
+            return date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+    raise ValueError(f"Укажите {label} в формате ГГГГ-ММ-ДД.")
+
+
+def order_metadata(payload, previous=None):
+    previous = previous or {}
+    placed = (previous.get("placedOn") if previous else datetime.now(MOSCOW_TIME).date().isoformat())
+    placed = order_date(payload.get("placedOn", placed), "дату постановки")
+    due = order_date(payload.get("dueOn", previous.get("dueOn")), "срок выполнения")
+    if placed and due and due < placed:
+        raise ValueError("Срок выполнения не может быть раньше даты постановки.")
+    notes = payload.get("notes", previous.get("notes", ""))
+    if not isinstance(notes, str) or len(notes) > 2000 or any(ord(ch) < 32 and ch not in "\r\n\t" for ch in notes):
+        raise ValueError("Введите примечание длиной до 2000 символов.")
+    return {"number": name(payload.get("number", previous.get("number")), "номер заказа"),
+            "placedOn": placed, "dueOn": due, "notes": notes}
+
+
 def row_data(row):
     return {**json.loads(row["data"]), **{k: row[k] for k in row.keys() if k != "data"}}
 
@@ -79,7 +108,8 @@ def check_composition(draft, cut):
 
 
 def cut_data(cut, **changes):
-    return {**{field: cut[field] for field in ("name", "widthMm", "members", "prepared", "partCount")}, **changes}
+    fields = ("name", "widthMm", "members", "prepared", "partCount", "released")
+    return {**{field: cut[field] for field in fields if field in cut}, **changes}
 
 
 def new_workspace(paths, filename, width=None):
@@ -247,21 +277,23 @@ class ProductionStore:
     @staticmethod
     def order_header(db, order_id):
         row = db.execute("SELECT * FROM orders WHERE id = ?", (key(order_id),)).fetchone()
-        if row is None:
+        order = row_data(row) if row is not None else None
+        if order is None or order.get("deleted"):
             raise RecordNotFound("Наряд не найден.")
-        return row_data(row)
+        return {"placedOn": None, "dueOn": None, "notes": "", **order}
 
     @staticmethod
     def cut_record(db, cut_id):
         row = db.execute("SELECT * FROM cuts WHERE id = ?", (key(cut_id),)).fetchone()
         if row is None:
             raise RecordNotFound("Раскладка не найдена.")
-        return row_data(row)
+        ProductionStore.order_header(db, row["order_id"])
+        return {"released": True, **row_data(row)}
 
     @staticmethod
     def cuts(db, order_id):
-        return [row_data(row) for row in db.execute("SELECT * FROM cuts WHERE order_id = ? ORDER BY position",
-                                                   (order_id,))]
+        return [{"released": True, **row_data(row)} for row in db.execute(
+            "SELECT * FROM cuts WHERE order_id = ? ORDER BY position", (order_id,))]
 
     def orders(self, order_id=None, *, published_only=False):
         with self.connect() as db:
@@ -270,11 +302,22 @@ class ProductionStore:
                 if published_only and not header["published"]:
                     raise RecordNotFound("Наряд ещё не отправлен оператору.")
                 return {**header, "cuts": self.cuts(db, order_id)}
-            rows = db.execute("SELECT orders.*, COUNT(cuts.id) AS total, "
-                              "COUNT(CASE WHEN cuts.status='done' THEN 1 END) AS done "
-                              "FROM orders LEFT JOIN cuts ON orders.id=cuts.order_id WHERE published >= ? "
-                              "GROUP BY orders.id ORDER BY orders.rowid DESC", (int(published_only),))
-            return {"orders": [row_data(row) for row in rows]}
+            entries = (row_data(row) for row in db.execute(
+                "SELECT * FROM orders WHERE published >= ? ORDER BY rowid DESC", (int(published_only),)))
+            orders = {order["id"]: {"placedOn": None, "dueOn": None, "notes": "", **order,
+                                   "materials": [], "total": 0, "done": 0, "active": 0}
+                      for order in entries if not order.get("deleted")}
+            for row in db.execute("SELECT cuts.* FROM cuts JOIN orders ON orders.id=cuts.order_id "
+                                  "WHERE orders.published >= ? ORDER BY cuts.order_id, cuts.position", (int(published_only),)):
+                order = orders.get(row["order_id"])
+                if order is None:
+                    continue
+                cut = {"released": bool(order["published"]), **row_data(row)}
+                order["materials"].append({field: cut[field] for field in ("id", "name", "widthMm", "status", "prepared", "released")})
+                order["total"] += 1
+                order["done"] += cut["status"] == "done"
+                order["active"] += cut["status"] == "active"
+            return {"orders": list(orders.values())}
 
     def save_order(self, payload):
         with self.connect(write=True) as db:
@@ -288,9 +331,19 @@ class ProductionStore:
             if model["kind"] != "folder" or not model.get("model"):
                 raise ValueError("Выберите папку, отмеченную как изделие.")
             amount = quantity(payload.get("quantity"))
-            if old and (old["quantity"] != amount or old["modelId"] != model["id"]) and self.cuts(db, order_id):
-                raise ValueError("Чтобы изменить изделие или тираж, удалите подготовленные пункты и создайте их заново.")
-            data = {"number": name(payload.get("number"), "номер заказа"), "modelId": model["id"],
+            if old and (old["quantity"] != amount or old["modelId"] != model["id"]):
+                cuts = self.cuts(db, order_id)
+                if cuts and old["modelId"] != model["id"]:
+                    raise ValueError("Чтобы изменить изделие, сначала удалите пункты раскроя этого наряда.")
+                for cut in cuts:
+                    paths = self.expand_parts(db, cut["members"], amount)
+                    cut_id = cut["id"]
+                    workspace = new_workspace(paths, f"cut-{cut_id}.dxf", cut["widthMm"])
+                    self.put_workspace(db, cut_id, "design", workspace, self.find_workspace(db, cut_id, "design"))
+                    db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
+                               (encode(cut_data(cut, prepared=False, released=False, partCount=paths[-1]["partNumber"])), cut_id))
+                self.clear_operator_workspaces(db, order_id)
+            data = {**order_metadata(payload, old), "modelId": model["id"],
                     "modelName": model["name"], "quantity": amount}
             if old is None:
                 order_id = uid()
@@ -299,16 +352,43 @@ class ProductionStore:
                 db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?", (encode(data), order_id))
             return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
 
+    def update_order_metadata(self, payload):
+        order_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            order = self.order_header(db, order_id)
+            check_revision(payload.get("revision"), order["revision"])
+            data = order_metadata(payload, order)
+            if data != {field: order[field] for field in data}:
+                raw = db.execute("SELECT data FROM orders WHERE id=?", (order_id,)).fetchone()["data"]
+                db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?",
+                           (encode({**json.loads(raw), **data}), order_id))
+            return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
+
+    def delete_order(self, payload):
+        order_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            order = self.order_header(db, order_id)
+            check_revision(payload.get("revision"), order["revision"])
+            active = db.execute("SELECT 1 FROM cuts WHERE order_id=? AND status='active' LIMIT 1",
+                                (order_id,)).fetchone()
+            if active is not None:
+                raise WorkspaceConflict("Завершите открытый раскрой перед удалением наряда.")
+            raw = db.execute("SELECT data FROM orders WHERE id=?", (order_id,)).fetchone()["data"]
+            data = json.loads(raw)
+            data["deleted"] = True
+            db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?", (encode(data), order_id))
+            return {"id": order_id, "deleted": True}
+
     def save_cut(self, payload):
         with self.connect(write=True) as db:
             order = self.order_header(db, payload.get("orderId"))
             check_revision(payload.get("orderRevision"), order["revision"])
-            if order["published"]:
-                raise WorkspaceConflict("Наряд уже отправлен.")
             cut_id = payload.get("id")
             old = self.cut_record(db, cut_id) if cut_id is not None else None
             if old is not None and old["order_id"] != order["id"]:
                 raise ValueError("Эта раскладка относится к другому наряду.")
+            if old is not None and old["status"] != "pending":
+                raise WorkspaceConflict("После начала раскроя нельзя изменять или удалять его пункт.")
             if payload.get("action") == "remove-cut":
                 if old is None:
                     raise ValueError("Выберите пункт раскроя.")
@@ -319,10 +399,14 @@ class ProductionStore:
                 data = {"name": name(payload.get("name"), "название ткани"),
                         "widthMm": width_mm(payload.get("widthMm")), "members": members}
                 previous = self.find_workspace(db, cut_id, "design") if old else None
-                unchanged = old is not None and all(old[field] == data[field] for field in data)
-                if not unchanged or not previous:
+                same_layout = old is not None and previous and all(old[field] == data[field] for field in ("widthMm", "members"))
+                if same_layout:
+                    if old["name"] != data["name"]:
+                        db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
+                                   (encode(cut_data(old, name=data["name"])), cut_id))
+                else:
                     paths = self.expand_parts(db, members, order["quantity"])
-                    data.update(prepared=False, partCount=paths[-1]["partNumber"])
+                    data.update(prepared=False, released=False, partCount=paths[-1]["partNumber"])
                     if old is None:
                         cut_id = uid()
                         position = db.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM cuts WHERE order_id=?",
@@ -332,6 +416,7 @@ class ProductionStore:
                     else:
                         db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
                                    (encode(data), cut_id))
+                        db.execute("DELETE FROM workspaces WHERE cut_id=? AND mode IN ('operator','demo')", (cut_id,))
                     workspace = new_workspace(paths, f"cut-{cut_id}.dxf", data["widthMm"])
                     self.put_workspace(db, cut_id, "design", workspace, previous)
             db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
@@ -345,6 +430,11 @@ class ProductionStore:
             return None
         return {"revision": row["revision"], "cutRevision": row["cut_revision"],
                 "workspace": json.loads(row["data"])}
+
+    @staticmethod
+    def clear_operator_workspaces(db, order_id):
+        db.execute("DELETE FROM workspaces WHERE mode IN ('operator','demo') AND cut_id IN "
+                   "(SELECT id FROM cuts WHERE order_id=?)", (order_id,))
 
     def put_workspace(self, db, cut_id, mode, workspace, previous):
         content = encode(workspace)
@@ -363,10 +453,13 @@ class ProductionStore:
         if mode not in ("design", "preview", "operator", "demo"):
             raise ValueError("Неизвестное рабочее место.")
         order = self.order_header(db, cut["order_id"])
-        if mode == "design" and order["published"]:
+        if mode == "design" and order["published"] and (cut["released"] or cut["status"] != "pending"):
             raise WorkspaceConflict("Наряд уже отправлен оператору.")
-        if mode in ("operator", "demo") and not order["published"]:
-            raise WorkspaceConflict("Наряд ещё не отправлен оператору.")
+        if mode in ("operator", "demo"):
+            if not order["published"]:
+                raise WorkspaceConflict("Наряд ещё не отправлен оператору.")
+            if not cut["released"]:
+                raise WorkspaceConflict("Конструктор обновляет раскладку. Дождитесь её отправки.")
         base = self.find_workspace(db, cut["id"], "design")
         if mode in ("design", "preview"):
             return base
@@ -386,7 +479,7 @@ class ProductionStore:
             if mode == "preview" or (mode == "operator" and cut["status"] == "done"):
                 raise WorkspaceConflict("Этот раскрой открыт для просмотра.")
             draft = validate_workspace(payload.get("workspace"))
-            if not draft or not draft["paths"] or draft["source"]["filename"] != current["workspace"]["source"]["filename"]:
+            if not draft or draft["source"]["filename"] != current["workspace"]["source"]["filename"]:
                 raise ValueError("Сохраните раскладку для этого пункта наряда.")
             if mode == "design" and draft["optimization"].get("nesting", {}).get("widthMm") != cut["widthMm"]:
                 raise ValueError("Ширина должна совпадать с указанной в пункте наряда.")
@@ -401,10 +494,20 @@ class ProductionStore:
                     prepared = False
                 if cut["prepared"] != prepared:
                     db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(cut_data(cut, prepared=prepared)), cut["id"]))
+                db.execute("DELETE FROM workspaces WHERE cut_id=? AND mode IN ('operator','demo')", (cut["id"],))
             previous = self.find_workspace(db, cut["id"], mode)
             if not previous:
                 previous = current
             return self.put_workspace(db, cut["id"], mode, draft, previous)
+
+    def verify_cut(self, db, cut, verify_layout):
+        draft = self.find_workspace(db, cut["id"], "design")["workspace"]
+        try:
+            check_composition(draft, cut)
+            verify_layout(draft, cut["widthMm"])
+        except (ValueError, PlotterError) as error:
+            raise ValueError(f'{cut["name"]}: {error}') from error
+        db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(cut_data(cut, prepared=True, released=True)), cut["id"]))
 
     def publish_order(self, payload, verify_layout):
         with self.connect(write=True) as db:
@@ -416,15 +519,36 @@ class ProductionStore:
             if not cuts:
                 raise ValueError("Добавьте хотя бы один пункт раскроя.")
             for cut in cuts:
-                draft = self.find_workspace(db, cut["id"], "design")["workspace"]
-                try:
-                    check_composition(draft, cut)
-                    verify_layout(draft, cut["widthMm"])
-                except (ValueError, PlotterError) as error:
-                    raise ValueError(f'{cut["name"]}: {error}') from error
-                db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(cut_data(cut, prepared=True)), cut["id"]))
+                self.verify_cut(db, cut, verify_layout)
             db.execute("UPDATE orders SET published=1, revision=revision+1 WHERE id=?", (order["id"],))
             return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"])}
+
+    def publish_cut(self, payload, verify_layout):
+        with self.connect(write=True) as db:
+            order = self.order_header(db, payload.get("orderId"))
+            check_revision(payload.get("orderRevision"), order["revision"])
+            cut = self.cut_record(db, payload.get("id"))
+            if cut["order_id"] != order["id"]:
+                raise ValueError("Эта раскладка относится к другому наряду.")
+            if not order["published"] or cut["released"] or cut["status"] != "pending":
+                raise WorkspaceConflict("Этот пункт не ожидает отправки оператору.")
+            self.verify_cut(db, cut, verify_layout)
+            db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
+            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"])}
+
+    def reopen_order(self, payload):
+        order_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            order = self.order_header(db, order_id)
+            check_revision(payload.get("revision"), order["revision"])
+            if not order["published"]:
+                raise WorkspaceConflict("Наряд уже открыт для редактирования.")
+            cuts = self.cuts(db, order_id)
+            if any(cut["status"] != "pending" for cut in cuts):
+                raise WorkspaceConflict("Наряд нельзя вернуть в черновики после начала раскроя.")
+            self.clear_operator_workspaces(db, order_id)
+            db.execute("UPDATE orders SET published=0, revision=revision+1 WHERE id=?", (order_id,))
+            return {**self.order_header(db, order_id), "cuts": cuts}
 
     def progress(self, cut_id, action, mode, revision=None):
         with self.connect(write=True) as db:
@@ -443,7 +567,19 @@ class ProductionStore:
                     db.execute("UPDATE cuts SET status=? WHERE id=?", (status, cut_id))
             elif action != "start" or mode != "demo":
                 raise WorkspaceConflict("В демо-режиме ход наряда не сохраняется.")
-            return {**current, "status": status, "name": cut["name"]}
+            return {**current, "status": status, "name": cut["name"],
+                    "opened": cut["status"] == "pending" and status == "active"}
+
+    def release_cut(self, cut_id, revision):
+        with self.connect(write=True) as db:
+            cut = self.cut_record(db, cut_id)
+            current = self.matching_workspace(db, cut, "operator")
+            check_revision(revision, current["revision"])
+            if cut["status"] != "active":
+                raise WorkspaceConflict("Этот раскрой сейчас не открыт на плоттере.")
+            current = self.put_workspace(db, cut_id, "operator", current["workspace"], current)
+            db.execute("UPDATE cuts SET status='pending' WHERE id=?", (cut_id,))
+            return {**current, "status": "pending", "name": cut["name"]}
 
     def backup(self, destination):
         if not self.path.is_file():

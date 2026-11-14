@@ -3,8 +3,9 @@ from math import cos, dist, isclose, radians, sin
 import unittest
 
 from cut_plan import prepare_cut_plan
+from designer_cad import prepare_design
 from machine import PlotterError
-from nesting import NestingFitError, nest_paths
+from nesting import NestingFitError, identify_parts, nest_paths
 
 
 def contour(points, *, layer="Лекало", closed=True):
@@ -147,6 +148,60 @@ class NestingTests(unittest.TestCase):
         result = pack(paths)
         self.assertEqual([part["indices"] for part in result["placements"]], [[0, 1], [2]])
         self.assertTrue(all(not path["closed"] for path in result["paths"]))
+
+    def test_explicit_long_notch_keeps_part_number_and_rotates_with_outline(self):
+        outline = rectangle(0, 0, 80, 140)
+        notch = {**contour([[30, -12], [30, 3]], closed=False), "notch": True}
+        imported = contour(notch["points"], layer="Надсечки", closed=False)
+        for paths in ([outline, notch], [outline, imported],
+                      [{**outline, "partNumber": 7}, {**notch, "partNumber": 13}]):
+            with self.subTest(paths=paths):
+                part, = identify_parts(paths)
+                self.assertEqual(part["indices"], [0, 1])
+                self.assertEqual(part["notchIndices"], [1])
+                result = pack(paths, width_mm=112, rotation="quarter")
+                placement, = result["placements"]
+                self.assertEqual(placement["indices"], [0, 1])
+                self.assertEqual(placement["angle"], 90)
+                self.assertEqual({path["partNumber"] for path in result["paths"]}, {part["number"]})
+                self.assertTrue(result["paths"][1]["notch"])
+                self.assertAlmostEqual(result["paths"][1]["points"][0][0] - result["paths"][1]["points"][1][0], 15)
+
+    def test_explicit_notch_num_does_not_merge_when_two_owners_are_tied(self):
+        paths = [{**rectangle(0, 0, 100, 100), "partNumber": 4},
+                 {**rectangle(104, 0, 100, 100), "partNumber": 8},
+                 {**contour([[95, 50], [109, 50]], closed=False), "notch": True, "partNumber": 11}]
+        self.assertEqual([part["indices"] for part in identify_parts(paths)], [[0], [1], [2]])
+
+    def test_cad_bound_notch_survives_contour_repair_and_layout_cut_plan(self):
+        vertices = [[0, 0], [80, 0], [80, 140], [0, 140], [0, 0]]
+        entities = [{"id": f"edge-{index}", "type": "line", "start": start, "end": end}
+                    for index, (start, end) in enumerate(zip(vertices, vertices[1:]))]
+        entities.append({"id": "mark", "type": "line", "start": [40, -2], "end": [40, -17],
+                         "layer": "Надсечки", "notch": True, "parentId": "edge-0"})
+        prepared = prepare_design(entities)
+        self.assertEqual(prepared["sourceIds"], [["edge-0", "edge-1", "edge-2", "edge-3"], ["mark"]])
+        self.assertEqual(prepared["closedCount"], 1)
+        outline, mark = prepared["paths"]
+        self.assertEqual(outline["partNumber"], mark["partNumber"])
+        layout = pack(prepared["paths"], width_mm=112, rotation="quarter")
+        self.assertEqual(layout["partCount"], 1)
+        plan = prepare_cut_plan({"paths": layout["paths"], "optimize": False}, 300, 112, 0.12)
+        self.assertFalse(plan["issues"])
+        self.assertEqual({item["index"] for item in plan["pages"][0]["paths"]}, {0, 1})
+
+    def test_route_prioritizes_long_explicit_notch_on_the_numbered_outline(self):
+        outline = {**rectangle(10, 10, 80, 65), "partNumber": 7}
+        notch = {**contour([[60, 72], [60, 90]], closed=False), "partNumber": 7}
+
+        def order(marker):
+            plan = prepare_cut_plan({"paths": [outline, marker]}, 200, 112, 0.12)
+            self.assertFalse(plan["issues"])
+            return [item["index"] for item in plan["pages"][0]["paths"]]
+
+        self.assertEqual(order({**notch, "notch": True}), [1, 0])
+        self.assertEqual(order({**notch, "notch": False}), [0, 1])
+        self.assertEqual(order({**notch, "notch": True, "partNumber": 8}), [0, 1])
 
     def test_ambiguous_edge_contact_does_not_join_distinct_pieces(self):
         paths = [rectangle(0, 0, 100, 100), rectangle(104, 0, 100, 100),

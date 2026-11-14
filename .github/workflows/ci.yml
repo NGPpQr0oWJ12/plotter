@@ -1,0 +1,125 @@
+name: Plotter CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r web-plotter/requirements.txt
+      - run: python -B -m unittest discover -s web-plotter -q
+
+  linux-dwg:
+    name: Import a real DWG on Linux
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r web-plotter/requirements.txt
+      - name: Build and verify the DWG converter
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/LibreDWG/libredwg/releases/download/0.14/libredwg-0.14.tar.xz \
+            --output "$RUNNER_TEMP/libredwg-0.14.tar.xz"
+          echo "62ebb73b984f865960f20ed26619ea5f8789d5e3fd088fa40a2598384da81275  $RUNNER_TEMP/libredwg-0.14.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/libredwg-0.14.tar.xz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/libredwg-0.14"
+          ./configure --enable-release --disable-bindings --disable-docs --disable-shared --disable-write
+          make -j "$(nproc)" -C src
+          make -j "$(nproc)" -C programs dwg2dxf
+      - name: Verify both Plotter import paths
+        working-directory: web-plotter
+        shell: bash
+        run: |
+          export PATH="$RUNNER_TEMP/libredwg-0.14/programs:$PATH"
+          python -B - "$RUNNER_TEMP/libredwg-0.14/test/test-data/example_2000.dwg" <<'PY'
+          from pathlib import Path
+          import sys
+          from cad import import_drawing
+          from designer_cad import import_design
+
+          sample = Path(sys.argv[1])
+          data = sample.read_bytes()
+          assert any(path["closed"] for path in import_drawing(data, sample.name)["paths"])
+          assert import_design(data, sample.name)["entities"]
+          PY
+
+  release-archives:
+    name: Build Windows release archives
+    if: github.event_name != 'pull_request'
+    needs: [tests, linux-dwg]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - shell: pwsh
+        run: |
+          $version = (Get-Content -Raw VERSION).Trim()
+          ./package-release.ps1 -Version $version
+          ./build-companion-setup.ps1 -UpdateOnly
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plotter-release
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: release-archives
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plotter-release
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < VERSION)
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $GITHUB_REF_NAME == "v$version" ]]
+          awk -v version="$version" '/^## / { if (section) exit; section = $0 == "## " version; next } section' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          grep -q '^- ' "$RUNNER_TEMP/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --latest --title "Plotter $version" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "dist/plotter-v$version-windows-source.zip" "dist/plotter-companion-v$version-windows-x64.zip"

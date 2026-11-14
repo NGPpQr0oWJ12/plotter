@@ -179,14 +179,14 @@ def _path(index, layer, points, closed):
     return {"index": index, "layer": layer, "points": [list(point) for point in points], "closed": closed}
 
 
-def _prepare_route(result, plan, part_numbers, optimize):
+def _prepare_route(result, plan, part_numbers, optimize, notch_flags):
     if not optimize:
         return
     before = after = 0.0
     fixed_sources = {seam["index"] for seam in result["seams"]}
     for page in result["pages"]:
         page["paths"], old, new = optimize_page_route(page["paths"], (page["startX"], 0.0),
-                                                      plan.contours, fixed_sources, part_numbers)
+                                                      plan.contours, fixed_sources, part_numbers, notch_flags)
         before += old
         after += new
     result["routeOptimization"] = {"beforeMm": before, "afterMm": after}
@@ -273,6 +273,7 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
     last_x = plan.bounds["maxX"]
     part_numbers = [path.get("partNumber") for path in job["paths"]]
     part_numbers = [number if type(number) is int and 1 <= number < 1 << 53 else None for number in part_numbers]
+    notch_flags = [path.get("notch") is True for path in job["paths"]]
 
     groups = {}
     cuts, issues = [], []
@@ -298,7 +299,7 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
         page["paths"] = [_path(index, contour.layer, contour.points, contour.closed)
                          for index, contour in enumerate(plan.contours)]
         result["pages"] = [page]
-        _prepare_route(result, plan, part_numbers, optimize)
+        _prepare_route(result, plan, part_numbers, optimize, notch_flags)
         _calculate_totals(result, plan, job, height)
         return result
 
@@ -341,6 +342,6 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
             pages[page_index]["paths"].append(_path(index, contour.layer, points, closed))
         result["seams"].extend({"x": x, "y": y, "index": index} for x, y in seams)
     result["pages"] = pages
-    _prepare_route(result, plan, part_numbers, optimize)
+    _prepare_route(result, plan, part_numbers, optimize, notch_flags)
     _calculate_totals(result, plan, job, height)
     return result

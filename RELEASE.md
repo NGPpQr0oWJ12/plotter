@@ -5,7 +5,7 @@
 Для сборки из корня проекта запустите команду, подставив согласованный номер релиза.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\package-release.ps1 -Version 2.0.0 -OutputDirectory .\dist
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\package-release.ps1 -Version 2.1.0 -OutputDirectory .\dist
 ```
 
 Параметр `-OutputDirectory` задаёт каталог архива. Скрипт выводит путь к архиву и его контрольную сумму SHA-256.

@@ -97,6 +97,7 @@ class Path:
     part_number: int | None
     part_rotation: str | None
     part_angle: float
+    notch: bool
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,8 @@ def _paths(value):
         vertices = tuple((float(x), float(y)) for x, y in points)
         if len(set(vertices)) < (3 if closed else 2):
             raise PlotterError(f"Контур {index}: недостаточно различных точек.")
-        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle))
+        notch = not closed and path.get("notch", layer.strip().casefold() in NOTCH_LAYER_WORDS)
+        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle, notch))
     return paths
 
 
@@ -309,7 +311,7 @@ def _connect_paths(paths, groups):
     ends = {}
     by_end = defaultdict(list)
     for index, path in enumerate(paths):
-        if path.closed:
+        if path.closed or path.notch:
             continue
         ends[index] = (_endpoint(path.points[0]), _endpoint(path.points[-1]))
         for key in ends[index]:
@@ -385,7 +387,7 @@ def _notch_segments(points):
     return segments
 
 
-def _notch_owner(paths, members, boundaries, index, bounds, groups, budget):
+def _notch_owner(paths, members, boundaries, index, bounds, owner_root, budget):
     segments = [segment for member in members for segment in _notch_segments(paths[member].points)]
     distances = {}
     for position in index.search(bounds.expanded(NOTCH_EXTENSION_MM)):
@@ -393,7 +395,7 @@ def _notch_owner(paths, members, boundaries, index, bounds, groups, budget):
         boundary = boundaries[position]
         distance = boundary.notch_distance(segments, budget)
         if distance <= NOTCH_EXTENSION_MM + GEOMETRY_EPSILON:
-            owner = groups.find(boundary.owner)
+            owner = owner_root(boundary.owner)
             distances[owner] = min(distances.get(owner, float("inf")), distance)
     if not distances:
         return None
@@ -469,7 +471,8 @@ def annotate_notches(paths, *, new_outlines=()):
     return [{**path, "notch": index in marked} for index, path in enumerate(paths)]
 
 
-def _parts(paths):
+def _parts(paths, notch_owners=None):
+    notch_owners = notch_owners or {}
     groups = Groups(len(paths))
     ends, by_end = _connect_paths(paths, groups)
     outlines = [Outline(index, path.points) for index, path in enumerate(paths) if path.closed]
@@ -505,22 +508,33 @@ def _parts(paths):
                 groups.merge(root, owner)
                 continue
         if _is_short_mark(paths, members, bounds):
-            marks.append((root, members, bounds))
+            marks.append((root, members, bounds, None))
         else:
             boundaries.extend(Boundary(member, paths[member].points, closed=False) for member in members)
+    for member, path in enumerate(paths):
+        if not path.notch:
+            continue
+        if member in notch_owners:
+            groups.merge(member, notch_owners[member])
+        else:
+            # Prefer an actual boundary attachment over an enclosing outline.
+            owner = _containing_outline(paths, [member], outlines, index, path.box, budget) if outlines else None
+            marks.append((member, [member], path.box, owner))
     if marks and boundaries:
         boundary_index = BoxTree([(boundary.box, position) for position, boundary in enumerate(boundaries)])
-        for root, members, bounds in marks:
-            owner = _notch_owner(paths, members, boundaries, boundary_index, bounds, groups, budget)
+        for root, members, bounds, fallback in marks:
+            owner = _notch_owner(paths, members, boundaries, boundary_index, bounds, groups.find, budget)
             if owner is not None:
                 groups.merge(root, owner)
+            elif fallback is not None:
+                groups.merge(root, fallback)
     by_part = defaultdict(list)
     for index in range(len(paths)):
         by_part[groups.find(index)].append(index)
     return [Part(tuple(members), _union([paths[index].box for index in members])) for members in by_part.values()]
 
 
-def _identified_parts(paths):
+def _identified_parts(paths, notch_owners=None):
     numbered = defaultdict(list)
     unnumbered = []
     for index, path in enumerate(paths):
@@ -536,12 +550,40 @@ def _identified_parts(paths):
         parts.append(Part(tuple(indices), _union([paths[index].box for index in indices]),
                           number, next((mode for mode in ("any", "quarter", "none") if mode in rotations), None)))
     next_number = 1
-    for part in _parts([paths[index] for index in unnumbered]):
+    positions = {index: position for position, index in enumerate(unnumbered)}
+    associations = {positions[notch]: positions[owner] for notch, owner in (notch_owners or {}).items()
+                    if notch in positions and owner in positions}
+    for part in _parts([paths[index] for index in unnumbered], associations):
         while next_number in numbered:
             next_number += 1
         parts.append(Part(tuple(unnumbered[index] for index in part.indices), part.box, next_number))
         next_number += 1
+    if numbered and any(all(paths[index].notch for index in part.indices) for part in parts):
+        parts = _attach_numbered_notches(paths, parts)
     return sorted(parts, key=lambda part: part.indices[0])
+
+
+def _attach_numbered_notches(paths, parts):
+    boundaries = []
+    for position, part in enumerate(parts):
+        for index in part.indices:
+            path = paths[index]
+            if not path.notch:
+                boundaries.append(Boundary(position, path.points, closed=path.closed))
+    if not boundaries:
+        return parts
+    tree = BoxTree([(boundary.box, index) for index, boundary in enumerate(boundaries)])
+    budget = Budget()
+    combined = [list(part.indices) for part in parts]
+    for position, part in enumerate(parts):
+        if not all(paths[index].notch for index in part.indices):
+            continue
+        owner = _notch_owner(paths, part.indices, boundaries, tree, part.box, lambda position: position, budget)
+        if owner is not None:
+            combined[owner].extend(part.indices)
+            combined[position].clear()
+    return [Part(tuple(sorted(indices)), _union([paths[index].box for index in indices]), part.number, part.rotation)
+            for part, indices in zip(parts, combined) if indices]
 
 
 def _hull(points):
@@ -773,10 +815,10 @@ def _rotation_boxes(part, paths, usable_x, usable_y, may_rotate, *, usable_lengt
     return {angle: boxes[angle] for angle in sorted(retained)}
 
 
-def identify_parts(paths):
+def identify_parts(paths, *, notch_owners=None):
     if paths == []:
         return []
-    parts = _identified_parts(_paths(paths))
+    parts = _identified_parts(_paths(paths), notch_owners)
     notches = _notch_indices(paths)
     return [
         {"number": part.number, "indices": list(part.indices),

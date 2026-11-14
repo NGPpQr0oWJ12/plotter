@@ -94,7 +94,7 @@ def _touches_notch(points, outline, gap, budget):
     return False
 
 
-def _dependencies(paths, source, fixed_sources, part_numbers):
+def _dependencies(paths, source, fixed_sources, part_numbers, notch_flags):
     """Precede the outer cut with its marks/holes, and retain the order of seam fragments."""
     count = len(paths)
     predecessors = [set() for _ in paths]
@@ -144,7 +144,8 @@ def _dependencies(paths, source, fixed_sources, part_numbers):
                 # CAD seam marks are short strokes that can extend outside the cut outline.
                 short = (max(inner_box[2] - inner_box[0], inner_box[3] - inner_box[1]) <= 10.0 + EPSILON
                          and sum(dist(a, b) for a, b in pairwise(points)) <= 10.0 + EPSILON)
-                if not short or not _touches_notch(points, edges, gap, budget):
+                bound_notch = number is not None and part_numbers[child_source] == number and notch_flags[child_source]
+                if (not short and not bound_notch) or not _touches_notch(points, edges, gap, budget):
                     continue
             for member in by_source[source_index]:
                 predecessors[member].add(child)
@@ -312,12 +313,12 @@ def _travel(paths, origin):
     return total
 
 
-def optimize_page_route(paths, origin, source, fixed_sources, part_numbers):
+def optimize_page_route(paths, origin, source, fixed_sources, part_numbers, notch_flags):
     before = _travel(paths, origin)
     if not paths:
         return paths, before, before
     try:
-        predecessors = _dependencies(paths, source, fixed_sources, part_numbers)
+        predecessors = _dependencies(paths, source, fixed_sources, part_numbers, notch_flags)
     except GeometryLimit:
         # Preserve the source order if the geometric checks cannot complete.
         return paths, before, before

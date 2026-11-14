@@ -76,6 +76,20 @@ class ServerFlowTests(unittest.TestCase):
     def save(self, workspace, revision=0):
         return self.request("/api/workspace", {"revision": revision, "workspace": workspace})["revision"]
 
+    def test_independent_part_correction_checks_revision_and_plotter_transfer_lock(self):
+        original = drawing()
+        revision = self.save(original)
+        corrected = drawing()
+        corrected["paths"][1]["points"][1] = [65, 50]
+        data = {"revision": revision, "workspace": corrected, "partCorrection": True}
+        with self.server.upload_lock:
+            self.request("/api/workspace", data, HTTPStatus.CONFLICT)
+        self.assertEqual(self.server.workspace.read()["revision"], revision)
+        saved = self.request("/api/workspace", data)
+        self.assertEqual(saved["workspace"], corrected)
+        self.request("/api/workspace", data, HTTPStatus.CONFLICT)
+        self.assertEqual(self.server.workspace.read(), saved)
+
     def test_local_companion_serves_ui_and_only_allows_same_origin_mutations(self):
         with patch("server.Controller", return_value=self.controller), patch("server.ssl.create_default_context"), \
                 PlotterServer(0, Path(self.directory.name) / "companion.json", profile_path=EXAMPLE_PROFILE,
@@ -318,19 +332,85 @@ class ServerFlowTests(unittest.TestCase):
         self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
         self.controller.read_live.return_value = {"responded": False}
         working = self.request("/api/cut-context", {"action": "select", "cutId": cut_id})
+        published_paths = self.server.production.workspace(cut_id, "preview")["workspace"]["paths"]
         job, filename = self.server.workspace_drawing(working["workspace"])
         first = self.request("/api/cut-plan", {"job": {**job, "cutContext": [cut_id, working["cutRevision"]]}, "filename": filename})
         working["workspace"]["paths"][0]["points"] = [[x + 5, y] for x, y in job["paths"][0]["points"]]
-        changed = self.request("/api/operator-workspace", {"mode": "operator", "action": "save", "cutId": cut_id, **working})
+        changed = self.request("/api/operator-workspace", {"mode": "operator", "action": "save", "cutId": cut_id,
+                                                           "partCorrection": True, **working})
+        self.assertEqual(changed["workspace"], working["workspace"])
+        self.assertEqual(self.server.production.workspace(cut_id, "preview")["workspace"]["paths"], published_paths)
         self.upload(first, HTTPStatus.CONFLICT, cutId=cut_id, autoRunOff=True)
         job, filename = self.server.workspace_drawing(changed["workspace"])
         second = self.request("/api/cut-plan", {"job": {**job, "cutContext": [cut_id, changed["cutRevision"]]}, "filename": filename})
         upload = self.upload(second, cutId=cut_id, autoRunOff=True)
         self.start(second, upload, HTTPStatus.CONFLICT)
         self.report_live(upload, 3, "running", startedAt=1, startedReceipt=upload["jobReceipt"])
+        self.request("/api/operator-workspace", {"action": "save", "mode": "operator", "cutId": cut_id,
+                                                 "partCorrection": True, **changed}, HTTPStatus.CONFLICT)
         self.request("/api/cut-context", {"action": "select", "cutId": None}, HTTPStatus.CONFLICT)
         self.request("/api/cut-context", {"action": "finish", "cutId": cut_id, "revision": changed["revision"]}, HTTPStatus.CONFLICT)
         self.assertEqual(self.controller.upload_job.call_count, 1)
+        self.controller.operate.assert_not_called()
+
+    def test_registered_order_can_reopen_and_delete_through_api(self):
+        model = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Диван", "model": True})
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Сиденье", "entities": [
+            {"id": "outline", "type": "polyline", "closed": True,
+             "points": [[20, 20], [60, 20], [60, 70], [20, 70]]},
+        ]})
+        order = self.request("/api/orders", {"action": "save", "number": "260551", "modelId": model["id"], "quantity": 1})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Крой", "widthMm": 1380, "members": [{"id": part["id"], "quantity": 1}]})
+        cut_id, order_id = order["cutId"], order["id"]
+        published = self.request("/api/orders", {"action": "publish", "id": order_id, "revision": order["revision"]})
+        reopened = self.request("/api/orders", {"action": "reopen", "id": order_id, "revision": published["revision"]})
+        self.assertFalse(reopened["published"])
+        self.request("/api/orders", {"action": "delete", "id": order_id, "revision": published["revision"]}, HTTPStatus.CONFLICT)
+        deleted = self.request("/api/orders", {"action": "delete", "id": order_id, "revision": reopened["revision"]})
+        self.assertEqual(deleted, {"id": order_id, "deleted": True})
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            for path in (f"/api/orders?id={order_id}", f"/api/operator-workspace?cutId={cut_id}&mode=preview"):
+                client.request("GET", path)
+                response = client.getresponse()
+                self.assertEqual(response.status, HTTPStatus.NOT_FOUND)
+                response.read()
+        self.controller.operate.assert_not_called()
+
+    def test_unloaded_registered_cut_returns_to_queue_only_when_controller_is_idle(self):
+        model = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Диван", "model": True})
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Сиденье", "entities": [
+            {"id": "outline", "type": "polyline", "closed": True,
+             "points": [[20, 20], [60, 20], [60, 70], [20, 70]]},
+        ]})
+        order = self.request("/api/orders", {"action": "save", "number": "260552", "modelId": model["id"], "quantity": 1})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Крой", "widthMm": 1380, "members": [{"id": part["id"], "quantity": 1}]})
+        cut_id = order["cutId"]
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        idle = {"responded": True, "busy": False, "position": {"x": 0, "y": 0, "z": 0},
+                "run": {"fresh": True, "state": "idle"}}
+        self.controller.read_live.return_value = idle
+        select = {"action": "select", "cutId": cut_id}
+        opened = self.request("/api/cut-context", select)
+        self.assertTrue(opened["canReleaseCut"])
+        self.assertTrue(self.request("/api/cut-context", select)["canReleaseCut"])
+        release = {"action": "release", "cutId": cut_id, "revision": opened["revision"]}
+        self.controller.read_live.return_value = {**idle, "responded": False}
+        self.request("/api/cut-context", release, HTTPStatus.CONFLICT)
+        self.controller.read_live.return_value = {**idle, "busy": True}
+        self.request("/api/cut-context", release, HTTPStatus.CONFLICT)
+        self.controller.read_live.return_value = idle
+        self.request("/api/cut-context", {**release, "revision": release["revision"] + 1}, HTTPStatus.CONFLICT)
+        result = self.request("/api/cut-context", release)
+        self.assertEqual(result["status"], "pending")
+        self.assertIsNone(result["selectedCut"])
+        self.assertFalse(result["canReleaseCut"])
+        reopened = self.request("/api/cut-context", select)
+        self.assertTrue(reopened["canReleaseCut"])
+        self.request("/api/cut-context", {"action": "select", "cutId": None})
+        self.assertFalse(self.request("/api/cut-context", select)["canReleaseCut"])
+        self.request("/api/cut-context", {**release, "revision": reopened["revision"]}, HTTPStatus.CONFLICT)
         self.controller.operate.assert_not_called()
 
     def test_new_cut_clears_persisted_drawing_offline_and_keeps_both_journals(self):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from email.message import Message
 from hashlib import sha256
@@ -77,9 +77,12 @@ MIME = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/simulation.js": ("simulation.js", "text/javascript; charset=utf-8"),
     "/workplaces.js": ("workplaces.js", "text/javascript; charset=utf-8"),
+    "/confirm-action.js": ("confirm-action.js", "text/javascript; charset=utf-8"),
     "/workplaces.css": ("workplaces.css", "text/css; charset=utf-8"),
     "/designer-cad.js": ("designer-cad.js", "text/javascript; charset=utf-8"),
+    "/designer-shortcuts.js": ("designer-shortcuts.js", "text/javascript; charset=utf-8"),
     "/designer-cad.css": ("designer-cad.css", "text/css; charset=utf-8"),
+    "/plotter-monochrome.css": ("plotter-monochrome.css", "text/css; charset=utf-8"),
 }
 PRODUCTION_ROUTES = {"/api/registry", "/api/orders", "/api/operator-workspace"}
 LOGGER = logging.getLogger("plotter")
@@ -254,6 +257,8 @@ def drawing_key(job, filename, width, height, page_add, *, roll=False):
             part_number = source.get("partNumber")
             if type(part_number) is int and 1 <= part_number <= MAX_PART_NUMBER:
                 path["partNumber"] = part_number
+            if optimize and source.get("notch") is True:
+                path["notch"] = True
     document = [filename, width, height, page_add, CUT_TOOL, paths, optimize]
     if roll:
         document.append(ROLL_PASS_LENGTH_MM)
@@ -421,6 +426,7 @@ class PlotterState:
         self.workspace = workspace
         self.workspace_lock = workspace_lock
         self.selected_cut = None
+        self.releasable_cut = None
         self.upload_lock = Lock()
         self.motion_start_lock = Lock()
         self.loaded_plan = None
@@ -504,7 +510,12 @@ class PlotterState:
     def cut_status(self):
         return {"roll": self.roll_snapshot(), "selectedCut": self.selected_cut,
                 "cutProgress": self.cut_progress.snapshot() if self.cut_progress else None,
-                "cutJournal": self.cut_journal.snapshot()}
+                "cutJournal": self.cut_journal.snapshot(), "canReleaseCut": self.can_release_cut()}
+
+    def can_release_cut(self):
+        return (not (self.demo_mode or self.central_mode or self.companion_mode)
+                and self.selected_cut is not None and self.selected_cut == self.releasable_cut
+                and all(state is None for state in (self.loaded_plan, self.cut_progress, self.roll)))
 
     def record_cut_event(self, progress, kind, message):
         event = self.cut_journal.record(progress.filename, progress.page, kind, message)
@@ -786,18 +797,29 @@ class PlotterState:
         if cut_id is not None:
             key(cut_id)
         action = data.get("action")
-        if action not in ("select", "finish") or action == "finish" and (cut_id is None or self.demo_mode):
+        if action not in ("select", "finish", "release") or action != "select" and (cut_id is None or self.demo_mode):
             raise ValueError("Выберите допустимое действие для раскроя.")
         with request_lock(self.motion_start_lock, "Дождитесь текущего действия."), \
                 request_lock(self.upload_lock, "Дождитесь завершения передачи."), self.workspace_lock:
+            if action == "release":
+                if cut_id != self.selected_cut or not self.can_release_cut():
+                    raise WorkspaceConflict("Вернуть в очередь можно только открытый здесь раскрой, ещё не переданный на станок.")
+                live = self.controller.read_live()
+                if (live.get("responded") is not True or live.get("run", {}).get("state") != "idle"
+                        or self.controller.upload_uncertain is True or live.get("uploadUncertain") is True):
+                    raise WorkspaceConflict("Контроллер не подтвердил, что плоттер свободен.")
+                self.verify_new_cut_idle(live)
+                result = self.production.release_cut(cut_id, data.get("revision"))
+                self.selected_cut = self.releasable_cut = None
+                return {**result, **self.cut_status()}
             if action == "finish" and cut_id != self.selected_cut:
                 record = self.read_production(cut_id, "operator")
                 if record["status"] == "done":
                     return {**record, **self.cut_status()}
                 raise WorkspaceConflict("Этот раскрой сейчас не открыт на плоттере.")
             if action == "select" and cut_id is not None and cut_id == self.selected_cut:
-                return {**self.production_progress(cut_id, "start", "demo" if self.demo_mode else "operator"),
-                        **self.cut_status()}
+                result = self.production_progress(cut_id, "start", "demo" if self.demo_mode else "operator")
+                return {**result, **self.cut_status()}
             # A roll which has started can still contain uncut material after a page finishes.
             if self.roll and self.roll.state not in ("completed", "cancelled") and self.roll.completed_pages:
                 raise WorkspaceConflict("Завершите или сбросьте текущий раскрой на плоттере.")
@@ -811,6 +833,7 @@ class PlotterState:
             else:
                 result = {}
             self.selected_cut = cut_id if action == "select" else None
+            self.releasable_cut = cut_id if action == "select" and result.get("opened") else None
             self.clear_cut()
             return {**result, **self.cut_status()}
 
@@ -944,6 +967,7 @@ class PlotterState:
                 self.verify_ready_roll()
                 previous = self.roll
             job, finish = encoded_pages[page_number - 1]
+            self.releasable_cut = None
             self.loaded_plan = None
             previous_progress = self.cut_progress
             first_page = previous.first_page if previous else page_number
@@ -1111,12 +1135,30 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
             if urlsplit(self.public_origin).port is None:
                 self.hosts.add(urlsplit(self.public_origin).netloc + ":443")
 
-    def save_workspace(self, revision, draft):
+    @contextmanager
+    def guard_part_correction(self, cut_id, plotters):
+        with ExitStack() as stack:
+            for plotter in plotters:
+                stack.enter_context(request_lock(plotter.motion_start_lock, "Дождитесь завершения текущего действия."))
+                stack.enter_context(request_lock(plotter.upload_lock, "Дождитесь завершения передачи задания."))
+            with self.workspace_lock:
+                if any(plotter.selected_cut == cut_id and (plotter.owns_drawing() or plotter.controller.upload_in_progress)
+                       for plotter in plotters):
+                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.")
+                yield
+
+    def save_workspace(self, revision, draft, *, part_correction=False):
+        if part_correction:
+            with self.guard_part_correction(None, (self, self.demo)):
+                return self.write_workspace(revision, draft)
         with self.workspace_lock:
-            result = self.workspace.write(revision, draft)
-            self.invalidate_loaded_plan(result["workspace"])
-            self.demo.invalidate_loaded_plan(result["workspace"])
-            return result
+            return self.write_workspace(revision, draft)
+
+    def write_workspace(self, revision, draft):
+        result = self.workspace.write(revision, draft)
+        self.invalidate_loaded_plan(result["workspace"])
+        self.demo.invalidate_loaded_plan(result["workspace"])
+        return result
 
     def new_cut(self, plotter, data):
         if data.get("stopped") is not True:
@@ -1379,7 +1421,8 @@ class Handler(BaseHTTPRequestHandler):
                         result = self.plotter.operate(data)
                 self.json_response(result)
             elif path == "/api/workspace":
-                self.json_response(self.server.save_workspace(data.get("revision"), data.get("workspace")))
+                self.json_response(self.server.save_workspace(data.get("revision"), data.get("workspace"),
+                                                               part_correction=data.get("partCorrection") is True))
             elif path == "/api/cut-plan":
                 self.json_response(self.plotter.cut_plan(
                     data.get("job"), data.get("filename"), self.plotter.controller.upload_page_add(),
@@ -1446,10 +1489,13 @@ class Handler(BaseHTTPRequestHandler):
         data = self.json_body(MAX_WORKSPACE_BYTES)
         action = data.get("action")
         mode = data.get("mode")
+        part_correction = data.get("partCorrection") is True
         if self.server.local_companion_ui:
             if path == "/api/operator-workspace" and action == "save" and mode in ("operator", "demo"):
-                with self.server.workspace_lock:
-                    plotter = self.server.demo if mode == "demo" else self.server
+                plotter = self.server.demo if mode == "demo" else self.server
+                guard = (self.server.guard_part_correction(data.get("cutId"), (plotter,))
+                         if part_correction else self.server.workspace_lock)
+                with guard:
                     if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
                         raise WorkspaceConflict("Сначала освободите раскладку на плоттере.")
                     result = self.server.workspace.production_request(path, data)
@@ -1463,13 +1509,23 @@ class Handler(BaseHTTPRequestHandler):
             result = store.save_registry(data) if action == "save" else store.collect(data.get("members"))
         elif path == "/api/orders" and action == "save":
             result = store.save_order(data)
+        elif path == "/api/orders" and action == "update-meta":
+            result = store.update_order_metadata(data)
         elif path == "/api/orders" and action in ("save-cut", "remove-cut"):
             result = store.save_cut(data)
         elif path == "/api/orders" and action == "publish":
             result = store.publish_order(data, verify)
+        elif path == "/api/orders" and action == "publish-cut":
+            result = store.publish_cut(data, verify)
+        elif path == "/api/orders" and action == "reopen":
+            result = store.reopen_order(data)
+        elif path == "/api/orders" and action == "delete":
+            result = store.delete_order(data)
         elif path == "/api/operator-workspace" and action == "save":
             plotter = self.server.demo if mode == "demo" else self.server
-            with self.server.workspace_lock:
+            guard = (self.server.guard_part_correction(data.get("cutId"), (plotter,))
+                     if part_correction else self.server.workspace_lock)
+            with guard:
                 if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
                     raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.")
                 result = store.save_workspace(data, mode, verify)

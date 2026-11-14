@@ -1,8 +1,26 @@
 import { mountCadEditor } from "/designer-cad.js";
+import { confirmAction } from "/confirm-action.js";
 
 const $ = (id) => document.getElementById(id);
 const labels = { folder: "Папка", drawing: "Чертёж", part: "Деталь", kit: "Комплект" };
 const states = { pending: "Ожидает", active: "В работе", done: "Выполнен" };
+
+function registryIcon(kind) {
+  const paths = {
+    folder: "M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z",
+    drawing: "M5 3h9l5 5v13H5ZM14 3v6h5m-11 8 3-5 4 5Z",
+    part: "M4 7l4-3h9l3 4v12H4ZM4 14h3m10 0h3",
+    kit: "m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5",
+  };
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("icon", "registry-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(svg.namespaceURI, "path");
+  path.setAttribute("d", paths[kind]);
+  svg.append(path);
+  return svg;
+}
 
 function el(tag, content = "", className = "") {
   const node = document.createElement(tag);
@@ -43,9 +61,33 @@ function progressPercent(done, total) {
   return total ? Math.floor(done * 100 / total) : 0;
 }
 
-export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, openFile, getActiveCut }) {
+const dateParts = new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Moscow", year: "numeric", month: "2-digit", day: "2-digit" });
+const today = () => dateParts.format(new Date());
+const showDate = (value) => value.split("-").reverse().join(".");
+
+function orderDates(order) {
+  const dates = el("span", "", "workplace-order-dates");
+  for (const [label, value] of [["Поставлен", order.placedOn], ["Выполнить до", order.dueOn]]) {
+    const item = el("span", el("span", label, "workplace-order-label"));
+    const date = value ? el("time", showDate(value)) : el("strong", label === "Поставлен" ? "Дата не указана" : "Срок не указан");
+    if (value) date.dateTime = value;
+    item.append(date);
+    dates.append(item);
+  }
+  return dates;
+}
+
+const ROLE_STORAGE_KEY = "plotter.workplace";
+const roleNames = { operator: "Оператор", designer: "Конструктор" };
+
+export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, openFile, getActiveCut, onExit }) {
   const page = $("workplace-page");
   const dock = $("workplace-dock");
+  const picker = $("role-picker");
+  const pickerStatus = $("role-picker-status");
+  const topbar = $("workplace-topbar");
+  const roleLabel = $("workplace-role");
+  const exit = $("workplace-exit");
   const status = el("p", "", "workplace-status");
   status.setAttribute("role", "alert");
   const panel = el("div", "", "workplace-content");
@@ -53,7 +95,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const modal = el("dialog", "", "plotter-dialog workplace-dialog");
   document.body.append(modal);
   let entries = [];
-  let tab = "operator";
+  let tab = null;
   let designerView = "registry";
   let selectedFolder = null;
   let cad = null;
@@ -88,9 +130,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       if (pending) return;
       pending = true;
       status.textContent = "";
+      pickerStatus.hidden = true;
       try { await action(); } catch (error) {
         if (modal.open) modal.querySelector(".workplace-dialog-error").textContent = error.message;
         else if (currentLayout) dock.querySelector(".workplace-dock-error").textContent = error.message;
+        else if (!picker.hidden) {
+          pickerStatus.textContent = error.message;
+          pickerStatus.hidden = false;
+        }
         else status.textContent = error.message;
       } finally { pending = false; }
     };
@@ -213,7 +260,8 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       tree.replaceChildren();
       const folderButton = (entry, level) => {
         const branch = button(entry ? entry.name : "Все папки", () => { selectedFolder = entry?.id ?? null; search.value = ""; draw(); });
-        branch.style.paddingInlineStart = `${12 + level * 15}px`;
+        branch.prepend(registryIcon("folder"));
+        branch.style.paddingInlineStart = `${14 + level * 16}px`;
         branch.setAttribute("aria-pressed", String((entry?.id ?? null) === selectedFolder));
         tree.append(branch);
       };
@@ -228,7 +276,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         const row = el("div", "", "registry-row");
         const title = el("span", el("strong", entry.name));
         title.append(el("small", `${entry.model ? "Изделие" : labels[entry.kind]}${needle && entry.parent ? ` · ${pathOf(find(entry.parent))}` : ""}`));
-        row.append(title);
+        const identity = el("div", registryIcon(entry.kind), "registry-entry");
+        identity.append(title);
+        row.append(identity);
         if (entry.kind === "folder") row.append(button("Открыть", () => { selectedFolder = entry.id; search.value = ""; draw(); }));
         if (["part", "drawing"].includes(entry.kind)) row.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id })))));
         row.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id })))));
@@ -248,13 +298,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     let record = document;
     const host = el("div", "", "workplace-cad");
     cad?.destroy();
-    panel.replaceChildren(workHeading(record?.name || "Редактор лекал", selectedFolder ? pathOf(find(selectedFolder)) : "", [
-      button("К реестру", execute(async () => {
-        if (cad?.hasUnsavedChanges() && !confirm("Закрыть чертёж с несохранёнными изменениями?")) return;
-        cad?.destroy(); cad = null;
-        await render();
-      })),
-    ]), host);
+    page.classList.add("is-cad");
+    panel.replaceChildren(host);
+    const back = execute(async () => {
+      if (!await confirmLeaveCad()) return;
+      cad?.destroy(); cad = null;
+      await render();
+      focusWorkplaceHeading();
+    });
     const savePart = ({ entities }) => new Promise((resolve, reject) => {
       const title = input("text", "", { required: true, maxLength: 255 });
       const parent = folderSelect(record?.parent ?? selectedFolder);
@@ -267,24 +318,60 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         resolve(part);
       });
     });
-    cad = mountCadEditor(host, { document, request, onSavePart: savePart, onSaveDocument: async (value) => {
+    cad = mountCadEditor(host, { document, request, onBack: back, onSavePart: savePart, onSaveDocument: async (value) => {
       record = await post("/api/registry", { action: "save", kind: record?.kind ?? "drawing", parent: record ? record.parent : selectedFolder,
         ...(record ? { id: record.id, revision: record.revision } : {}), ...value });
-      panel.querySelector("h1").textContent = record.name;
       await refreshRegistry();
       return record;
     } });
   }
 
+  function openLayoutPart(document, { onBack, onSaveDocument }) {
+    const host = el("div", "", "workplace-cad");
+    const back = execute(async () => {
+      if (!await confirmLeaveCad()) return;
+      cad?.destroy();
+      cad = null;
+      page.hidden = true;
+      page.classList.remove("is-cad");
+      panel.replaceChildren();
+      onBack();
+    });
+    cad?.destroy();
+    page.classList.add("is-cad");
+    panel.replaceChildren(host);
+    page.hidden = false;
+    cad = mountCadEditor(host, { document, request, layoutPart: true, onBack: back, onSaveDocument });
+  }
+
   function orderDialog(old) {
+    const published = Boolean(old?.published);
     const number = input("text", old?.number ?? "", { required: true, maxLength: 255 });
     const model = select([["", "Выберите папку изделия"], ...folders().filter(folder => folder.model).map(folder => [folder.id, pathOf(folder)])], old?.modelId);
     model.required = true;
     const amount = input("number", old?.quantity ?? 1, { min: 1, max: 50000, required: true });
     const fields = el("div", field("Номер заказа", number), "workplace-form-grid");
-    fields.append(field("Изделие", model), field("Количество изделий", amount));
+    if (!published) fields.append(field("Изделие", model), field("Количество изделий", amount));
+    if (!published && old?.cuts.length) {
+      model.disabled = true;
+      fields.append(el("p", "Чтобы сменить изделие, сначала удалите пункты раскроя.", "workplace-form-note"));
+      const notice = el("p", "После изменения количества раскладки по всем тканям нужно подготовить заново.", "workplace-form-note");
+      notice.hidden = true;
+      amount.oninput = () => { notice.hidden = amount.valueAsNumber === old.quantity; };
+      fields.append(notice);
+    }
+    const placedOn = input("date", old ? old.placedOn ?? "" : today(), { required: !old || Boolean(old.placedOn) });
+    const dueOn = input("date", old?.dueOn ?? "", { required: !old || Boolean(old.dueOn), min: placedOn.value });
+    placedOn.oninput = () => { dueOn.min = placedOn.value; };
+    const notes = Object.assign(el("textarea"), { value: old?.notes ?? "", maxLength: 2000, rows: 3,
+      placeholder: "Например, сначала раскроить подкладку" });
+    const dates = el("div", field("Дата постановки", placedOn), "workplace-date-fields");
+    dates.append(field("Срок выполнения", dueOn));
+    fields.append(dates, field("Комментарий для оператора", notes));
     formDialog(old ? "Изменить наряд" : "Новый наряд", fields, "Сохранить", async () => {
-      const result = await post("/api/orders", { action: "save", number: number.value, modelId: model.value, quantity: amount.valueAsNumber,
+      const result = await post("/api/orders", { action: published ? "update-meta" : "save", number: number.value,
+        ...(!published ? { modelId: model.value, quantity: amount.valueAsNumber } : {}),
+        ...(placedOn.value ? { placedOn: placedOn.value } : {}), ...(dueOn.value ? { dueOn: dueOn.value } : {}), notes: notes.value,
         ...(old ? { id: old.id, revision: old.revision } : {}) });
       selectedOrder = result.id;
       await render();
@@ -297,6 +384,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const picker = itemPicker(["part", "kit"], old?.members);
     const content = el("div", field("Название ткани", title), "workplace-form-grid");
     content.append(field("Рабочая ширина полотна, мм", width), el("strong", "Состав на одно изделие"), picker.section);
+    if (order.published) content.append(el("p", "Если изменить состав или ширину, подготовьте и отправьте эту раскладку оператору заново.", "workplace-form-note"));
     formDialog(old ? "Изменить пункт раскроя" : "Добавить ткань", content, "Сохранить", async () => {
       await post("/api/orders", { action: "save-cut", orderId: order.id, orderRevision: order.revision, id: old?.id,
         name: title.value, widthMm: width.valueAsNumber, members: picker.values() });
@@ -315,9 +403,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     error.setAttribute("role", "alert");
     dock.replaceChildren(button(next.id ? "К наряду" : "К нарядам", execute(async () => { await leaveLayout(); await render(); })), heading, error);
     if (mode === "design") {
-      dock.append(button("Предпросмотр", execute(() => showLayout({ id: next.id, mode: "preview" }))));
+      dock.append(button("Предпросмотр", execute(() => showLayout({ ...next, mode: "preview", editable: true }))));
     } else if (mode === "preview") {
-      dock.append(button("Редактировать раскладку", execute(() => showLayout({ id: next.id, mode: "design" }))));
+      if (next.editable) dock.append(button("Редактировать раскладку", execute(() => showLayout({ ...next, mode: "design" }))));
     } else if (result?.status !== "done" || mode === "demo") {
       dock.append(button("Добавить файл", execute(async () => {
         await refreshRegistry();
@@ -328,11 +416,21 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           addRegisteredParts(result.paths);
         });
       })));
+      if (mode === "operator" && result?.canReleaseCut) dock.append(button("Вернуть в очередь", execute(async () => {
+        await releaseRegisteredCut();
+        await leaveLayout();
+        await render();
+      })));
       if (mode === "operator") dock.append(button("Отметить раскрой выполненным", execute(async () => {
-        if (!confirm(`Подтвердите, что раскрой «${result.name}» фактически выполнен.`)) return;
+        if (!await confirmAction({
+          title: "Отметить раскрой выполненным?",
+          message: `Подтвердите, что раскрой «${result.name}» фактически выполнен.`,
+          confirmLabel: "Отметить выполненным",
+        })) return;
         await finishRegisteredCut();
         await leaveLayout();
         await render();
+        focusWorkplaceHeading();
       }), { primary: true }));
     }
     dock.hidden = false;
@@ -346,16 +444,41 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   function renderOrder(order) {
     const operator = tab === "operator";
-    const editable = !operator && !order.published;
+    const draft = !order.published;
     const done = order.cuts.filter(cut => cut.status === "done").length;
     const actions = [button("Все наряды", execute(async () => { selectedOrder = null; await render(); }))];
-    if (editable) actions.push(button("Изменить шапку", () => orderDialog(order)), button("Добавить ткань", () => cutDialog(order)));
-    if (editable && order.cuts.length) actions.push(button("Отправить оператору", execute(async () => {
-      if (!confirm(`Отправить наряд № ${order.number} оператору?`)) return;
+    if (!operator) {
+      const canReopen = order.cuts.every(cut => cut.status === "pending");
+      const hasActiveCut = order.cuts.some(cut => cut.status === "active");
+      actions.push(button("Изменить наряд", () => orderDialog(order)), button("Добавить ткань", () => cutDialog(order)));
+      if (order.published && order.cuts.length && canReopen) actions.push(button("Вернуть в черновики", execute(async () => {
+        formDialog("Изменить отправленный наряд?", el("p", "Наряд вернётся в черновики. После правок отправьте его оператору повторно."), "Вернуть в черновики", async () => {
+          await post("/api/orders", { action: "reopen", id: order.id, revision: order.revision });
+          await render();
+        });
+      })));
+      actions.push(button("Удалить наряд", execute(async () => {
+        if (hasActiveCut) throw new Error("В наряде есть раскрой в работе. Завершите его на рабочем месте оператора перед удалением.");
+        formDialog(`Удалить наряд № ${order.number}?`, el("p", "Наряд исчезнет из списков. Лекала останутся в реестре, а история раскроя сохранится."), "Удалить наряд", async () => {
+          await post("/api/orders", { action: "delete", id: order.id, revision: order.revision });
+          selectedOrder = null;
+          await render();
+        });
+      })));
+    }
+    if (!operator && draft && order.cuts.length) actions.push(button("Отправить оператору", execute(async () => {
+      if (!await confirmAction({
+        title: `Отправить наряд № ${order.number} оператору?`,
+        confirmLabel: "Отправить",
+      })) return;
       await post("/api/orders", { action: "publish", id: order.id, revision: order.revision });
       await render();
+      focusWorkplaceHeading();
     }), { primary: true }));
     panel.append(workHeading(`Наряд № ${order.number}`, `${order.modelName} · ${order.quantity} шт.`, actions));
+    const overview = el("section", orderDates(order), "workplace-order-overview");
+    if (order.notes) overview.append(el("p", order.notes, "workplace-order-notes"));
+    panel.append(overview);
     if (operator || order.published) panel.append(progressRow(done, order.cuts.length));
     const list = el("div", "", "workplace-cut-list");
     for (const cut of order.cuts) {
@@ -363,20 +486,36 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       const main = el("div", el("h2", cut.name));
       main.append(el("p", `Полотно ${cut.widthMm} мм`));
       const tools = el("div", "", "workplace-actions");
-      const state = !order.published ? cut.prepared ? "Готов к отправке" : "Требуется раскладка" : states[cut.status];
+      const released = cut.released !== false;
+      const state = draft ? cut.prepared ? "Готов к отправке" : "Требуется раскладка"
+        : released ? states[cut.status] : "Конструктор обновляет раскладку";
       tools.append(el("span", state, `workplace-chip ${cut.status}`));
-      if (operator) {
+      if (operator && released) {
         tools.append(button(cut.status === "pending" ? "Приступить" : cut.status === "active" ? "Продолжить" : "Просмотреть",
           execute(() => showLayout({ id: cut.id, mode: "operator" })), { primary: cut.status !== "done" }));
         tools.append(button("Демо", execute(() => showLayout({ id: cut.id, mode: "demo" }))));
-      } else if (editable) {
-        tools.append(button("Состав", () => cutDialog(order, cut)), button("Раскладка", execute(() => showLayout({ id: cut.id, mode: "design" })), { primary: true }));
-        tools.append(button("Удалить", execute(async () => {
-          if (!confirm(`Удалить пункт «${cut.name}»?`)) return;
+      } else if (!operator && (draft || cut.status === "pending")) {
+        tools.append(button("Изменить ткань и состав", () => cutDialog(order, cut)));
+        if (draft || !released) {
+          tools.append(button("Раскладка", execute(() => showLayout({ id: cut.id, mode: "design" })), { primary: true }));
+          if (!draft) tools.append(button("Отправить раскладку", execute(async () => {
+            await post("/api/orders", { action: "publish-cut", id: cut.id, orderId: order.id, orderRevision: order.revision });
+            await render();
+          }), { primary: true }));
+        } else {
+          tools.append(button("Предпросмотр", execute(() => showLayout({ id: cut.id, mode: "preview" }))));
+        }
+        tools.append(button("Удалить ткань", execute(async () => {
+          if (!await confirmAction({
+            title: `Удалить пункт «${cut.name}»?`,
+            message: "Состав и раскладка для этой ткани будут удалены из наряда.",
+            confirmLabel: "Удалить",
+          })) return;
           await post("/api/orders", { action: "remove-cut", id: cut.id, orderId: order.id, orderRevision: order.revision });
           await render();
+          focusWorkplaceHeading();
         })));
-      } else tools.append(button("Предпросмотр", execute(() => showLayout({ id: cut.id, mode: "preview" }))));
+      } else if (!operator) tools.append(button("Предпросмотр", execute(() => showLayout({ id: cut.id, mode: "preview" }))));
       row.append(main, tools);
       list.append(row);
     }
@@ -395,12 +534,11 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   async function render() {
     const epoch = ++renderEpoch;
+    page.classList.remove("is-cad");
     if (tab === "designer") await refreshRegistry();
     if (epoch !== renderEpoch) return;
     const operator = tab === "operator";
     panel.replaceChildren();
-    $("operator-tab").setAttribute("aria-pressed", String(operator));
-    $("designer-tab").setAttribute("aria-pressed", String(!operator));
     if (!operator) {
       const nav = el("nav", "", "workplace-subnav");
       for (const [view, title] of [["registry", "Реестр"], ["orders", "Наряды"]]) {
@@ -424,26 +562,104 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     panel.append(workHeading(operator ? "Наряды на раскрой" : "Наряды", "", actions));
     const cards = el("div", "", "workplace-cards");
     for (const order of result.orders) {
-      const card = el("button", "", "workplace-card");
-      card.type = "button";
-      card.append(el("strong", `Наряд № ${order.number}`), el("span", `${order.modelName} · ${order.quantity} шт.`));
-      card.append(order.published ? progressRow(order.done, order.total) : el("small", "Черновик", "workplace-chip"));
-      card.onclick = execute(async () => { selectedOrder = order.id; await render(); });
+      const card = el("article", "", "workplace-card");
+      const identity = el("div", el("h2", `Наряд № ${order.number}`), "workplace-card-identity");
+      identity.append(el("p", `${order.modelName} · ${order.quantity} шт.`));
+      const summary = el("div", "", "workplace-card-materials");
+      summary.append(el("span", "Ткани", "workplace-order-label"));
+      summary.append(el("span", order.materials?.map(material => `${material.name} · ${material.widthMm} мм`).join(", ") || "Ткани не добавлены"));
+      const progress = el("div", order.published ? progressRow(order.done, order.total)
+        : el("small", "Черновик", "workplace-chip"), "workplace-card-progress");
+      const open = button("Открыть", execute(async () => { selectedOrder = order.id; await render(); }));
+      open.setAttribute("aria-label", `Открыть наряд № ${order.number}`);
+      card.append(identity, orderDates(order), summary, progress, open);
+      if (order.notes) card.append(el("p", order.notes, "workplace-card-notes"));
       cards.append(card);
     }
     if (!cards.children.length) cards.append(el("p", operator ? "Отправленные наряды появятся здесь." : "Создайте наряд для изделия из реестра.", "workplace-empty"));
     panel.append(cards);
   }
 
-  for (const name of ["operator", "designer"]) {
-    $(`${name}-tab`).onclick = execute(async () => {
-      if (cad?.hasUnsavedChanges() && !confirm("Закрыть чертёж с несохранёнными изменениями?")) return;
-      await leaveLayout();
-      cad?.destroy(); cad = null;
-      if (tab !== name) selectedOrder = null;
-      tab = name;
-      await render();
+  function saveRole(role) {
+    try {
+      if (role) sessionStorage.setItem(ROLE_STORAGE_KEY, role);
+      else sessionStorage.removeItem(ROLE_STORAGE_KEY);
+    } catch {
+      // The role still works when browser storage is unavailable.
+    }
+  }
+
+  function storedRole() {
+    try {
+      const name = sessionStorage.getItem(ROLE_STORAGE_KEY);
+      return Object.hasOwn(roleNames, name) ? name : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function focusPicker() {
+    $("role-picker-title").focus({ preventScroll: true });
+  }
+
+  function focusWorkplaceHeading() {
+    const heading = panel.querySelector("h1");
+    heading.tabIndex = -1;
+    heading.focus({ preventScroll: true });
+  }
+
+  function confirmLeaveCad() {
+    return !cad?.hasUnsavedChanges() || confirmAction({
+      title: "Закрыть чертёж?",
+      message: "Несохранённые изменения будут потеряны.",
+      confirmLabel: "Закрыть без сохранения",
+      cancelLabel: "Продолжить редактирование",
     });
   }
-  execute(render)();
+
+  async function enterRole(name) {
+    tab = name;
+    try {
+      await render();
+    } catch (error) {
+      tab = null;
+      panel.replaceChildren();
+      throw error;
+    }
+    saveRole(name);
+    roleLabel.textContent = roleNames[name];
+    picker.hidden = true;
+    topbar.hidden = page.hidden = false;
+    focusWorkplaceHeading();
+  }
+
+  const leaveRole = execute(async () => {
+    if (cad?.isBusy()) return;
+    if (!await confirmLeaveCad()) return;
+    await leaveLayout();
+    await onExit?.();
+    cad?.destroy();
+    cad = null;
+    tab = selectedOrder = selectedFolder = null;
+    designerView = "registry";
+    saveRole(null);
+    page.classList.remove("is-cad");
+    panel.replaceChildren();
+    topbar.hidden = page.hidden = true;
+    picker.hidden = false;
+    focusPicker();
+  });
+  exit.onclick = leaveRole;
+  for (const name of Object.keys(roleNames)) {
+    $(`${name}-tab`).onclick = execute(() => enterRole(name));
+  }
+  window.addEventListener("beforeunload", event => {
+    if (!cad?.hasUnsavedChanges()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+  const initialRole = storedRole();
+  if (initialRole) void execute(() => enterRole(initialRole))();
+  else focusPicker();
+  return { openLayoutPart };
 }
