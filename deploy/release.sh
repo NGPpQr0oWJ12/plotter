@@ -98,6 +98,18 @@ copy_state() {
             if [[ -f $state/$file ]]; then cp -- "$state/$file" "$dest/$file"; fi
         done
     ) 8<"$state/workspace.json.lock"
+    if [[ -f $state/production.sqlite3 ]]; then
+        python3 - "$state/production.sqlite3" "$dest/production.sqlite3" <<'PY'
+from contextlib import closing
+from pathlib import Path
+import sqlite3
+import sys
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as source:
+    with closing(sqlite3.connect(sys.argv[2])) as target:
+        source.backup(target)
+PY
+    fi
 }
 
 check_state() {
@@ -128,7 +140,7 @@ stage() (
     if [[ -f $source/CHANGELOG.md ]]; then
         install -m 0644 "$source/CHANGELOG.md" "$final/CHANGELOG.md"
     fi
-    install -m 0644 "$source"/web-plotter/static/{app.js,index.html,simulation.js,style.css} "$final/web-plotter/static/"
+    install -m 0644 "$source"/web-plotter/static/*.{css,html,js} "$final/web-plotter/static/"
     install -D -m 0644 "$source/research/machine-profile.example.json" "$final/research/machine-profile.example.json"
     python3 -m venv "$final/.venv"
     "$final/.venv/bin/python" -m pip install -r "$final/web-plotter/requirements.txt"

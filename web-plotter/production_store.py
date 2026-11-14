@@ -1,0 +1,469 @@
+from contextlib import closing, contextmanager
+import json
+import math
+from pathlib import Path
+import sqlite3
+from uuid import uuid4
+
+from cad import MAX_ENTITIES, MAX_POINTS
+from designer_cad import prepare_design, validate_design
+from machine import PlotterError
+from nesting import validate_placed_parts
+from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, validate_workspace
+
+
+SCHEMA_VERSION = 1
+MAX_QUANTITY = 50_000
+
+
+class RecordNotFound(PlotterError):
+    pass
+
+
+def uid():
+    return uuid4().hex
+
+
+def name(value, label="название"):
+    if not isinstance(value, str) or not 0 < len(value.strip()) <= 255 or any(ord(c) < 32 for c in value):
+        raise ValueError(f"Укажите {label} (до 255 символов).")
+    return value.strip()
+
+
+def quantity(value):
+    if type(value) is not int or not 1 <= value <= MAX_QUANTITY:
+        raise ValueError(f"Количество должно быть целым от 1 до {MAX_QUANTITY}.")
+    return value
+
+
+def width_mm(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or not 1 <= value <= 1_000_000:
+        raise ValueError("Укажите рабочую ширину полотна в миллиметрах.")
+    return value
+
+
+def encode(value):
+    result = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(result.encode("utf-8")) > MAX_WORKSPACE_BYTES:
+        raise ValueError("Данные превышают допустимый размер.")
+    return result
+
+
+def object_value(value):
+    if not isinstance(value, dict):
+        raise ValueError("Неверные данные записи.")
+    return value
+
+
+def key(value):
+    if not isinstance(value, str) or len(value) != 32 or any(c not in "0123456789abcdef" for c in value):
+        raise ValueError("Неверный идентификатор записи.")
+    return value
+
+
+def check_revision(value, revision):
+    if type(value) is not int or value != revision:
+        raise WorkspaceConflict("Запись изменилась в другой вкладке. Заново откройте её.")
+
+
+def row_data(row):
+    return {**json.loads(row["data"]), **{k: row[k] for k in row.keys() if k != "data"}}
+
+
+def check_composition(draft, cut):
+    excluded = set(draft["excluded"])
+    actual = {path.get("partNumber") for index, path in enumerate(draft["paths"])
+              if index not in excluded and path["closed"]}
+    if actual != set(range(1, cut["partCount"] + 1)):
+        raise ValueError("В раскладке должны быть все детали из состава пункта.")
+
+
+def cut_data(cut, **changes):
+    return {**{field: cut[field] for field in ("name", "widthMm", "members", "prepared", "partCount")}, **changes}
+
+
+def new_workspace(paths, filename, width=None):
+    return validate_workspace({
+        "source": {"filename": filename, "warnings": []}, "paths": paths, "excluded": [],
+        "view": {"zoom": 1, "focusX": 0, "focusY": 0, "grid": True, "cameraMode": "overview"},
+        "optimization": {"route": True, "routeApplied": True, "join": False, **({"nesting": {
+            "widthMm": width, "gapMm": 3, "marginMm": 0, "rotation": "quarter", "widthExplicit": True,
+        }} if width is not None else {})},
+    })
+
+
+class ProductionStore:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    @contextmanager
+    def connect(self, *, write=False):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA foreign_keys = ON")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 0:
+                self.initialize(db)
+            elif version != SCHEMA_VERSION:
+                raise ValueError("Версия базы реестра не поддерживается этой версией Plotter.")
+            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield db
+            db.commit()
+        finally:
+            db.close()
+
+    @staticmethod
+    def initialize(db):
+        db.executescript(f"""
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS registry (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, parent TEXT REFERENCES registry(id),
+                name TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS registry_parent ON registry(parent);
+            CREATE TABLE IF NOT EXISTS orders (
+                id TEXT PRIMARY KEY, revision INTEGER NOT NULL, published INTEGER NOT NULL, data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cuts (
+                id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id), position INTEGER NOT NULL,
+                revision INTEGER NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL,
+                UNIQUE (order_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS workspaces (
+                cut_id TEXT NOT NULL REFERENCES cuts(id), mode TEXT NOT NULL, revision INTEGER NOT NULL,
+                cut_revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (cut_id, mode)
+            );
+            PRAGMA user_version = {SCHEMA_VERSION};
+            COMMIT;
+        """)
+
+    @staticmethod
+    def registry_record(db, record_id):
+        row = db.execute("SELECT * FROM registry WHERE id = ?", (key(record_id),)).fetchone()
+        if row is None:
+            raise RecordNotFound("Запись в реестре не найдена.")
+        return row_data(row)
+
+    def registry(self, record_id=None):
+        with self.connect() as db:
+            if record_id is not None:
+                return self.registry_record(db, record_id)
+            rows = db.execute("SELECT id, kind, parent, name, revision, "
+                              "CASE WHEN kind = 'folder' THEN data ELSE '{}' END AS data FROM registry")
+            return {"entries": sorted(map(row_data, rows), key=lambda r: (r["name"].casefold(), r["id"]))}
+
+    def save_registry(self, payload):
+        kind = payload.get("kind")
+        if kind not in ("folder", "drawing", "part", "kit"):
+            raise ValueError("Неверный тип записи реестра.")
+        record_id = payload.get("id")
+        title, parent = name(payload.get("name")), payload.get("parent")
+        with self.connect(write=True) as db:
+            old = None
+            if record_id is not None:
+                old = self.registry_record(db, record_id)
+                check_revision(payload.get("revision"), old["revision"])
+                if old["kind"] != kind:
+                    raise ValueError("Тип существующей записи изменить нельзя.")
+            else:
+                record_id = uid()
+            ancestor = parent
+            while ancestor is not None:
+                if ancestor == record_id:
+                    raise ValueError("Нельзя переместить папку внутрь неё самой.")
+                folder = self.registry_record(db, ancestor)
+                if folder["kind"] != "folder":
+                    raise ValueError("Выберите папку реестра.")
+                ancestor = folder["parent"]
+            if kind == "folder":
+                data = {"model": payload.get("model") is True}
+            elif kind == "kit":
+                data = {"members": self.members(db, payload.get("members", old and old["members"]), ("part",))}
+            elif old is not None and "entities" not in payload:
+                data = {field: old[field] for field in ("entities", "warnings", "paths") if field in old}
+            else:
+                entities = validate_design(payload.get("entities"))
+                warnings = payload.get("warnings", [])
+                if (not isinstance(warnings, list) or len(warnings) > 32
+                        or any(not isinstance(w, str) or len(w) > 16_384 for w in warnings)):
+                    raise ValueError("Неверные предупреждения чертежа.")
+                data = {"entities": entities, "warnings": warnings}
+                if kind == "part":
+                    prepared = prepare_design(entities)
+                    if not any(path["closed"] for path in prepared["paths"]):
+                        raise ValueError("Для детали выделите замкнутую кромку и её внутренние контуры.")
+                    data.update(paths=prepared["paths"], warnings=prepared["warnings"][:32])
+            revision = 1 if old is None else old["revision"] + 1
+            if old is None:
+                db.execute("INSERT INTO registry VALUES (?, ?, ?, ?, ?, ?)",
+                           (record_id, kind, parent, title, revision, encode(data)))
+            else:
+                db.execute("UPDATE registry SET name=?, parent=?, revision=?, data=? WHERE id=?",
+                           (title, parent, revision, encode(data), record_id))
+            return self.registry_record(db, record_id)
+
+    def members(self, db, values, allowed):
+        if not isinstance(values, list) or not 0 < len(values) <= MAX_ENTITIES:
+            raise ValueError("Выберите детали или комплекты и укажите количество.")
+        members = {}
+        for raw in values:
+            member = object_value(raw)
+            record_id = key(member.get("id"))
+            row = db.execute("SELECT kind FROM registry WHERE id = ?", (record_id,)).fetchone()
+            if row is None or row["kind"] not in allowed:
+                raise ValueError("В составе есть запись неподходящего типа.")
+            members[record_id] = quantity(members.get(record_id, 0) + quantity(member.get("quantity")))
+        return [{"id": record_id, "quantity": amount} for record_id, amount in members.items()]
+
+    def expand_parts(self, db, members, multiplier=1):
+        paths, part_number, point_count = [], 0, 0
+        for member in members:
+            entry = self.registry_record(db, member["id"])
+            repeats = quantity(member["quantity"] * multiplier)
+            details = entry["members"] if entry["kind"] == "kit" else [{"id": entry["id"], "quantity": 1}]
+            for detail in details:
+                part = entry if entry["kind"] == "part" else self.registry_record(db, detail["id"])
+                amount = quantity(detail["quantity"] * repeats)
+                contours = part["paths"]
+                point_count += amount * sum(len(path["points"]) for path in contours)
+                if len(paths) + amount * len(contours) > MAX_ENTITIES or point_count > MAX_POINTS:
+                    raise ValueError("Слишком много деталей в одном раскрое. Разделите раскладку.")
+                min_x = min(x for path in contours for x, _ in path["points"])
+                min_y = min(y for path in contours for _, y in path["points"])
+                normalized = [{**path, "points": [[x - min_x, y - min_y] for x, y in path["points"]]}
+                              for path in contours]
+                for _ in range(amount):
+                    part_number += 1
+                    paths.extend({**path, "partNumber": part_number} for path in normalized)
+        return paths
+
+    def collect(self, values):
+        with self.connect() as db:
+            members = self.members(db, values, ("part", "kit"))
+            return {"paths": self.expand_parts(db, members)}
+
+    @staticmethod
+    def order_header(db, order_id):
+        row = db.execute("SELECT * FROM orders WHERE id = ?", (key(order_id),)).fetchone()
+        if row is None:
+            raise RecordNotFound("Наряд не найден.")
+        return row_data(row)
+
+    @staticmethod
+    def cut_record(db, cut_id):
+        row = db.execute("SELECT * FROM cuts WHERE id = ?", (key(cut_id),)).fetchone()
+        if row is None:
+            raise RecordNotFound("Раскладка не найдена.")
+        return row_data(row)
+
+    @staticmethod
+    def cuts(db, order_id):
+        return [row_data(row) for row in db.execute("SELECT * FROM cuts WHERE order_id = ? ORDER BY position",
+                                                   (order_id,))]
+
+    def orders(self, order_id=None, *, published_only=False):
+        with self.connect() as db:
+            if order_id is not None:
+                header = self.order_header(db, order_id)
+                if published_only and not header["published"]:
+                    raise RecordNotFound("Наряд ещё не отправлен оператору.")
+                return {**header, "cuts": self.cuts(db, order_id)}
+            rows = db.execute("SELECT orders.*, COUNT(cuts.id) AS total, "
+                              "COUNT(CASE WHEN cuts.status='done' THEN 1 END) AS done "
+                              "FROM orders LEFT JOIN cuts ON orders.id=cuts.order_id WHERE published >= ? "
+                              "GROUP BY orders.id ORDER BY orders.rowid DESC", (int(published_only),))
+            return {"orders": [row_data(row) for row in rows]}
+
+    def save_order(self, payload):
+        with self.connect(write=True) as db:
+            order_id = payload.get("id")
+            old = self.order_header(db, order_id) if order_id is not None else None
+            if old:
+                check_revision(payload.get("revision"), old["revision"])
+                if old["published"]:
+                    raise WorkspaceConflict("Наряд уже отправлен.")
+            model = self.registry_record(db, payload.get("modelId"))
+            if model["kind"] != "folder" or not model.get("model"):
+                raise ValueError("Выберите папку, отмеченную как изделие.")
+            amount = quantity(payload.get("quantity"))
+            if old and (old["quantity"] != amount or old["modelId"] != model["id"]) and self.cuts(db, order_id):
+                raise ValueError("Чтобы изменить изделие или тираж, удалите подготовленные пункты и создайте их заново.")
+            data = {"number": name(payload.get("number"), "номер заказа"), "modelId": model["id"],
+                    "modelName": model["name"], "quantity": amount}
+            if old is None:
+                order_id = uid()
+                db.execute("INSERT INTO orders VALUES (?, 1, 0, ?)", (order_id, encode(data)))
+            else:
+                db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?", (encode(data), order_id))
+            return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
+
+    def save_cut(self, payload):
+        with self.connect(write=True) as db:
+            order = self.order_header(db, payload.get("orderId"))
+            check_revision(payload.get("orderRevision"), order["revision"])
+            if order["published"]:
+                raise WorkspaceConflict("Наряд уже отправлен.")
+            cut_id = payload.get("id")
+            old = self.cut_record(db, cut_id) if cut_id is not None else None
+            if old is not None and old["order_id"] != order["id"]:
+                raise ValueError("Эта раскладка относится к другому наряду.")
+            if payload.get("action") == "remove-cut":
+                if old is None:
+                    raise ValueError("Выберите пункт раскроя.")
+                db.execute("DELETE FROM workspaces WHERE cut_id=?", (cut_id,))
+                db.execute("DELETE FROM cuts WHERE id=?", (cut_id,))
+            else:
+                members = self.members(db, payload.get("members"), ("part", "kit"))
+                data = {"name": name(payload.get("name"), "название ткани"),
+                        "widthMm": width_mm(payload.get("widthMm")), "members": members}
+                previous = self.find_workspace(db, cut_id, "design") if old else None
+                unchanged = old is not None and all(old[field] == data[field] for field in data)
+                if not unchanged or not previous:
+                    paths = self.expand_parts(db, members, order["quantity"])
+                    data.update(prepared=False, partCount=paths[-1]["partNumber"])
+                    if old is None:
+                        cut_id = uid()
+                        position = db.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM cuts WHERE order_id=?",
+                                              (order["id"],)).fetchone()[0]
+                        db.execute("INSERT INTO cuts VALUES (?, ?, ?, 1, 'pending', ?)",
+                                   (cut_id, order["id"], position, encode(data)))
+                    else:
+                        db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
+                                   (encode(data), cut_id))
+                    workspace = new_workspace(paths, f"cut-{cut_id}.dxf", data["widthMm"])
+                    self.put_workspace(db, cut_id, "design", workspace, previous)
+            db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
+            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"]), "cutId": cut_id}
+
+    @staticmethod
+    def find_workspace(db, cut_id, mode):
+        row = db.execute("SELECT revision, cut_revision, data FROM workspaces WHERE cut_id=? AND mode=?",
+                         (cut_id, mode)).fetchone()
+        if row is None:
+            return None
+        return {"revision": row["revision"], "cutRevision": row["cut_revision"],
+                "workspace": json.loads(row["data"])}
+
+    def put_workspace(self, db, cut_id, mode, workspace, previous):
+        content = encode(workspace)
+        revision = previous["revision"] + 1 if previous else 1
+        # Retain the cutting revision for view-only updates.
+        def geometry(draft):
+            return {field: value for field, value in draft.items() if field != "view"}
+        cut_revision = (previous["cutRevision"] + (geometry(previous["workspace"]) != geometry(workspace))
+                        if previous else 1)
+        db.execute("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?) ON CONFLICT(cut_id, mode) DO UPDATE "
+                   "SET revision=excluded.revision, cut_revision=excluded.cut_revision, data=excluded.data",
+                   (cut_id, mode, revision, cut_revision, content))
+        return self.find_workspace(db, cut_id, mode)
+
+    def matching_workspace(self, db, cut, mode):
+        if mode not in ("design", "preview", "operator", "demo"):
+            raise ValueError("Неизвестное рабочее место.")
+        order = self.order_header(db, cut["order_id"])
+        if mode == "design" and order["published"]:
+            raise WorkspaceConflict("Наряд уже отправлен оператору.")
+        if mode in ("operator", "demo") and not order["published"]:
+            raise WorkspaceConflict("Наряд ещё не отправлен оператору.")
+        base = self.find_workspace(db, cut["id"], "design")
+        if mode in ("design", "preview"):
+            return base
+        work = self.find_workspace(db, cut["id"], mode)
+        return work or {"revision": 0, "cutRevision": base["cutRevision"], "workspace": base["workspace"]}
+
+    def workspace(self, cut_id, mode):
+        with self.connect() as db:
+            cut = self.cut_record(db, cut_id)
+            return {**self.matching_workspace(db, cut, mode), "status": cut["status"], "name": cut["name"]}
+
+    def save_workspace(self, payload, mode, verify_layout):
+        with self.connect(write=True) as db:
+            cut = self.cut_record(db, payload.get("cutId"))
+            current = self.matching_workspace(db, cut, mode)
+            check_revision(payload.get("revision"), current["revision"])
+            if mode == "preview" or (mode == "operator" and cut["status"] == "done"):
+                raise WorkspaceConflict("Этот раскрой открыт для просмотра.")
+            draft = validate_workspace(payload.get("workspace"))
+            if not draft or not draft["paths"] or draft["source"]["filename"] != current["workspace"]["source"]["filename"]:
+                raise ValueError("Сохраните раскладку для этого пункта наряда.")
+            if mode == "design" and draft["optimization"].get("nesting", {}).get("widthMm") != cut["widthMm"]:
+                raise ValueError("Ширина должна совпадать с указанной в пункте наряда.")
+            if mode == "operator" and cut["status"] == "pending":
+                raise WorkspaceConflict("Сначала откройте раскрой из наряда.")
+            if mode == "design":
+                try:
+                    check_composition(draft, cut)
+                    verify_layout(draft, cut["widthMm"])
+                    prepared = True
+                except (ValueError, PlotterError):
+                    prepared = False
+                if cut["prepared"] != prepared:
+                    db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(cut_data(cut, prepared=prepared)), cut["id"]))
+            previous = self.find_workspace(db, cut["id"], mode)
+            if not previous:
+                previous = current
+            return self.put_workspace(db, cut["id"], mode, draft, previous)
+
+    def publish_order(self, payload, verify_layout):
+        with self.connect(write=True) as db:
+            order = self.order_header(db, payload.get("id"))
+            if order["published"]:
+                return {**order, "cuts": self.cuts(db, order["id"])}
+            check_revision(payload.get("revision"), order["revision"])
+            cuts = self.cuts(db, order["id"])
+            if not cuts:
+                raise ValueError("Добавьте хотя бы один пункт раскроя.")
+            for cut in cuts:
+                draft = self.find_workspace(db, cut["id"], "design")["workspace"]
+                try:
+                    check_composition(draft, cut)
+                    verify_layout(draft, cut["widthMm"])
+                except (ValueError, PlotterError) as error:
+                    raise ValueError(f'{cut["name"]}: {error}') from error
+                db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(cut_data(cut, prepared=True)), cut["id"]))
+            db.execute("UPDATE orders SET published=1, revision=revision+1 WHERE id=?", (order["id"],))
+            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"])}
+
+    def progress(self, cut_id, action, mode, revision=None):
+        with self.connect(write=True) as db:
+            cut = self.cut_record(db, cut_id)
+            current = self.matching_workspace(db, cut, mode)
+            status = cut["status"]
+            if mode == "operator":
+                if action == "start" and status == "pending":
+                    status = "active"
+                if action == "finish" and status != "done":
+                    if status != "active":
+                        raise WorkspaceConflict("Сначала приступите к раскрою.")
+                    check_revision(revision, current["revision"])
+                    status = "done"
+                if status != cut["status"]:
+                    db.execute("UPDATE cuts SET status=? WHERE id=?", (status, cut_id))
+            elif action != "start" or mode != "demo":
+                raise WorkspaceConflict("В демо-режиме ход наряда не сохраняется.")
+            return {**current, "status": status, "name": cut["name"]}
+
+    def backup(self, destination):
+        if not self.path.is_file():
+            return
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as source, \
+                closing(sqlite3.connect(destination)) as target:
+            source.backup(target)
+
+    def check(self):
+        with self.connect() as db:
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or db.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("База реестра содержит повреждённые записи.")
+
+
+def verify_arrangement(draft, width):
+    excluded = set(draft["excluded"])
+    paths = [path for index, path in enumerate(draft["paths"]) if index not in excluded]
+    if not paths:
+        raise ValueError("Добавьте детали в раскладку.")
+    settings = draft["optimization"].get("nesting", {})
+    if settings.get("widthMm") != width:
+        raise ValueError("Установите рабочую ширину полотна.")
+    validate_placed_parts(paths, width=width, margin=settings["marginMm"], gap=settings["gapMm"])

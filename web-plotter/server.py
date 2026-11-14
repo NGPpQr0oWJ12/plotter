@@ -20,7 +20,7 @@ import ssl
 import subprocess
 from struct import unpack_from
 from threading import Lock, Timer
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
 from uuid import uuid4
@@ -36,10 +36,12 @@ from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SEC
 from cut_journal import MAX_EVENTS, CutJournal
 from cut_plan import EPSILON_MM, prepare_cut_plan
 from demo_controller import DemoController
+from designer_cad import edit_design, import_design, prepare_design
 from machine import PlotterError, Simulator, build_plan, number
 from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
 from panel_diagnostics import compare_panel_samples
 from panel_readback import PanelReadback
+from production_store import ProductionStore, RecordNotFound, key, verify_arrangement
 from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace
 from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
@@ -52,13 +54,14 @@ LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
 LOCAL_ADDRESS = "127.0.0.1"
 DEFAULT_PORT = 8765
-API_VERSION = 21
+API_VERSION = 22
 COMPANION_PORT = 8767
 COMPANION_PROTOCOL = 1
 HARDWARE_ROUTES = frozenset({"/api/status", "/api/cut-plan", "/api/controller", "/api/controller-live",
     "/api/controller-position", "/api/controller-job", "/api/controller-feed-mode", "/api/control-session",
     "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset",
-    "/api/panel-snapshot", "/api/panel-compare", "/api/reachability", "/api/open-in-xiao", "/api/prepare-xiao"})
+    "/api/panel-snapshot", "/api/panel-compare", "/api/reachability", "/api/open-in-xiao", "/api/prepare-xiao",
+    "/api/cut-context"})
 RESTART_SAFE_ACTIONS = {
     "/api/controller-hold": "stop", "/api/controller-operation": "cancel-cut", "/api/control-session": "disarm",
 }
@@ -73,7 +76,12 @@ MIME = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/simulation.js": ("simulation.js", "text/javascript; charset=utf-8"),
+    "/workplaces.js": ("workplaces.js", "text/javascript; charset=utf-8"),
+    "/workplaces.css": ("workplaces.css", "text/css; charset=utf-8"),
+    "/designer-cad.js": ("designer-cad.js", "text/javascript; charset=utf-8"),
+    "/designer-cad.css": ("designer-cad.css", "text/css; charset=utf-8"),
 }
+PRODUCTION_ROUTES = {"/api/registry", "/api/orders", "/api/operator-workspace"}
 LOGGER = logging.getLogger("plotter")
 
 
@@ -139,26 +147,31 @@ class CompanionWorkspace:
         return self._request("/api/workspace", payload)
 
     def _request(self, endpoint, payload=None):
+        data = self.production_request(endpoint, payload)
+        if not isinstance(data, dict) or type(data.get("revision")) is not int or "workspace" not in data:
+            raise RequestError("Общая раскладка имеет неверный формат.", HTTPStatus.BAD_GATEWAY)
+        if data.get("workspace") is not None:
+            data["workspace"] = validate_workspace(data["workspace"])
+        return data
+
+    def production_request(self, endpoint, payload=None, *, raw=None):
         request = Request(self.origin + endpoint)
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
             if len(body) > MAX_WORKSPACE_BYTES:
                 raise ValueError("Файл рабочей области слишком велик.")
             request = Request(request.full_url, body, {"Content-Type": "application/json", "Origin": self.origin})
+        elif raw is not None:
+            request = Request(request.full_url, raw, {"Content-Type": "application/octet-stream", "Origin": self.origin})
         try:
-            with self.opener.open(request, timeout=12 if payload is not None else 4) as response:
+            with self.opener.open(request, timeout=90 if raw is not None else 30 if payload is not None else 10) as response:
                 contents = response.read(MAX_WORKSPACE_BYTES + 1)
             if len(contents) > MAX_WORKSPACE_BYTES:
                 raise ValueError("Workspace too large")
-            data = json.loads(contents)
-            if not isinstance(data, dict) or type(data.get("revision")) is not int or "workspace" not in data:
-                raise ValueError("Invalid workspace")
-            if data.get("workspace") is not None:
-                data["workspace"] = validate_workspace(data["workspace"])
-            return data
+            return json.loads(contents)
         except HTTPError as error:
             with error:
-                if error.code in (400, 409):
+                if error.code in (400, 404, 409, 422):
                     try:
                         message = json.loads(error.read(4096)).get("error")
                     except (OSError, ValueError, AttributeError, RecursionError):
@@ -166,7 +179,7 @@ class CompanionWorkspace:
                     if isinstance(message, str) and message:
                         if error.code == 409:
                             raise WorkspaceConflict(message) from error
-                        raise RequestError(message) from error
+                        raise RequestError(message, error.code) from error
             raise RequestError("Помощник не смог обратиться к общей раскладке.", HTTPStatus.BAD_GATEWAY) from error
         except (URLError, OSError, ValueError, RecursionError) as error:
             raise RequestError("Помощник не смог обратиться к общей раскладке.", HTTPStatus.BAD_GATEWAY) from error
@@ -244,6 +257,8 @@ def drawing_key(job, filename, width, height, page_add, *, roll=False):
     document = [filename, width, height, page_add, CUT_TOOL, paths, optimize]
     if roll:
         document.append(ROLL_PASS_LENGTH_MM)
+    if "cutContext" in job:
+        document.append(job["cutContext"])
     return sha256(json.dumps(document, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
 
 
@@ -405,6 +420,7 @@ class PlotterState:
         self.xiao_path = Path(profile["software"]["path"])
         self.workspace = workspace
         self.workspace_lock = workspace_lock
+        self.selected_cut = None
         self.upload_lock = Lock()
         self.motion_start_lock = Lock()
         self.loaded_plan = None
@@ -486,7 +502,7 @@ class PlotterState:
         return roll.snapshot() if roll else None
 
     def cut_status(self):
-        return {"roll": self.roll_snapshot(),
+        return {"roll": self.roll_snapshot(), "selectedCut": self.selected_cut,
                 "cutProgress": self.cut_progress.snapshot() if self.cut_progress else None,
                 "cutJournal": self.cut_journal.snapshot()}
 
@@ -726,8 +742,80 @@ class PlotterState:
             job["materialMarginMm"] = nesting["marginMm"]
         return job, draft["source"]["filename"]
 
+    def read_production(self, cut_id, mode):
+        if isinstance(self.workspace, CompanionWorkspace):
+            return self.workspace._request(f"/api/operator-workspace?cutId={key(cut_id)}&mode={mode}")
+        return self.production.workspace(cut_id, mode)
+
+    def production_progress(self, cut_id, action, mode, revision=None):
+        if isinstance(self.workspace, CompanionWorkspace):
+            return self.workspace.production_request("/api/operator-workspace", {
+                "cutId": cut_id, "action": action, "mode": mode, "revision": revision,
+            })
+        return self.production.progress(cut_id, action, mode, revision)
+
+    def current_drawing(self, cut_id=None, *, for_machine=False, for_export=False):
+        if for_machine and cut_id != self.selected_cut:
+            raise WorkspaceConflict("На плоттере открыт другой раскрой. Откройте нужный пункт заново.")
+        if cut_id is None:
+            return self.workspace_drawing(self.workspace.read()["workspace"])
+        record = self.read_production(cut_id, "demo" if self.demo_mode else "operator")
+        if for_machine and not self.demo_mode and record["status"] != "active":
+            raise WorkspaceConflict("Пункт наряда недоступен для запуска.")
+        draft = record["workspace"]
+        if for_machine or for_export:
+            self.verify_production_layout(draft, draft["optimization"].get("nesting", {}).get("widthMm"))
+        job, filename = self.workspace_drawing(draft)
+        if for_machine and isinstance(self.workspace, CompanionWorkspace) and not self.demo_mode:
+            self.workspace.production_request("/api/operator-workspace", {"action": "verify", "mode": "operator",
+                "cutId": cut_id, "cutRevision": record["cutRevision"]})
+        job["cutContext"] = [cut_id, record["cutRevision"]]
+        return job, filename
+
+    def verify_production_layout(self, draft, width):
+        if width is None or width > self.simulator.height:
+            raise ValueError("Ширина полотна превышает ширину рабочего поля плоттера.")
+        verify_arrangement(draft, width)
+        job, filename = self.workspace_drawing(draft)
+        plan = self.cut_plan(job, filename)
+        if not plan["canPrepareXiao"]:
+            raise ValueError(plan["issues"][0]["message"] if plan["issues"] else "Раскрой не содержит проходов.")
+
+    def change_cut_context(self, data):
+        cut_id = data.get("cutId")
+        if cut_id is not None:
+            key(cut_id)
+        action = data.get("action")
+        if action not in ("select", "finish") or action == "finish" and (cut_id is None or self.demo_mode):
+            raise ValueError("Выберите допустимое действие для раскроя.")
+        with request_lock(self.motion_start_lock, "Дождитесь текущего действия."), \
+                request_lock(self.upload_lock, "Дождитесь завершения передачи."), self.workspace_lock:
+            if action == "finish" and cut_id != self.selected_cut:
+                record = self.read_production(cut_id, "operator")
+                if record["status"] == "done":
+                    return {**record, **self.cut_status()}
+                raise WorkspaceConflict("Этот раскрой сейчас не открыт на плоттере.")
+            if action == "select" and cut_id is not None and cut_id == self.selected_cut:
+                return {**self.production_progress(cut_id, "start", "demo" if self.demo_mode else "operator"),
+                        **self.cut_status()}
+            # A roll which has started can still contain uncut material after a page finishes.
+            if self.roll and self.roll.state not in ("completed", "cancelled") and self.roll.completed_pages:
+                raise WorkspaceConflict("Завершите или сбросьте текущий раскрой на плоттере.")
+            if action == "finish" and self.cut_progress and self.cut_progress.state not in ("completed", "cancelled"):
+                raise WorkspaceConflict("Дождитесь окончания резки или отмените загруженный раскрой.")
+            self.verify_new_cut_idle(self.controller.read_live())
+            if action == "finish":
+                result = self.production_progress(cut_id, "finish", "operator", data.get("revision"))
+            elif cut_id:
+                result = self.production_progress(cut_id, "start", "demo" if self.demo_mode else "operator")
+            else:
+                result = {}
+            self.selected_cut = cut_id if action == "select" else None
+            self.clear_cut()
+            return {**result, **self.cut_status()}
+
     def invalidate_loaded_plan(self, workspace):
-        if self.loaded_plan is None:
+        if self.loaded_plan is None or self.selected_cut is not None:
             return
         current = None
         if workspace is not None:
@@ -769,12 +857,12 @@ class PlotterState:
         plan["canUpload"] = True
         return plan
 
-    def prepare_xiao(self, plan_id, *, shared_export=False):
+    def prepare_xiao(self, plan_id, *, shared_export=False, cut_id=None):
         if not isinstance(plan_id, str) or re.fullmatch(r"[0-9a-f]{64}", plan_id) is None:
             raise RequestError("Сначала подготовьте раскладку для Xiao.")
         page_add = self.controller.upload_page_add()
         with self.workspace_lock:
-            source, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            source, filename = self.current_drawing(cut_id, for_export=True)
             preview = self.cut_plan(source, filename, page_add)
             if preview["exportPlanId" if shared_export else "planId"] != plan_id:
                 raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
@@ -822,7 +910,7 @@ class PlotterState:
         if page_add is None:
             raise RequestError("Сохранённый профиль Xiao не подходит для прямой передачи одного листа.")
         with self.workspace_lock:
-            source, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            source, filename = self.current_drawing(data.get("cutId"), for_machine=True)
             encoded_pages = []
             preview = self.cut_plan(source, filename, page_add, encoded_pages=encoded_pages)
             if preview["planId"] != data.get("planId"):
@@ -948,7 +1036,7 @@ class PlotterState:
         if action == "cut" and data.get("jobVerified") is not True:
             raise RequestError("Сверьте загруженный чертёж на штатном пульте.")
         with self.workspace_lock:
-            job, filename = self.workspace_drawing(self.workspace.read()["workspace"])
+            job, filename = self.current_drawing(data.get("cutId"), for_machine=True)
             roll = self.roll
             page_number = roll.page if roll else 1
             current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
@@ -1009,6 +1097,7 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         PlotterState.__init__(self, profile, workspace, workspace_lock, central=bool(self.public_origin),
                               companion=bool(self.companion_origin))
         self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
+        self.production = self.demo.production = ProductionStore(Path(workspace_path).with_name("production.sqlite3"))
         install_root = None
         if os.name == "nt" and self.local_companion_ui and os.environ.get("LOCALAPPDATA"):
             candidate = (Path(os.environ["LOCALAPPDATA"]) / "Plotter" / "Companion").resolve()
@@ -1041,6 +1130,8 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         with (request_lock(self.motion_start_lock, movement), request_lock(self.demo.motion_start_lock, movement),
               request_lock(self.upload_lock, transfers), request_lock(self.demo.upload_lock, transfers)):
             with self.workspace_lock:
+                if plotter.selected_cut is not None:
+                    raise WorkspaceConflict("Вернитесь к самостоятельному раскрою перед очисткой.")
                 if self.workspace.read()["revision"] != revision:
                     raise WorkspaceConflict("Рабочая область изменилась в другой вкладке. Обновите страницу.")
                 if other.owns_drawing() or other.controller.upload_in_progress is True:
@@ -1130,7 +1221,7 @@ class Handler(BaseHTTPRequestHandler):
                 path = path.removeprefix("/demo")
                 if path in ("/api/open-in-xiao", "/api/stage", "/api/reveal"):
                     raise RequestError("В демо-режиме можно скачать DXF.", HTTPStatus.FORBIDDEN)
-            elif self.server.central_mode and path in HARDWARE_ROUTES - {"/api/status", "/api/cut-plan", "/api/prepare-xiao", "/api/controller-live"}:
+            elif self.server.central_mode and path in HARDWARE_ROUTES - {"/api/status", "/api/cut-plan", "/api/prepare-xiao", "/api/controller-live", "/api/cut-context"}:
                 raise RequestError("Для управления станком подключите помощник на компьютере оператора.", HTTPStatus.FORBIDDEN)
             if self.server.central_mode and path in ("/api/stage", "/api/reveal"):
                 raise RequestError("Скачайте DXF на компьютер оператора.", HTTPStatus.FORBIDDEN)
@@ -1146,6 +1237,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response({"error": str(error)}, error.status)
         except WorkspaceConflict as error:
             self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
+        except RecordNotFound as error:
+            self.json_response({"error": str(error)}, HTTPStatus.NOT_FOUND)
         except NestingFitError as error:
             self.json_response({
                 "error": str(error), "indices": error.indices,
@@ -1192,6 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
             self.json_response(self.plotter.workspace.read())
+        elif path in PRODUCTION_ROUTES:
+            self.get_production(path, query)
         elif path == "/api/reachability":
             self.json_response(self.plotter.reachability())
         else:
@@ -1202,14 +1297,27 @@ class Handler(BaseHTTPRequestHandler):
             data = self.json_body(4096)
             self.server.app_updates.start(data.get("version"), self.server.verify_update_idle)
             self.json_response(self.server.app_updates.status(), HTTPStatus.ACCEPTED)
-        elif path == "/api/import":
+        elif path in ("/api/import", "/api/cad/import"):
             name = parse_qs(query, max_num_fields=4).get("filename", [""])[0]
             if not name or len(name) > 255 or re.search(r"[/\\\x00-\x1f]", name):
                 raise RequestError("Передайте имя файла DXF или DWG.")
             data = self.body(MAX_FILE_BYTES, "application/octet-stream")
-            drawing = import_drawing(data, name)
-            drawing["paths"] = annotate_notches(drawing["paths"])
+            if path == "/api/cad/import":
+                drawing = (self.server.workspace.production_request(path + "?filename=" + quote(name), raw=data)
+                           if self.server.local_companion_ui else import_design(data, name))
+            else:
+                drawing = import_drawing(data, name)
+                drawing["paths"] = annotate_notches(drawing["paths"])
             self.json_response(drawing)
+        elif path in ("/api/cad/paths", "/api/cad/edit"):
+            data = self.json_body(MAX_WORKSPACE_BYTES)
+            result = (prepare_design(data.get("entities")) if path.endswith("/paths") else
+                      edit_design(data.get("entities"), data.get("operation"), data.get("options")))
+            self.json_response(result)
+        elif path in PRODUCTION_ROUTES:
+            self.post_production(path)
+        elif path == "/api/cut-context":
+            self.json_response(self.plotter.change_cut_context(self.json_body(4096)))
         elif path == "/api/close-contours":
             data = self.json_body(MAX_WORKSPACE_BYTES)
             paths = drawing_paths(data.get("paths"))
@@ -1230,6 +1338,7 @@ class Handler(BaseHTTPRequestHandler):
             export_id = data.get("exportPlanId") if self.plotter.central_mode else None
             filename, contents = self.plotter.prepare_xiao(
                 export_id if export_id is not None else data.get("planId"), shared_export=export_id is not None,
+                cut_id=data.get("cutId"),
             )
             if open_in_xiao:
                 staged = self.stage(filename, contents)
@@ -1247,7 +1356,7 @@ class Handler(BaseHTTPRequestHandler):
                         request_lock(self.server.upload_lock, "Дождитесь завершения передачи задания."):
                     self.server.verify_new_cut_idle(self.server.read_live())
                     self.server.clear_cut()
-                self.json_response({"idle": True, **self.server.cut_status()})
+                    self.json_response({"idle": True, **self.server.cut_status()})
                 return
             self.json_response(self.server.new_cut(self.plotter, self.json_body(16 * 1024)))
         elif path in ("/api/workspace", "/api/cut-plan", "/api/nest", "/api/nest-parts", "/api/command", "/api/plan", "/api/export", "/api/stage", "/api/reveal", "/api/open-in-xiao",
@@ -1319,6 +1428,62 @@ class Handler(BaseHTTPRequestHandler):
                     self.json_response(result)
         else:
             raise RequestError("Команда не найдена.", HTTPStatus.NOT_FOUND)
+
+    def get_production(self, path, query):
+        params = {key: values[0] for key, values in parse_qs(query, max_num_fields=4).items()}
+        if self.server.local_companion_ui:
+            self.json_response(self.server.workspace.production_request(path + "?" + urlencode(params)))
+            return
+        store = self.server.production
+        if path == "/api/registry":
+            self.json_response(store.registry(params.get("id")))
+        elif path == "/api/orders":
+            self.json_response(store.orders(params.get("id"), published_only=params.get("published") == "1"))
+        else:
+            self.json_response(store.workspace(params.get("cutId"), params.get("mode")))
+
+    def post_production(self, path):
+        data = self.json_body(MAX_WORKSPACE_BYTES)
+        action = data.get("action")
+        mode = data.get("mode")
+        if self.server.local_companion_ui:
+            if path == "/api/operator-workspace" and action == "save" and mode in ("operator", "demo"):
+                with self.server.workspace_lock:
+                    plotter = self.server.demo if mode == "demo" else self.server
+                    if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
+                        raise WorkspaceConflict("Сначала освободите раскладку на плоттере.")
+                    result = self.server.workspace.production_request(path, data)
+            else:
+                result = self.server.workspace.production_request(path, data)
+            self.json_response(result)
+            return
+        store = self.server.production
+        verify = self.server.verify_production_layout
+        if path == "/api/registry" and action in ("save", "collect"):
+            result = store.save_registry(data) if action == "save" else store.collect(data.get("members"))
+        elif path == "/api/orders" and action == "save":
+            result = store.save_order(data)
+        elif path == "/api/orders" and action in ("save-cut", "remove-cut"):
+            result = store.save_cut(data)
+        elif path == "/api/orders" and action == "publish":
+            result = store.publish_order(data, verify)
+        elif path == "/api/operator-workspace" and action == "save":
+            plotter = self.server.demo if mode == "demo" else self.server
+            with self.server.workspace_lock:
+                if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
+                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.")
+                result = store.save_workspace(data, mode, verify)
+        elif (path == "/api/operator-workspace" and action in ("start", "finish") and mode in ("operator", "demo")
+              and self.server.central_mode):
+            result = store.progress(data.get("cutId"), action, mode, data.get("revision"))
+        elif path == "/api/operator-workspace" and action == "verify" and mode == "operator":
+            record = store.workspace(data.get("cutId"), "operator")
+            if record["status"] != "active" or record["cutRevision"] != data.get("cutRevision"):
+                raise WorkspaceConflict("Рабочая раскладка изменилась. Загрузите актуальную редакцию.")
+            result = {"verified": True}
+        else:
+            raise RequestError("Неизвестное действие.")
+        self.json_response(result)
 
     def stage(self, filename, contents):
         STAGING.mkdir(exist_ok=True)

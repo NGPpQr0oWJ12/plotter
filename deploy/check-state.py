@@ -32,6 +32,19 @@ def validate(application, state):
     if journal.exists() and CutJournal(journal).snapshot() != json.loads(journal.read_bytes()):
         raise ValueError("cut-journal.json: release cannot read every saved journal entry")
 
+    production = state / "production.sqlite3"
+    if production.exists():
+        if (application / "production_store.py").is_file():
+            from production_store import ProductionStore
+            ProductionStore(production).check()
+        else:
+            # A previous release leaves the new database untouched during rollback.
+            import sqlite3
+            from contextlib import closing
+            with closing(sqlite3.connect(production.as_uri() + "?mode=ro", uri=True)) as db:
+                if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("production.sqlite3: invalid registry database")
+
 
 if __name__ == "__main__":
     try:

@@ -71,10 +71,10 @@ if (!(Test-Path -LiteralPath $runtime)) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the local Python environment.' }
 }
 
-$installed = & $runtime -c "from importlib.metadata import version; from importlib.util import find_spec; print(version('ezdxf') if find_spec('ezdxf') else '')"
-if ($LASTEXITCODE -ne 0 -or $installed -ne '1.4.5') {
+$installed = & $runtime -c "from importlib.metadata import distributions; from pathlib import Path; installed = {d.metadata['Name'].lower(): d.version for d in distributions()}; print(all(installed.get(name.lower()) == version for name, version in (line.split('==') for line in Path('requirements.txt').read_text().splitlines() if '==' in line)))"
+if ($LASTEXITCODE -ne 0 -or $installed -ne 'True') {
     & $runtime -m pip install --disable-pip-version-check -r requirements.txt
-    if ($LASTEXITCODE -ne 0) { throw 'Could not install the drawing import dependency.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install the drawing dependencies.' }
 }
 
 $toolDirectory = Join-Path $PSScriptRoot '.tools\libredwg'

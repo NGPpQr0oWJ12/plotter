@@ -47,10 +47,12 @@ $files = @(
     'web-plotter/cut_metrics.py',
     'web-plotter/cut_plan.py',
     'web-plotter/demo_controller.py',
+    'web-plotter/designer_cad.py',
     'web-plotter/machine.py',
     'web-plotter/nesting.py',
     'web-plotter/panel_diagnostics.py',
     'web-plotter/panel_readback.py',
+    'web-plotter/production_store.py',
     'web-plotter/rect_packing.py',
     'web-plotter/route_optimizer.py',
     'web-plotter/run_monitor.py',
@@ -63,16 +65,22 @@ $files = @(
     'web-plotter/test_cad.py',
     'web-plotter/test_controller.py',
     'web-plotter/test_cut_plan.py',
+    'web-plotter/test_designer_cad.py',
     'web-plotter/test_nesting.py',
     'web-plotter/test_panel_diagnostics.py',
+    'web-plotter/test_production_store.py',
     'web-plotter/test_server_flow.py',
     'web-plotter/test_workspace.py',
     'web-plotter/test_xiao_desktop.py',
     'web-plotter/test_xiao_job.py',
     'web-plotter/static/app.js',
+    'web-plotter/static/designer-cad.css',
+    'web-plotter/static/designer-cad.js',
     'web-plotter/static/index.html',
     'web-plotter/static/simulation.js',
-    'web-plotter/static/style.css'
+    'web-plotter/static/style.css',
+    'web-plotter/static/workplaces.css',
+    'web-plotter/static/workplaces.js'
 )
 
 foreach ($relativePath in $files) {

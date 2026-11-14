@@ -1,0 +1,187 @@
+.cad-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.cad-header,
+.cad-tools,
+.cad-actions,
+.cad-tool-group,
+.cad-finish {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.cad-header {
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+
+.cad-editor label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.cad-editor .cad-name { flex: 1 1 200px; max-width: 380px; }
+
+.cad-editor input:not([type="checkbox"]),
+.cad-editor select {
+  min-width: 0;
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid #c6ccd3;
+  border-radius: 5px;
+  color: #24292e;
+  background: #fff;
+}
+
+.cad-editor .button {
+  gap: 6px;
+  min-height: 32px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.cad-tools {
+  gap: 7px 12px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #f5f6f7;
+}
+
+.cad-tool-group { gap: 4px; }
+.cad-tool-group + .cad-tool-group { border-left: 1px solid #d4d9df; padding-left: 10px; }
+.cad-tool-group [aria-pressed="true"],
+.cad-tool-group [aria-pressed="true"]:not(:disabled):hover {
+  border-color: #9aadd8;
+  background: #e8effc;
+  color: var(--blue-dark);
+}
+
+.cad-work {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 218px;
+  flex: 1 1 auto;
+  min-height: 400px;
+  min-height: clamp(400px, 54vh, 720px);
+  overflow: hidden;
+  border: 1px solid #c8d0d8;
+  border-radius: 7px;
+}
+
+.cad-view {
+  position: relative;
+  min-height: 300px;
+  background: #fafcfe;
+}
+
+.cad-view canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.cad-view canvas:focus-visible { outline-offset: -3px; }
+.cad-view canvas[data-gesture="pan"] { cursor: grabbing; }
+
+.cad-canvas-status {
+  position: absolute;
+  inset: auto 8px 8px;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  pointer-events: none;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #42515e;
+}
+
+.cad-canvas-status span {
+  padding: 3px 6px;
+  border: 1px solid #dce3ea;
+  border-radius: 4px;
+  background: #fafcfe;
+}
+
+.cad-inspector {
+  min-width: 0;
+  max-height: min(66vh, 720px);
+  overflow: auto;
+  border-left: 1px solid #c8d0d8;
+  background: #fff;
+}
+
+.cad-inspector-section {
+  display: grid;
+  gap: 8px;
+  padding: 11px;
+}
+
+.cad-inspector-section + .cad-inspector-section { border-top: 1px solid #e0e5e9; }
+.cad-inspector h3 { margin: 0; font-size: 13px; }
+.cad-inspector p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.cad-inspector form,
+.cad-inspector [data-view="offset-preview"] { display: grid; gap: 6px; }
+
+.cad-field-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.cad-editor .cad-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 19px;
+}
+.cad-checkbox input { margin: 0; accent-color: var(--blue); }
+
+.cad-legend {
+  display: grid;
+  gap: 5px;
+  color: #454545;
+  font-size: 11px;
+}
+.cad-legend span { display: flex; align-items: center; gap: 6px; }
+.cad-legend span::before { content: ""; width: 16px; border-top: 2px solid #292e34; }
+.cad-legend span:nth-child(2)::before { border-color: #bb531a; }
+.cad-legend span:nth-child(3)::before { border-top: 2px dashed #7d8b97; }
+
+.cad-warnings { color: #764b1b; background: #fff8eb; font-size: 12px; }
+.cad-warnings summary { cursor: pointer; font-weight: 600; }
+.cad-warnings ul { margin: 6px 0 0; padding-left: 15px; overflow-wrap: anywhere; }
+.cad-warnings li + li { margin-top: 4px; }
+
+.cad-message {
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: #e9f4ee;
+  color: #235438;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.cad-message.cad-error { background: #fff0ee; color: #8b211d; }
+
+@media (max-width: 780px) {
+  .cad-tool-group + .cad-tool-group { border-left: 0; padding-left: 0; }
+}
+
+@media (max-width: 600px) {
+  .cad-work { grid-template-columns: 1fr; }
+  .cad-inspector {
+    max-height: none;
+    border-top: 1px solid #c8d0d8;
+    border-left: 0;
+  }
+}

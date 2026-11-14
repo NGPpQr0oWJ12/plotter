@@ -672,6 +672,33 @@ def _contours_clear(positions, outline_at, gap):
     return True
 
 
+def validate_placed_parts(paths, *, width, margin, gap):
+    """Check placed parts using the same outline and clearance rules as nesting."""
+    source = _paths(paths)
+    boundaries = []
+    for part in _identified_parts(source):
+        box = part.box
+        if min(box.min_x, box.min_y) < margin - GEOMETRY_EPSILON or (
+                box.max_y + COORDINATE_OFFSET_MM > width - margin + GEOMETRY_EPSILON):
+            raise PlotterError(f"Деталь {part.number} выходит за границы полотна.")
+        closed = [source[index] for index in part.indices if source[index].closed]
+        if not closed:
+            raise PlotterError(f"У детали {part.number} нет замкнутого контура.")
+        for path in closed:
+            boundaries.append(Outline(part.number, path.points))
+    budget = Budget(limit=MAX_CLEARANCE_TESTS)
+    clearance = max(gap, ROUNDING_ALLOWANCE_MM)
+    active = []
+    for outline in sorted(boundaries, key=lambda boundary: boundary.box.min_x):
+        if not _simple_outline(outline, budget):
+            raise PlotterError(f"Контур детали {outline.owner} пересекает сам себя.")
+        active = [other for other in active if other.box.max_x + clearance >= outline.box.min_x]
+        for other in active:
+            if outline.owner != other.owner and _outlines_conflict(outline, other, clearance, budget):
+                raise PlotterError(f"Детали {outline.owner} и {other.owner} пересекаются или расположены слишком близко.")
+        active.append(outline)
+
+
 def _edge_angles(hull):
     edges = []
     opposite = 1
