@@ -168,9 +168,10 @@ def repair_closed_contours(paths, excluded=(), *, bridge_small_gaps=False):
             members = sorted({index for index, _ in references})
             # Keep the perimeter after its last source fragment and any retained notch there.
             outline = {**paths[members[0]], "points": [list(point) for point in points], "closed": True}
-            rotation = next((paths[index]["partRotation"] for index in members if "partRotation" in paths[index]), None)
-            if rotation is not None:
-                outline["partRotation"] = rotation
+            for key in ("partRotation", "partAngle"):
+                value = next((paths[index][key] for index in members if key in paths[index]), None)
+                if value is not None:
+                    outline[key] = value
             loops[members[-1]].append((outline, members))
             for index, offset in references:
                 consumed[index].add(offset)

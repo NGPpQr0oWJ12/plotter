@@ -94,11 +94,32 @@ class WorkspaceStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.write(saved["revision"], layout)
 
+    def test_saved_fabric_length_accepts_omitted_numeric_and_null(self):
+        layout = draft()
+        settings = {"widthMm": 1400, "gapMm": 7, "marginMm": 9, "rotation": "half"}
+        layout["optimization"]["nesting"] = settings
+        saved = self.store.write(0, layout)
+        self.assertNotIn("lengthMm", WorkspaceStore(self.path).read()["workspace"]["optimization"]["nesting"])
+
+        for length in (3600.5, None):
+            with self.subTest(length=length):
+                settings["lengthMm"] = length
+                saved = self.store.write(saved["revision"], layout)
+                reopened = WorkspaceStore(self.path).read()
+                self.assertEqual(reopened["workspace"]["optimization"]["nesting"], settings)
+
+        for invalid in (True, 0, -1, "3600", float("inf")):
+            with self.subTest(length=invalid):
+                settings["lengthMm"] = invalid
+                with self.assertRaises(ValueError):
+                    self.store.write(saved["revision"], layout)
+                self.assertEqual(WorkspaceStore(self.path).read(), saved)
+
     def test_part_numbers_and_rotation_survive_reordering_and_restart(self):
         layout = draft()
         contour, mark = layout["paths"]
-        contour.update(partNumber=12, partRotation="none")
-        mark["partNumber"] = 12
+        contour.update(partNumber=12, partRotation="none", partAngle=275.25)
+        mark.update(partNumber=12, partAngle=275.25)
         layout["paths"].reverse()
         saved = self.store.write(0, layout)
         self.assertEqual(WorkspaceStore(self.path).read(), saved)
@@ -111,6 +132,13 @@ class WorkspaceStoreTests(unittest.TestCase):
             ({"partNumber": 0}, {}),
             ({"partNumber": None}, {}),
             ({"partNumber": 1 << 53}, {}),
+            ({"partAngle": True}, {}),
+            ({"partAngle": None}, {}),
+            ({"partAngle": "90"}, {}),
+            ({"partAngle": -0.1}, {}),
+            ({"partAngle": 360}, {}),
+            ({"partAngle": float("inf")}, {}),
+            ({"partAngle": float("nan")}, {}),
             ({"partRotation": "quarter"}, {}),
             ({"partNumber": 1, "partRotation": "half"}, {}),
             ({"partNumber": 1, "partRotation": "none"}, {"partNumber": 1, "partRotation": "quarter"}),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from email.message import Message
 from hashlib import sha256
@@ -18,6 +19,8 @@ import subprocess
 from struct import unpack_from
 from threading import Lock, Timer
 from urllib.parse import parse_qs, quote, urlsplit
+from urllib.error import URLError
+from urllib.request import build_opener, HTTPRedirectHandler
 from uuid import uuid4
 import webbrowser
 
@@ -29,11 +32,12 @@ from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_con
 from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
 from cut_journal import MAX_EVENTS, CutJournal
 from cut_plan import EPSILON_MM, prepare_cut_plan
+from demo_controller import DemoController
 from machine import PlotterError, Simulator, build_plan, number
-from nesting import MAX_PART_NUMBER, NestingFitError, identify_parts, nest_paths
+from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
 from panel_diagnostics import compare_panel_samples
 from panel_readback import PanelReadback
-from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths
+from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace
 from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
 
@@ -43,7 +47,13 @@ LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
 LOCAL_ADDRESS = "127.0.0.1"
 DEFAULT_PORT = 8765
-API_VERSION = 19
+API_VERSION = 21
+COMPANION_PORT = 8767
+COMPANION_PROTOCOL = 1
+HARDWARE_ROUTES = frozenset({"/api/status", "/api/cut-plan", "/api/controller", "/api/controller-live",
+    "/api/controller-position", "/api/controller-job", "/api/controller-feed-mode", "/api/control-session",
+    "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset",
+    "/api/panel-snapshot", "/api/panel-compare", "/api/reachability", "/api/open-in-xiao", "/api/prepare-xiao"})
 CUT_TOOL = 4
 DEFAULT_FABRIC_WIDTH_MM = 1380
 ROLL_PASS_LENGTH_MM = 2450
@@ -63,6 +73,75 @@ class RequestError(PlotterError):
     def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
         super().__init__(message)
         self.status = status
+
+
+def https_origin(value):
+    parsed = urlsplit(value or "")
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or not re.fullmatch(r"[A-Za-z0-9.\-]+(?::[0-9]{1,5})?", parsed.netloc)):
+        raise ValueError("Укажите точный HTTPS-адрес веб-панели без пути.")
+    port = parsed.port
+    if port == 0:
+        raise ValueError("Недопустимый HTTPS-порт.")
+    return f"https://{parsed.hostname}" + (f":{port}" if port not in (None, 443) else "")
+
+
+class OfflineController:
+    auto_run_readback = None
+    upload_uncertain = False
+    upload_in_progress = False
+
+    def upload_page_add(self):
+        return None
+
+    def actuator_snapshot(self):
+        return None
+
+    def read_live(self):
+        return {"responded": False, "busy": False, "message": "Подключите помощник на компьютере у станка."}
+
+    def stop_active_hold(self):
+        pass
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, newurl):
+        return None
+
+
+class CompanionWorkspace:
+    """Read the authoritative saved drawing at upload/start; never mirror or accept it from the browser."""
+
+    def __init__(self, path, origin):
+        self.path = path
+        self.url = origin + "/api/workspace"
+        self.opener = build_opener(NoRedirect())
+
+    def read(self):
+        try:
+            with self.opener.open(self.url, timeout=4) as response:
+                contents = response.read(MAX_WORKSPACE_BYTES + 1)
+            if len(contents) > MAX_WORKSPACE_BYTES:
+                raise ValueError("Workspace too large")
+            data = json.loads(contents)
+            if not isinstance(data, dict) or type(data.get("revision")) is not int:
+                raise ValueError("Invalid workspace")
+            if data.get("workspace") is not None:
+                data["workspace"] = validate_workspace(data["workspace"])
+            return data
+        except (URLError, OSError, ValueError, RecursionError) as error:
+            raise RequestError("Помощник не смог прочитать общую раскладку на сервере.", HTTPStatus.BAD_GATEWAY) from error
+
+
+@contextmanager
+def request_lock(lock, message):
+    if not lock.acquire(blocking=False):
+        raise RequestError(message, HTTPStatus.CONFLICT)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 @dataclass(frozen=True)
@@ -274,31 +353,38 @@ def single_page_xiao_settings(executable, machine_ip):
         return None
 
 
-class PlotterServer(ThreadingHTTPServer):
-    def __init__(self, port, workspace_path=WORKSPACE_PATH):
-        profile = json.loads(PROFILE.read_text(encoding="utf-8"))
+class PlotterState:
+    def __init__(self, profile, workspace, workspace_lock, *, demo=False, central=False, companion=False):
         config = profile["observedComputerConfiguration"]
         board = profile.get("observedControllerConfiguration", {})
         bounds = board.get("workrectMm", config["workrectMm"])
         width, height = bounds["x"], bounds["y"]
+        self.demo_mode = demo
+        self.central_mode = central
+        self.companion_mode = companion
         self.simulator = Simulator(width, height)
-        self.machine_ip = str(ipaddress.IPv4Address(config["machineIp"]))
+        self.machine_ip = None if demo or central else str(ipaddress.IPv4Address(config["machineIp"]))
         self.xiao_path = Path(profile["software"]["path"])
-        self.workspace = WorkspaceStore(workspace_path)
-        self.workspace_lock = Lock()
+        self.workspace = workspace
+        self.workspace_lock = workspace_lock
         self.upload_lock = Lock()
+        self.motion_start_lock = Lock()
         self.loaded_plan = None
         self.roll = None
         self.cut_progress = None
-        self.cut_journal = CutJournal(Path(workspace_path).with_name("cut-journal.json"))
+        self.cut_journal = CutJournal(None if demo else workspace.path.with_name("cut-journal.json"))
+        if demo:
+            self.controller = DemoController(width, height)
+            return
+        if central:
+            self.controller = OfflineController()
+            return
         self.controller = Controller(self.machine_ip, width, height,
                                      upload_profile=lambda: single_page_xiao_settings(self.xiao_path, self.machine_ip),
                                      z_travel=board.get("zTravelMm", 0),
                                      auto_run_readback=AutoRunReadback.from_profile(board.get("autoRunReadback")),
                                      manual_speed_readback=PanelReadback.from_profile(
                                          board.get("manualSpeedReadback"), {"fastValue": "fast", "slowValue": "slow"}))
-        super().__init__((LOCAL_ADDRESS, port), Handler)
-        self.hosts = {f"{host}:{self.server_port}" for host in (LOCAL_ADDRESS, "localhost")}
 
     @property
     def default_fabric_width(self):
@@ -311,6 +397,11 @@ class PlotterServer(ThreadingHTTPServer):
         return {
             "mode": "controller",
             "apiVersion": API_VERSION,
+            "demoAvailable": True,
+            "demoMode": self.demo_mode,
+            "centralMode": self.central_mode,
+            "companionMode": self.companion_mode,
+            "companionProtocol": COMPANION_PROTOCOL,
             "nestingKeepsNotches": True,
             "nestingPartRotation": True,
             "pageRouteOptimization": True,
@@ -323,7 +414,7 @@ class PlotterServer(ThreadingHTTPServer):
                 "defaultFabricWidthMm": self.default_fabric_width,
                 "rollPassLengthMm": self.roll_pass_length(page_add),
                 "headCount": 1,
-                "directControl": True,
+                "directControl": not self.central_mode or self.demo_mode,
                 "directUpload": page_add is not None,
                 "directRoll": True,
                 "continuousRoll": True,
@@ -344,15 +435,12 @@ class PlotterServer(ThreadingHTTPServer):
                 "uploadInProgress": self.controller.upload_in_progress,
                 "controllerPort": CONTROLLER_PORT,
                 "holdLeaseMs": int(HOLD_LEASE_SECONDS * 1000),
-                "xiaoAvailable": self.xiao_path.is_file() or LOCALIZED_XIAO.is_file(),
+                "xiaoAvailable": not self.demo_mode and not self.central_mode
+                                 and (self.xiao_path.is_file() or LOCALIZED_XIAO.is_file()),
                 "dwgAvailable": dwg_available(),
             },
             "simulation": simulation if simulation is not None else self.simulator.snapshot(),
         }
-
-    def server_close(self):
-        self.controller.stop_active_hold()
-        super().server_close()
 
     def roll_snapshot(self):
         roll = self.roll
@@ -546,10 +634,37 @@ class PlotterServer(ThreadingHTTPServer):
                     or result.get("lastEvent", {}).get("code") in ACTIVE_CONTROLLER_EVENTS):
                 raise RequestError("Контроллер не подтвердил остановку. Сверьте состояние станка на пульте.")
             self.controller.require_control(data.get("controlToken"))
-            self.roll = None
-            self.loaded_plan = None
-            self.cut_progress = None
+            self.clear_cut()
             return self.cut_status()
+
+    def clear_cut(self):
+        self.roll = None
+        self.loaded_plan = None
+        self.cut_progress = None
+
+    def owns_drawing(self):
+        return (self.loaded_plan is not None and self.cut_progress is None
+                or any(cut is not None and cut.state not in ("completed", "cancelled")
+                       for cut in (self.roll, self.cut_progress)))
+
+    def verify_new_cut_idle(self, result):
+        run = result.get("run", {})
+        move = result.get("coordinateMove") or {}
+        uncertain_upload = self.controller.upload_uncertain is True or result.get("uploadUncertain") is True
+        owns_drawing = self.owns_drawing()
+        transfer_error = run.get("state") == "error" and run.get("startedAt") is None and not owns_drawing
+        safe_run = run.get("state") in (None, "idle", "ready", "completed", "cancelled") or transfer_error
+        idle = (not result.get("busy") and not result.get("motionInhibited") and not result.get("externalMotion")
+                and not result.get("stopAvailable") and not result.get("manualMovement")
+                and self.controller.upload_in_progress is not True
+                and result.get("lastEvent", {}).get("code") not in ACTIVE_CONTROLLER_EVENTS
+                and move.get("state") in (None, "reached") and safe_run)
+        if result.get("responded") is True:
+            idle = idle and result.get("position") and run.get("fresh") is True and (not uncertain_upload or not owns_drawing)
+        else:
+            idle = idle and not self.demo_mode and not owns_drawing and not uncertain_upload
+        if not idle:
+            raise RequestError("Новый раскрой доступен после остановки и проверки текущего задания.", HTTPStatus.CONFLICT)
 
     def plan(self, job):
         position = self.simulator.snapshot()
@@ -572,18 +687,16 @@ class PlotterServer(ThreadingHTTPServer):
             job["materialMarginMm"] = nesting["marginMm"]
         return job, draft["source"]["filename"]
 
-    def save_workspace(self, revision, draft):
-        with self.workspace_lock:
-            result = self.workspace.write(revision, draft)
-            if self.loaded_plan is not None:
-                current = None
-                if result["workspace"] is not None:
-                    job, filename = self.workspace_drawing(result["workspace"])
-                    current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
-                                          self.controller.upload_page_add(), roll=self.roll is not None)
-                if current != self.loaded_plan[1]:
-                    self.loaded_plan = None
-            return result
+    def invalidate_loaded_plan(self, workspace):
+        if self.loaded_plan is None:
+            return
+        current = None
+        if workspace is not None:
+            job, filename = self.workspace_drawing(workspace)
+            current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
+                                  self.controller.upload_page_add(), roll=self.roll is not None)
+        if current != self.loaded_plan[1]:
+            self.loaded_plan = None
 
     def cut_plan(self, job, filename, page_add=None, *, encoded_pages=None):
         if not isinstance(filename, str) or not filename or len(filename) > 255:
@@ -592,6 +705,8 @@ class PlotterServer(ThreadingHTTPServer):
         plan = prepare_cut_plan(job, width, height, PREVIEW_PAGE_ADD_MM if page_add is None else page_add,
                                 roll_pass_length_mm=ROLL_PASS_LENGTH_MM)
         plan["planId"] = drawing_key(job, filename, width, height, page_add, roll=plan["mode"] == "roll")
+        if self.companion_mode or self.central_mode:
+            plan["exportPlanId"] = drawing_key(job, filename, width, height, None, roll=True)
         plan["filename"] = filename
         plan["tool"] = CUT_TOOL
         plan["canPrepareXiao"] = bool(plan["pages"]) and not plan["issues"]
@@ -615,14 +730,14 @@ class PlotterServer(ThreadingHTTPServer):
         plan["canUpload"] = True
         return plan
 
-    def prepare_xiao(self, plan_id):
+    def prepare_xiao(self, plan_id, *, shared_export=False):
         if not isinstance(plan_id, str) or re.fullmatch(r"[0-9a-f]{64}", plan_id) is None:
             raise RequestError("Сначала подготовьте раскладку для Xiao.")
         page_add = self.controller.upload_page_add()
         with self.workspace_lock:
             source, filename = self.workspace_drawing(self.workspace.read()["workspace"])
             preview = self.cut_plan(source, filename, page_add)
-            if preview["planId"] != plan_id:
+            if preview["exportPlanId" if shared_export else "planId"] != plan_id:
                 raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
             if not preview["canPrepareXiao"]:
                 message = preview["issues"][0]["message"] if preview["issues"] else "В раскладке нет контуров."
@@ -650,17 +765,13 @@ class PlotterServer(ThreadingHTTPServer):
         margin = number(data.get("marginMm", 10), "Отступ от края, мм", 0, 100)
         return nest_paths(
             data.get("paths"), width_mm=width, gap_mm=gap, margin_mm=margin, rotation=data.get("rotation", "none"),
-            page_length_mm=self.roll_pass_length(self.controller.upload_page_add()),
+            page_length_mm=self.roll_pass_length(self.controller.upload_page_add()), length_mm=data.get("lengthMm"),
         )
 
     def upload(self, data):
-        if not self.upload_lock.acquire(blocking=False):
-            raise RequestError("Дождитесь завершения передачи задания.", HTTPStatus.CONFLICT)
-        try:
+        with request_lock(self.upload_lock, "Дождитесь завершения передачи задания."):
             self.controller.require_coordinate_move_idle()
             return self.upload_page(data)
-        finally:
-            self.upload_lock.release()
 
     def upload_page(self, data):
         control_token = data.get("controlToken")
@@ -756,18 +867,29 @@ class PlotterServer(ThreadingHTTPServer):
         return result
 
     def operate(self, data):
+        if data.get("action") in ("pause-cut", "cancel-cut"):
+            return self.operate_controller(data)
+        with request_lock(self.motion_start_lock, "Дождитесь завершения текущего действия."):
+            return self.operate_controller(data)
+
+    def hold(self, data):
+        action = data.get("action")
+        args = (action, data.get("session"), data.get("axis"), data.get("direction"),
+                data.get("token"), data.get("ready"), data.get("controlToken"))
+        if action == "start":
+            with request_lock(self.motion_start_lock, "Дождитесь завершения текущего действия."):
+                return self.controller.hold(*args)
+        return self.controller.hold(*args)
+
+    def operate_controller(self, data):
         action, token = data.get("action"), data.get("controlToken")
         if action in ("cut", "range", "pause-cut", "resume-cut", "acknowledge-run"):
             self.controller.require_control(token)
         args = (action, data.get("token"), data.get("ready"), data.get("jobConfirmed"), data.get("recoverUpload"), token)
         kwargs = {"job_receipt": data.get("jobReceipt"), "job_verified": data.get("jobVerified")}
         if action == "move-to":
-            if not self.upload_lock.acquire(blocking=False):
-                raise RequestError("Дождитесь завершения передачи задания.", HTTPStatus.CONFLICT)
-            try:
+            with request_lock(self.upload_lock, "Дождитесь завершения передачи задания."):
                 result = self.controller.operate(*args, **kwargs, x=data.get("x"), y=data.get("y"))
-            finally:
-                self.upload_lock.release()
             with self.workspace_lock:
                 result.update(self.cut_status())
             return result
@@ -811,6 +933,8 @@ class PlotterServer(ThreadingHTTPServer):
             return result
 
     def reachability(self):
+        if self.demo_mode:
+            return {"reachable": True, "ip": None, "message": "Подключён виртуальный плоттер."}
         is_windows = os.name == "nt"
         arguments = ["ping.exe", "-n", "1", "-w", "850"] if is_windows else ["ping", "-c", "1", "-W", "1"]
         try:
@@ -825,8 +949,68 @@ class PlotterServer(ThreadingHTTPServer):
             message = "Проверка ping недоступна или истекло время ожидания."
         return {"reachable": reachable, "ip": self.machine_ip, "message": message}
 
+class PlotterServer(PlotterState, ThreadingHTTPServer):
+    def __init__(self, port, workspace_path=WORKSPACE_PATH, *, profile_path=None, public_origin=None, companion_origin=None):
+        if public_origin and companion_origin:
+            raise ValueError("Выберите один режим сервера.")
+        profile_path = Path(profile_path) if profile_path is not None else PROFILE
+        profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
+        self.public_origin = https_origin(public_origin) if public_origin else None
+        self.companion_origin = https_origin(companion_origin) if companion_origin else None
+        workspace = (CompanionWorkspace(Path(workspace_path), self.companion_origin) if self.companion_origin
+                     else WorkspaceStore(workspace_path, shared=bool(self.public_origin)))
+        workspace_lock = Lock()
+        PlotterState.__init__(self, profile, workspace, workspace_lock, central=bool(self.public_origin),
+                              companion=bool(self.companion_origin))
+        self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
+        ThreadingHTTPServer.__init__(self, (LOCAL_ADDRESS, port), Handler)
+        self.hosts = {f"{host}:{self.server_port}" for host in (LOCAL_ADDRESS, "localhost")}
+        if self.public_origin:
+            self.hosts.add(urlsplit(self.public_origin).netloc)
+            if urlsplit(self.public_origin).port is None:
+                self.hosts.add(urlsplit(self.public_origin).netloc + ":443")
+
+    def save_workspace(self, revision, draft):
+        with self.workspace_lock:
+            result = self.workspace.write(revision, draft)
+            self.invalidate_loaded_plan(result["workspace"])
+            self.demo.invalidate_loaded_plan(result["workspace"])
+            return result
+
+    def new_cut(self, plotter, data):
+        if data.get("stopped") is not True:
+            raise RequestError("Подтвердите, что плоттер остановлен.")
+        revision = data.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise RequestError("Неверная редакция рабочей области.")
+        other = self if plotter is self.demo else self.demo
+        transfers = "Дождитесь завершения передачи задания."
+        movement = "Дождитесь завершения текущего действия."
+        with (request_lock(self.motion_start_lock, movement), request_lock(self.demo.motion_start_lock, movement),
+              request_lock(self.upload_lock, transfers), request_lock(self.demo.upload_lock, transfers)):
+            with self.workspace_lock:
+                if self.workspace.read()["revision"] != revision:
+                    raise WorkspaceConflict("Рабочая область изменилась в другой вкладке. Обновите страницу.")
+                if other.owns_drawing() or other.controller.upload_in_progress is True:
+                    raise RequestError("Текущее задание открыто в другом режиме. Завершите его или сбросьте там.",
+                                       HTTPStatus.CONFLICT)
+            live = plotter.controller.read_live()
+            with self.workspace_lock:
+                plotter.verify_new_cut_idle(live)
+                result = self.workspace.write(revision, None)
+                plotter.clear_cut()
+                other.clear_cut()
+                return {**result, **plotter.cut_status()}
+
+    def server_close(self):
+        self.controller.stop_active_hold()
+        self.demo.controller.stop_active_hold()
+        super().server_close()
+
+
 class Handler(BaseHTTPRequestHandler):
     server: PlotterServer
+    plotter: PlotterState
     server_version = "Plotter/1.0"
     sys_version = ""
 
@@ -840,16 +1024,46 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.dispatch(self.post)
 
+    def do_OPTIONS(self):
+        self.dispatch(self.preflight)
+
+    def preflight(self, path, query):
+        if not self.server.companion_mode or self.headers.get("Access-Control-Request-Method") not in ("GET", "POST"):
+            raise RequestError("Этот запрос недоступен.", HTTPStatus.METHOD_NOT_ALLOWED)
+        requested = {name.strip().lower() for name in self.headers.get("Access-Control-Request-Headers", "").split(",") if name.strip()}
+        if requested - {"content-type", "x-plotter-companion"}:
+            raise RequestError("Недопустимые заголовки запроса.", HTTPStatus.FORBIDDEN)
+        self.respond(b"", "text/plain", HTTPStatus.NO_CONTENT)
+
     def dispatch(self, route):
         try:
             host = self.headers.get("Host", "").lower()
             origin = self.headers.get("Origin")
-            if host not in self.server.hosts or (origin and origin != f"http://{host}"):
+            if self.server.companion_mode:
+                allowed = origin == self.server.companion_origin
+                if self.command == "POST":
+                    allowed = allowed and self.headers.get("X-Plotter-Companion") == str(COMPANION_PROTOCOL)
+            else:
+                allowed = not origin or origin == (self.server.public_origin or f"http://{host}")
+            if host not in self.server.hosts or not allowed:
                 raise RequestError("Приложение принимает запросы с локального адреса.", HTTPStatus.FORBIDDEN)
             result = urlsplit(self.path)
             if result.netloc or result.scheme or not self.path.startswith("/"):
                 raise RequestError("Недопустимый адрес запроса.")
-            route(result.path, result.query)
+            path = result.path
+            self.plotter = self.server
+            if self.server.companion_mode and path not in HARDWARE_ROUTES | {"/api/new-cut"}:
+                raise RequestError("Этот запрос обслуживает сервер раскладки.", HTTPStatus.NOT_FOUND)
+            if path.startswith("/demo/api/"):
+                self.plotter = self.server.demo
+                path = path.removeprefix("/demo")
+                if path in ("/api/open-in-xiao", "/api/stage", "/api/reveal"):
+                    raise RequestError("В демо-режиме можно скачать DXF.", HTTPStatus.FORBIDDEN)
+            elif self.server.central_mode and path in HARDWARE_ROUTES - {"/api/status", "/api/cut-plan", "/api/prepare-xiao", "/api/controller-live"}:
+                raise RequestError("Для управления станком подключите помощник на компьютере оператора.", HTTPStatus.FORBIDDEN)
+            if self.server.central_mode and path in ("/api/stage", "/api/reveal"):
+                raise RequestError("Скачайте DXF на компьютер оператора.", HTTPStatus.FORBIDDEN)
+            route(path, result.query)
         except RequestError as error:
             self.json_response({"error": str(error)}, error.status)
         except WorkspaceConflict as error:
@@ -877,13 +1091,13 @@ class Handler(BaseHTTPRequestHandler):
             name, content_type = MIME[path]
             self.respond((ROOT / "static" / name).read_bytes(), content_type)
         elif path == "/api/status":
-            self.json_response(self.server.status())
+            self.json_response(self.plotter.status())
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
-            self.json_response(self.server.workspace.read())
+            self.json_response(self.plotter.workspace.read())
         elif path == "/api/reachability":
-            self.json_response(self.server.reachability())
+            self.json_response(self.plotter.reachability())
         else:
             raise RequestError("Страница не найдена.", HTTPStatus.NOT_FOUND)
 
@@ -893,27 +1107,49 @@ class Handler(BaseHTTPRequestHandler):
             if not name or len(name) > 255 or re.search(r"[/\\\x00-\x1f]", name):
                 raise RequestError("Передайте имя файла DXF или DWG.")
             data = self.body(MAX_FILE_BYTES, "application/octet-stream")
-            self.json_response(import_drawing(data, name))
+            drawing = import_drawing(data, name)
+            drawing["paths"] = annotate_notches(drawing["paths"])
+            self.json_response(drawing)
         elif path == "/api/close-contours":
             data = self.json_body(MAX_WORKSPACE_BYTES)
             paths = drawing_paths(data.get("paths"))
             excluded = excluded_paths(data.get("excluded", []), len(paths))
             repaired = repair_closed_contours(paths, excluded, bridge_small_gaps=True)
-            self.json_response({"paths": repaired.paths, "closedCount": repaired.closed_count,
+            new_outlines = {index for index, (contour, sources) in enumerate(zip(repaired.paths, repaired.sources))
+                            if contour["closed"] and not paths[sources[0]]["closed"]}
+            self.json_response({"paths": annotate_notches(repaired.paths, new_outlines=new_outlines),
+                                "closedCount": repaired.closed_count,
                                 "sources": repaired.sources, "excluded": repaired.excluded})
         elif path == "/api/prepare-xiao":
             data = self.json_body(16 * 1024)
             open_in_xiao = data.get("openInXiao", False)
             if type(open_in_xiao) is not bool:
                 raise RequestError("Укажите, нужно ли открыть подготовленный DXF в Xiao.")
-            filename, contents = self.server.prepare_xiao(data.get("planId"))
+            if open_in_xiao and (self.plotter.demo_mode or self.plotter.central_mode):
+                raise RequestError("В демо-режиме можно скачать DXF.", HTTPStatus.FORBIDDEN)
+            export_id = data.get("exportPlanId") if self.plotter.central_mode else None
+            filename, contents = self.plotter.prepare_xiao(
+                export_id if export_id is not None else data.get("planId"), shared_export=export_id is not None,
+            )
             if open_in_xiao:
                 staged = self.stage(filename, contents)
                 self.json_response({"filename": staged.name, "path": str(staged), **self.open_in_xiao(staged)})
             else:
                 self.respond(contents, "application/dxf", filename=filename)
         elif path == "/api/roll-reset":
-            self.json_response(self.server.reset_roll(self.json_body(16 * 1024)))
+            self.json_response(self.plotter.reset_roll(self.json_body(16 * 1024)))
+        elif path == "/api/new-cut":
+            if self.server.companion_mode:
+                data = self.json_body(16 * 1024)
+                if data.get("stopped") is not True:
+                    raise RequestError("Подтвердите, что плоттер остановлен.")
+                with request_lock(self.server.motion_start_lock, "Дождитесь завершения текущего действия."), \
+                        request_lock(self.server.upload_lock, "Дождитесь завершения передачи задания."):
+                    self.server.verify_new_cut_idle(self.server.read_live())
+                    self.server.clear_cut()
+                self.json_response({"idle": True, **self.server.cut_status()})
+                return
+            self.json_response(self.server.new_cut(self.plotter, self.json_body(16 * 1024)))
         elif path in ("/api/workspace", "/api/cut-plan", "/api/nest", "/api/nest-parts", "/api/command", "/api/plan", "/api/export", "/api/stage", "/api/reveal", "/api/open-in-xiao",
                       "/api/controller", "/api/controller-position", "/api/controller-job",
                       "/api/controller-hold", "/api/controller-operation", "/api/controller-feed-mode",
@@ -926,47 +1162,46 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/workspace":
                 self.json_response(self.server.save_workspace(data.get("revision"), data.get("workspace")))
             elif path == "/api/cut-plan":
-                self.json_response(self.server.cut_plan(data.get("job"), data.get("filename"), self.server.controller.upload_page_add()))
+                self.json_response(self.plotter.cut_plan(
+                    data.get("job"), data.get("filename"), self.plotter.controller.upload_page_add(),
+                ))
             elif path == "/api/nest":
-                self.json_response(self.server.nest(data))
+                self.json_response(self.plotter.nest(data))
             elif path == "/api/nest-parts":
                 self.json_response({"parts": identify_parts(data.get("paths"))})
             elif path == "/api/command":
-                self.json_response(self.server.status(self.server.simulator.command(data)))
+                self.json_response(self.plotter.status(self.plotter.simulator.command(data)))
             elif path == "/api/controller":
-                self.json_response(self.server.controller.read_status())
+                self.json_response(self.plotter.controller.read_status())
             elif path == "/api/controller-live":
-                self.json_response(self.server.read_live())
+                self.json_response(self.plotter.read_live())
             elif path == "/api/panel-snapshot":
                 extended = data.get("extended", False)
                 if type(extended) is not bool:
                     raise RequestError("Неверный режим диагностики.")
-                self.json_response(self.server.controller.read_panel_snapshot(extended=extended))
+                self.json_response(self.plotter.controller.read_panel_snapshot(extended=extended))
             elif path == "/api/panel-compare":
                 self.json_response({"candidates": compare_panel_samples(data.get("samples"))})
             elif path == "/api/control-session":
-                self.json_response(self.server.controller.control_session(
+                self.json_response(self.plotter.controller.control_session(
                     data.get("action"), data.get("controlToken"), data.get("ready"),
                 ))
             elif path == "/api/controller-position":
-                self.json_response(self.server.controller.read_position())
+                self.json_response(self.plotter.controller.read_position())
             elif path == "/api/controller-job":
-                self.json_response(self.server.controller.read_job_index())
+                self.json_response(self.plotter.controller.read_job_index())
             elif path == "/api/controller-feed-mode":
-                self.json_response(self.server.controller.read_feed_mode())
+                self.json_response(self.plotter.controller.read_feed_mode())
             elif path == "/api/controller-upload":
-                self.json_response(self.server.upload(data))
+                self.json_response(self.plotter.upload(data))
             elif path == "/api/controller-hold":
-                self.json_response(self.server.controller.hold(
-                    data.get("action"), data.get("session"), data.get("axis"), data.get("direction"),
-                    data.get("token"), data.get("ready"), data.get("controlToken"),
-                ))
+                self.json_response(self.plotter.hold(data))
             elif path == "/api/controller-operation":
-                self.json_response(self.server.operate(data))
+                self.json_response(self.plotter.operate(data))
             elif path == "/api/reveal":
                 self.reveal(data.get("filename"))
             else:
-                plan = self.server.plan(data.get("job"))
+                plan = self.plotter.plan(data.get("job"))
                 if path == "/api/plan":
                     self.json_response(plan.summary())
                     return
@@ -1059,7 +1294,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
+        connect = f"; connect-src 'self' http://127.0.0.1:{COMPANION_PORT}" if self.server.central_mode else ""
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'" + connect)
+        if self.server.companion_mode and self.headers.get("Origin") == self.server.companion_origin:
+            self.send_header("Access-Control-Allow-Origin", self.server.companion_origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Plotter-Companion")
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
         if filename:
             self.send_header("Content-Disposition", f"attachment; filename=plotter.dxf; filename*=UTF-8''{quote(filename, safe='')}")
         self.end_headers()
@@ -1072,12 +1314,26 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Локальное веб-приложение для плоттера Xiao.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--central", action="store_true")
+    mode.add_argument("--companion", action="store_true")
+    parser.add_argument("--profile", type=Path, default=PROFILE)
+    parser.add_argument("--workspace", type=Path)
+    parser.add_argument("--public-origin")
+    parser.add_argument("--central-url")
     parser.add_argument("--open", action="store_true", help="открыть приложение в браузере")
     args = parser.parse_args()
+    if args.central != bool(args.public_origin) or args.companion != bool(args.central_url):
+        parser.error("Для --central задайте --public-origin, для --companion задайте --central-url.")
+    if args.central and (not args.workspace or os.name == "nt"):
+        parser.error("Для --central на Linux задайте общий файл через --workspace.")
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("ezdxf").setLevel(logging.WARNING)
-    with PlotterServer(args.port) as server:
+    port = args.port if args.port is not None else (COMPANION_PORT if args.companion else DEFAULT_PORT)
+    path = args.workspace or (args.profile.parent / "workspace.json" if args.companion else WORKSPACE_PATH)
+    with PlotterServer(port, path, profile_path=args.profile, public_origin=args.public_origin,
+                       companion_origin=args.central_url) as server:
         url = f"http://{LOCAL_ADDRESS}:{server.server_port}"
         print(f"Плоттер запущен: {url}", flush=True)
         if args.open:

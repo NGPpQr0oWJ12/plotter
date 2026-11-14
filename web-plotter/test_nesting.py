@@ -3,6 +3,7 @@ from math import cos, dist, isclose, radians, sin
 import unittest
 
 from cut_plan import prepare_cut_plan
+from machine import PlotterError
 from nesting import NestingFitError, nest_paths
 
 
@@ -27,6 +28,56 @@ def tilt(path, angle, *, x=0, y=0):
 
 
 class NestingTests(unittest.TestCase):
+    def test_omitted_and_null_fabric_length_preserve_unlimited_layout(self):
+        paths = [rectangle(0, index * 160, 90, 50) for index in range(2)]
+        options = dict(width_mm=100, gap_mm=4, margin_mm=10, page_length_mm=119.88)
+
+        unlimited = pack(paths, **options)
+
+        self.assertEqual(pack(paths, length_mm=None, **options), unlimited)
+        self.assertAlmostEqual(unlimited["lengthMm"], 204)
+        self.assertEqual(unlimited["pageCount"], 2)
+
+    def test_fabric_length_limit_includes_both_end_margins(self):
+        paths = [rectangle(0, 0, 90, 50)]
+        original = deepcopy(paths)
+        options = dict(width_mm=100, gap_mm=4, margin_mm=10, page_length_mm=119.88)
+
+        fitting = pack(paths, length_mm=110, **options)
+
+        xs = [x for x, _ in fitting["paths"][0]["points"]]
+        self.assertAlmostEqual(min(xs), 10)
+        self.assertAlmostEqual(max(xs), 100)
+        self.assertAlmostEqual(fitting["lengthMm"], 110)
+        with self.assertRaises(PlotterError):
+            pack(paths, length_mm=109.5, **options)
+        self.assertEqual(paths, original)
+
+    def test_multiple_passes_use_one_fabric_length_limit(self):
+        paths = [rectangle(0, index * 160, 90, 50) for index in range(2)]
+        original = deepcopy(paths)
+        options = dict(width_mm=100, gap_mm=4, margin_mm=10, page_length_mm=119.88)
+
+        result = pack(paths, length_mm=204, **options)
+        plan = prepare_cut_plan({"paths": result["paths"]}, 120, 100, 0.12)
+
+        self.assertEqual(result["partCount"], len(paths))
+        self.assertAlmostEqual(result["lengthMm"], 204)
+        self.assertEqual(result["pageCount"], 2)
+        self.assertEqual((plan["issues"], plan["seams"], len(plan["pages"])), ([], [], 2))
+        with self.assertRaises(PlotterError):
+            pack(paths, length_mm=203.5, **options)
+        self.assertEqual(paths, original)
+
+    def test_shorter_layout_must_still_split_into_valid_passes(self):
+        sizes = [(90, 80), (110, 20), (40, 35)]
+        paths = [rectangle(0, index * 160, *size) for index, size in enumerate(sizes)]
+        options = dict(width_mm=120, gap_mm=4, margin_mm=6, page_length_mm=119.88, rotation="quarter")
+
+        self.assertEqual(pack(paths, **options)["pageCount"], 2)
+        with self.assertRaisesRegex(PlotterError, "разбиением на проходы"):
+            pack(paths, length_mm=158, **options)
+
     def test_compacts_distant_parts_with_gaps_and_stable_contour_order(self):
         paths = [rectangle(-4400, 8000, 700, 550), rectangle(6900, 20, 500, 590),
                  rectangle(18000, -8500, 600, 650)]

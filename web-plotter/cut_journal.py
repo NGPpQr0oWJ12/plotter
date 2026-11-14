@@ -16,8 +16,10 @@ class CutJournal:
     """Persist operator-visible cut events without restoring machine control state."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = Path(path) if path is not None else None
         self.events = deque(maxlen=MAX_EVENTS)
+        if self.path is None:
+            return
         try:
             with self.path.open("rb") as file:
                 contents = file.read(MAX_BYTES + 1)
@@ -43,6 +45,8 @@ class CutJournal:
     def record(self, filename, page, kind, message):
         event = {"at": timestamp(), "filename": filename, "page": page, "kind": kind, "message": message}
         self.events.append(event)
+        if self.path is None:
+            return event
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             contents = json.dumps(list(self.events), ensure_ascii=False, separators=(",", ":")).encode("utf-8")

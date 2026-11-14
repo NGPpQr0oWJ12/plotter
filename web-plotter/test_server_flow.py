@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import unittest
 from contextlib import closing
@@ -14,7 +15,10 @@ import ezdxf
 
 from controller import ControllerError
 from cut_journal import CutJournal
-from server import PlotterServer
+from server import CutProgress, PlotterServer, RollRun
+from workspace import WorkspaceStore
+
+EXAMPLE_PROFILE = Path(__file__).resolve().parent.parent / "research" / "machine-profile.example.json"
 
 
 def drawing():
@@ -46,7 +50,7 @@ class ServerFlowTests(unittest.TestCase):
         self.controller.upload_uncertain = False
         self.controller.upload_in_progress = False
         with patch("server.Controller", return_value=self.controller):
-            self.server = PlotterServer(0, Path(self.directory.name) / "workspace.json")
+            self.server = PlotterServer(0, Path(self.directory.name) / "workspace.json", profile_path=EXAMPLE_PROFILE)
         self.worker = Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.worker.start()
         self.addCleanup(self.close_server)
@@ -72,6 +76,60 @@ class ServerFlowTests(unittest.TestCase):
     def save(self, workspace, revision=0):
         return self.request("/api/workspace", {"revision": revision, "workspace": workspace})["revision"]
 
+    @unittest.skipIf(os.name == "nt", "central workspaces use Linux file locking")
+    def test_shared_export_remains_available_with_the_companion_cut_plan(self):
+        origin = "https://plotter.example.invalid:8447"
+        with PlotterServer(0, Path(self.directory.name) / "central.json",
+                           profile_path=EXAMPLE_PROFILE, public_origin=origin) as central:
+            central.workspace.write(0, drawing())
+            job, filename = central.workspace_drawing(central.workspace.read()["workspace"])
+            central_plan = central.cut_plan(job, filename)
+            with patch("server.Controller", return_value=self.controller), \
+                    PlotterServer(0, Path(self.directory.name) / "companion.json",
+                                  profile_path=EXAMPLE_PROFILE, companion_origin=origin) as companion:
+                linked_plan = companion.cut_plan(job, filename, self.controller.upload_page_add())
+            self.assertNotEqual(central_plan["planId"], linked_plan["planId"])
+            self.assertEqual(central_plan["exportPlanId"], linked_plan["exportPlanId"])
+            _, contents = central.prepare_xiao(linked_plan["exportPlanId"], shared_export=True)
+            self.assertTrue(contents)
+            central.workspace.write(1, {**drawing(), "excluded": [0, 2]})
+            with self.assertRaisesRegex(ValueError, "Сохранённая раскладка изменилась"):
+                central.prepare_xiao(linked_plan["exportPlanId"], shared_export=True)
+
+    def test_notches_are_identified_and_persisted_without_changing_cut_paths(self):
+        document = ezdxf.new(units=ezdxf.units.MM)
+        document.layers.new("Надсечки")
+        model = document.modelspace()
+        model.add_lwpolyline([(0, 0), (20, 0), (20, 20), (0, 20)], close=True)
+        model.add_line((20.5, 5), (25.5, 5))
+        model.add_line((6, 10), (11, 10))
+        model.add_line((6, 0), (11, 0))
+        model.add_line((30, 0), (30, 5), dxfattribs={"layer": "Надсечки"})
+        file = Path(self.directory.name) / "notches.dxf"
+        document.saveas(file)
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            client.request("POST", "/api/import?filename=notches.dxf", file.read_bytes(),
+                           {"Content-Type": "application/octet-stream"})
+            response = client.getresponse()
+            self.assertEqual(response.status, HTTPStatus.OK)
+            imported = json.loads(response.read())["paths"]
+
+        self.assertEqual([path["notch"] for path in imported], [False, True, False, False, True])
+        paths = [{**path, "partNumber": 12} for path in imported]
+        workspace = {**drawing(), "paths": paths, "excluded": [4]}
+        self.save(workspace)
+        self.assertEqual(self.server.workspace.read()["workspace"], workspace)
+        cut = self.preview(workspace)
+        self.assertEqual(len(cut["pages"][0]["paths"]), 4)
+        self.assertEqual(cut["cutDistanceMm"], 95)
+
+        legacy = [{key: value for key, value in path.items() if key != "notch"} for path in paths]
+        parts = self.request("/api/nest-parts", {"paths": legacy})["parts"]
+        self.assertEqual(parts, [{"number": 12, "indices": [0, 1, 2, 3, 4], "notchIndices": [1, 4]}])
+        moved = [{**path, "points": [[x + 100, y] for x, y in path["points"]]} if index == 1 else path
+                 for index, path in enumerate(paths)]
+        self.assertEqual(self.request("/api/nest-parts", {"paths": moved})["parts"], parts)
+
     def test_close_contours_leaves_the_saved_draft_and_exclusions_intact(self):
         def contour(points):
             return {"layer": "Крой", "closed": False, "points": points, "partNumber": 1}
@@ -86,7 +144,8 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(repaired["closedCount"], 1)
         self.assertEqual(repaired["sources"], [[1], [2], [0, 2]])
         self.assertEqual(repaired["excluded"], [0])
-        self.assertEqual(repaired["paths"][0], paths[1])
+        self.assertEqual(repaired["paths"][0], {**paths[1], "notch": False})
+        self.assertTrue(repaired["paths"][1]["notch"])
         self.assertTrue(repaired["paths"][-1]["closed"])
         self.assertEqual(self.server.workspace.read()["workspace"], workspace)
         self.controller.operate.assert_not_called()
@@ -94,7 +153,8 @@ class ServerFlowTests(unittest.TestCase):
     def test_close_contours_bridges_a_small_gap_only_on_explicit_repair(self):
         outline = {"layer": "Крой", "closed": False, "partNumber": 4,
                    "points": [[10, 10], [110, 10], [110, 110], [10, 110], [10, 10.01153]]}
-        notch = {"layer": "Крой", "closed": False, "partNumber": 4, "points": [[10, 10], [5, 10]]}
+        notch = {"layer": "Крой", "closed": False, "partNumber": 4, "notch": False,
+                 "points": [[10, 10], [5, 10]]}
         workspace = {**drawing(), "paths": [outline, notch], "excluded": []}
         self.save(workspace)
         plan = self.preview(workspace)
@@ -104,7 +164,7 @@ class ServerFlowTests(unittest.TestCase):
         repaired = self.request("/api/close-contours", {"paths": workspace["paths"]})
 
         self.assertEqual(repaired["closedCount"], 1)
-        self.assertEqual(repaired["paths"], [{**outline, "closed": True}, notch])
+        self.assertEqual(repaired["paths"], [{**outline, "closed": True, "notch": False}, {**notch, "notch": True}])
         self.assertEqual(self.server.workspace.read()["workspace"], workspace)
         fixed_plan = self.preview({**workspace, "paths": repaired["paths"]})
         self.assertEqual(fixed_plan["repairableContourCount"], 0)
@@ -157,7 +217,7 @@ class ServerFlowTests(unittest.TestCase):
             response = client.getresponse()
             status = json.loads(response.read())
         self.assertEqual(response.status, HTTPStatus.OK)
-        self.assertEqual(status["apiVersion"], 19)
+        self.assertEqual(status["apiVersion"], 21)
         self.assertIs(status["machine"]["liveCutProgress"], True)
         self.assertIs(status["nestingKeepsNotches"], True)
         self.assertIs(status["nestingPartRotation"], True)
@@ -174,6 +234,173 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(status["machine"]["actuators"], self.controller.actuator_snapshot.return_value)
         self.controller.read_live.assert_not_called()
         self.controller.operate.assert_not_called()
+
+    def test_new_cut_clears_persisted_drawing_offline_and_keeps_both_journals(self):
+        revision = self.save(drawing())
+        for plotter in (self.server, self.server.demo):
+            plotter.roll = RollRun("plan", 1, 1, 1, 0, "completed", 1)
+            plotter.cut_progress = CutProgress("plan", "Лекало.dxf", 1, 1, 1, 2, 0, 50, state="completed")
+            plotter.cut_journal.record("Лекало.dxf", 1, "cut_completed", "Раскрой завершён.")
+        self.controller.read_live.return_value = {"responded": False, "busy": False,
+                                                 "run": {"state": "completed", "fresh": False}}
+        self.request("/api/new-cut", {"revision": revision, "stopped": False}, HTTPStatus.BAD_REQUEST)
+        self.request("/api/new-cut", {"revision": revision - 1, "stopped": True}, HTTPStatus.CONFLICT)
+        self.controller.read_live.assert_not_called()
+        result = self.request("/api/new-cut", {"revision": revision, "stopped": True})
+        self.assertEqual(result["revision"], revision + 1)
+        self.assertIsNone(result["workspace"])
+        self.assertIsNone(result["roll"])
+        self.assertIsNone(result["cutProgress"])
+        self.assertEqual(len(result["cutJournal"]), 1)
+        self.assertIsNone(self.server.demo.roll)
+        self.assertIsNone(self.server.demo.cut_progress)
+        self.assertEqual(len(self.server.demo.cut_journal.snapshot()), 1)
+        self.assertIsNone(WorkspaceStore(self.server.workspace.path).read()["workspace"])
+        self.assertEqual(CutJournal(self.server.cut_journal.path).snapshot(), result["cutJournal"])
+        self.controller.operate.assert_not_called()
+
+    def test_new_cut_leaves_drawing_and_metadata_intact_if_controller_is_unsafe(self):
+        revision = self.save(drawing())
+        progress = CutProgress("plan", "Лекало.dxf", 1, 1, 1, 2, 0, 50, state="ready", receipt="receipt")
+        self.server.loaded_plan = ("receipt", "plan", 1)
+        self.server.cut_progress = progress
+        data = {"revision": revision, "stopped": True}
+        idle = {"responded": True, "position": {"x": 0, "y": 0}, "run": {"state": "ready", "fresh": True}}
+        for unsafe in ({"busy": True}, {"responded": False}, {"uploadUncertain": True},
+                       {"motionInhibited": True}, {"coordinateMove": {"state": "moving"}},
+                       {"coordinateMove": {"state": "unconfirmed"}}, {"externalMotion": "running"},
+                       {"lastEvent": {"code": 3}}, {"run": {"state": "paused", "fresh": True}}):
+            with self.subTest(unsafe=unsafe):
+                self.controller.read_live.return_value = {**idle, **unsafe}
+                self.request("/api/new-cut", data, HTTPStatus.CONFLICT)
+                self.assertIs(self.server.cut_progress, progress)
+                self.assertEqual(self.server.workspace.read()["revision"], revision)
+        self.controller.read_live.return_value = idle
+        with self.server.upload_lock:
+            self.request("/api/new-cut", data, HTTPStatus.CONFLICT)
+        with (patch.object(self.server.workspace, "write", side_effect=OSError("write failed")),
+              self.assertLogs("plotter", level="ERROR")):
+            self.request("/api/new-cut", data, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertIs(self.server.cut_progress, progress)
+        self.assertEqual(self.server.loaded_plan, ("receipt", "plan", 1))
+        self.assertEqual(self.server.workspace.read()["revision"], revision)
+        self.controller.operate.assert_not_called()
+
+    def test_demo_new_cut_blocks_other_job_and_virtual_jog_without_touching_real_controller(self):
+        revision = self.save(drawing())
+        data = {"revision": revision, "stopped": True}
+        self.server.roll = RollRun("plan", 1, 2, 1, 40, "advance", 1)
+        self.request("/demo/api/new-cut", data, HTTPStatus.CONFLICT)
+        self.server.roll = None
+        token = self.request("/demo/api/control-session", {"action": "arm", "ready": True})["controlToken"]
+        hold = {"session": "new-cut-demo-hold", "axis": "x", "direction": 1, "controlToken": token}
+        self.request("/demo/api/controller-hold", {**hold, "action": "start"})
+        self.request("/demo/api/new-cut", data, HTTPStatus.CONFLICT)
+        self.request("/demo/api/controller-hold", {**hold, "action": "stop"})
+        self.assertIsNone(self.request("/demo/api/new-cut", data)["workspace"])
+        self.controller.read_live.assert_not_called()
+        self.controller.operate.assert_not_called()
+
+    def test_demo_runs_a_roll_without_calling_the_real_controller_or_journal(self):
+        workspace = drawing()
+        workspace["paths"] = [
+            {"layer": "Крой", "closed": False, "points": [[x, 50], [x + 10, 70]]}
+            for x in (20, 2600)
+        ]
+        workspace["excluded"] = []
+        self.save(workspace)
+        self.controller.reset_mock()
+        clock = [100.0]
+
+        def demo(path, data, expected=HTTPStatus.OK):
+            return self.request("/demo/api/" + path, data, expected)
+
+        with patch("demo_controller.monotonic", side_effect=lambda: clock[0]):
+            plan = demo("cut-plan", {"job": {"paths": workspace["paths"], "optimize": True},
+                                     "filename": workspace["source"]["filename"]})
+            self.assertTrue(plan["canUpload"])
+            self.assertEqual(len(plan["pages"]), 2)
+            armed = demo("control-session", {"action": "arm", "ready": True})
+            token = armed["controlToken"]
+            options = {"planId": plan["planId"], "controlToken": token}
+            demo("controller-upload", {**options, "controlToken": "real-token"}, HTTPStatus.BAD_REQUEST)
+            for page in (1, 2):
+                upload = demo("controller-upload", {**options, "page": page, "advanceConfirmed": True})
+                self.assertEqual(upload["cutProgress"]["state"], "ready")
+                demo("controller-operation", {**options, "action": "cut", "jobVerified": True,
+                                              "jobReceipt": upload["jobReceipt"]})
+                clock[0] += 2
+                running = demo("controller-live", {})
+                self.assertEqual(running["cutProgress"]["state"], "running")
+                self.assertIn("drawingPosition", running)
+                if page == 1:
+                    demo("controller-operation", {"action": "pause-cut", "controlToken": token})
+                    paused = demo("controller-live", {})
+                    self.assertEqual(paused["cutProgress"]["state"], "paused")
+                    clock[0] += 35
+                    self.assertEqual(demo("controller-live", {})["position"], paused["position"])
+                    demo("controller-operation", {"action": "resume-cut", "controlToken": token})
+                clock[0] += 35
+                finished = demo("controller-live", {})
+                self.assertEqual(finished["roll"]["state"], "advance" if page == 1 else "completed")
+                self.assertEqual(finished["cutProgress"]["completedPages"], page)
+                self.assertEqual(finished["cutProgress"]["index"], upload["points"])
+
+        self.assertEqual(finished["cutJournal"][-1]["kind"], "cut_completed")
+        self.assertIsNone(self.server.cut_progress)
+        self.assertIsNone(self.server.roll)
+        self.assertEqual(self.server.cut_journal.snapshot(), [])
+        self.assertFalse(self.server.cut_journal.path.exists())
+        self.assertEqual(self.controller.mock_calls, [])
+
+    def test_demo_disallows_xiao_handoff_and_keeps_real_status(self):
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            client.request("GET", "/demo/api/status")
+            response = client.getresponse()
+            status = json.loads(response.read())
+        self.assertEqual(response.status, HTTPStatus.OK)
+        self.assertTrue(status["demoMode"])
+        self.assertTrue(status["demoAvailable"])
+        self.assertTrue(status["machine"]["directUpload"])
+        self.assertIsNone(status["machine"]["ip"])
+        self.assertFalse(status["machine"]["xiaoAvailable"])
+        self.assertFalse(self.server.status()["demoMode"])
+
+        with patch("server.Handler.stage") as stage, patch("server.Handler.open_in_xiao") as handoff:
+            self.request("/demo/api/prepare-xiao", {"openInXiao": True}, HTTPStatus.FORBIDDEN)
+            self.request("/demo/api/open-in-xiao", {}, HTTPStatus.FORBIDDEN)
+            stage.assert_not_called()
+            handoff.assert_not_called()
+
+    def test_demo_has_its_own_material_controls_and_jog_position(self):
+        self.controller.reset_mock()
+        clock = [100.0]
+        with patch("demo_controller.monotonic", side_effect=lambda: clock[0]):
+            token = self.request("/demo/api/control-session", {
+                "action": "arm", "ready": True,
+            })["controlToken"]
+            self.request("/demo/api/controller-operation", {"action": "vacuum", "controlToken": token})
+            self.request("/demo/api/controller-operation", {"action": "clamp", "controlToken": token})
+            before = self.request("/demo/api/controller-live", {})
+            self.assertTrue(before["actuators"]["vacuumEnabled"])
+            self.assertTrue(before["actuators"]["clampLowered"])
+            self.request("/demo/api/controller-operation", {"action": "raise-clamp", "controlToken": token})
+
+            held = self.request("/demo/api/controller-hold", {
+                "action": "start", "session": "00000000-0000-4000-8000-000000000001",
+                "axis": "x", "direction": 1, "controlToken": token,
+            })
+            self.assertEqual(held["phase"], "holding")
+            clock[0] += 0.2
+            stopped = self.request("/demo/api/controller-hold", {
+                "action": "stop", "session": "00000000-0000-4000-8000-000000000001",
+            })
+            self.assertTrue(stopped["positionStable"])
+            after = self.request("/demo/api/controller-live", {})
+            self.assertGreater(after["position"]["x"], before["position"]["x"])
+            self.assertFalse(after["actuators"]["vacuumEnabled"])
+            self.assertFalse(after["actuators"]["clampLowered"])
+        self.assertEqual(self.controller.mock_calls, [])
 
     def test_coordinate_move_passes_target_and_control_session_to_controller(self):
         move = {"state": "moving", "x": 100.25, "y": 42}
@@ -701,16 +928,20 @@ class ServerFlowTests(unittest.TestCase):
         other = {"layer": "Крой", "closed": True,
                  "points": [[300, 0], [380, 0], [380, 90], [300, 90]]}
         identified = self.request("/api/nest-parts", {"paths": [notch, other, outline]})
-        self.assertEqual(identified["parts"], [{"number": 1, "indices": [0, 2]}, {"number": 2, "indices": [1]}])
+        self.assertEqual(identified["parts"], [{"number": 1, "indices": [0, 2], "notchIndices": [0]},
+                                              {"number": 2, "indices": [1], "notchIndices": []}])
 
-        paths = [{**outline, "partNumber": 1, "partRotation": "quarter"},
-                 {**notch, "partNumber": 1},
+        paths = [{**outline, "partNumber": 1, "partRotation": "quarter", "partAngle": 325.5},
+                 {**notch, "partNumber": 1, "partAngle": 325.5},
                  {**other, "partNumber": 2, "partRotation": "none"}]
         laid_out = self.request("/api/nest", {"paths": paths, "widthMm": 112, "rotation": "none"})
         self.assertEqual([(part["partNumber"], part["angle"]) for part in laid_out["placements"]], [(1, 90), (2, 0)])
         self.assertEqual([path["partRotation"] for path in laid_out["paths"]], ["quarter", "quarter", "none"])
+        self.assertEqual([path["partAngle"] for path in laid_out["paths"]], [55.5, 55.5, 0])
+        self.assertEqual([path["notch"] for path in laid_out["paths"]], [False, True, False])
         self.assertEqual(self.request("/api/nest-parts", {"paths": laid_out["paths"]})["parts"], [
-            {"number": 1, "indices": [0, 1], "rotation": "quarter"}, {"number": 2, "indices": [2], "rotation": "none"},
+            {"number": 1, "indices": [0, 1], "notchIndices": [1], "rotation": "quarter"},
+            {"number": 2, "indices": [2], "notchIndices": [], "rotation": "none"},
         ])
 
         paths[0]["partRotation"] = "none"
@@ -727,11 +958,14 @@ class ServerFlowTests(unittest.TestCase):
                   "points": [[100, 0], [200, 0], [200, 100], [100, 100]], "partNumber": (1 << 53) - 1}
         third = {"layer": "Крой", "closed": False, "points": [[200, 0], [300, 0]]}
         identified = self.request("/api/nest-parts", {"paths": [first, second, third]})
-        self.assertEqual(identified["parts"], [{"number": 1, "indices": [0]},
-                                              {"number": (1 << 53) - 1, "indices": [1]},
-                                              {"number": 2, "indices": [2]}])
+        self.assertEqual(identified["parts"], [{"number": 1, "indices": [0], "notchIndices": []},
+                                              {"number": (1 << 53) - 1, "indices": [1], "notchIndices": []},
+                                              {"number": 2, "indices": [2], "notchIndices": []}])
         for invalid in (
             [{**first, "partNumber": True}],
+            [{**third, "notch": 1}],
+            [{**third, "partAngle": True}],
+            [{**third, "partAngle": 360}],
             [{**third, "partRotation": "quarter"}],
             [{**first, "partRotation": "quarter"}, {**second, "partNumber": 1, "partRotation": "none"}],
         ):
@@ -748,6 +982,7 @@ class ServerFlowTests(unittest.TestCase):
         numbered = {**path, "partNumber": 1}
         rotated = {**numbered, "partRotation": "none"}
         self.assertEqual(preview([numbered])["planId"], preview([rotated])["planId"])
+        self.assertEqual(preview([numbered]), preview([{**numbered, "partAngle": 275.25}]))
         self.assertEqual(preview([path], False)["planId"], preview([numbered], False)["planId"])
         separate = preview([path, other])
         together = preview([{**path, "partNumber": 1}, {**other, "partNumber": 1}])

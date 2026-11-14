@@ -1,0 +1,10 @@
+# Copy to /etc/plotter/deploy.conf and replace the example hostname.
+PUBLIC_HOST=plotter.example.invalid
+PUBLIC_PORT=443
+BLUE_PORT=18765
+GREEN_PORT=18766
+PREVIEW_PORT=18767
+# Optional CA bundle used by the local HTTPS health check.
+# TLS_CA_FILE=/etc/plotter/tls/ca.pem
+# Maximum wait for old Nginx workers before leaving the old slot running.
+DRAIN_SECONDS=30

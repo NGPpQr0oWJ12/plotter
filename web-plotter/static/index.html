@@ -15,12 +15,15 @@
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></symbol>
     <symbol id="i-cursor" viewBox="0 0 24 24"><path d="m5 3 14 9-7 1-3 7L5 3Z"/></symbol>
     <symbol id="i-select-all" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="2 2.5"/><rect x="8" y="8" width="8" height="8" rx="1"/></symbol>
-    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 13V6a1.5 1.5 0 0 1 3 0v5-6a1.5 1.5 0 0 1 3 0v6-4a1.5 1.5 0 0 1 3 0v5-2a1.5 1.5 0 0 1 3 0v4a7 7 0 0 1-13 4l-3-4a1.5 1.5 0 0 1 2-2l2 1Z"/></symbol>
     <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5"/><rect x="8" y="8" width="8" height="8" rx="1"/></symbol>
-    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18m6-18v18"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="m8 5-5 5 5 5m-5-5h12a5 5 0 0 1 0 10h-4"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="m16 5 5 5-5 5m5-5H9a5 5 0 0 0 0 10h4"/></symbol>
+    <symbol id="i-ruler" viewBox="0 0 24 24"><rect x="2.5" y="7" width="19" height="10" rx="2" transform="rotate(-40 12 12)"/><path d="M7 7v4m5-4v3m5-3v4" transform="rotate(-40 12 12)"/></symbol>
     <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7V5Z"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14m6-14v14"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+    <symbol id="i-drawing-file" viewBox="0 0 24 24"><path d="M13 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9Zm0 0v6h6M8 17l3-4 2 2 3-3"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
     <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
     <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
@@ -42,6 +45,8 @@
     <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h5m4 0h7M4 12h11m4 0h1M4 18h2m4 0h10"/><circle cx="11" cy="6" r="2"/><circle cx="17" cy="12" r="2"/><circle cx="8" cy="18" r="2"/></symbol>
     <symbol id="i-route" viewBox="0 0 24 24"><circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h9a3.5 3.5 0 1 1 0 7H8a3.5 3.5 0 1 0 0 7h9"/></symbol>
     <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/></symbol>
   </svg>
 
   <header class="topbar">
@@ -58,7 +63,7 @@
     </h1>
     <div class="topbar-actions">
       <span id="workspace-save" class="workspace-save" role="status" hidden></span>
-      <button class="button primary" id="import-button" type="button"><svg class="icon"><use href="#i-upload"/></svg><span>Открыть DXF / DWG</span></button>
+      <button class="button topbar-secondary" id="new-cut-button" type="button" hidden disabled>Новый раскрой</button>
       <input id="file-input" type="file" accept=".dxf,.dwg" hidden>
     </div>
   </header>
@@ -78,38 +83,132 @@
           </div>
           <div class="canvas-tools">
             <div class="tool-row" role="group" aria-label="Инструменты канваса">
-              <button class="icon-button selected" id="select-tool" type="button" title="Выделить контур щелчком или несколько рамкой" aria-label="Выделить контуры щелчком или рамкой" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-cursor"/></svg></button>
-              <button class="icon-button" id="select-all-tool" type="button" title="Выделить все контуры" aria-label="Выделить все контуры" disabled><svg class="icon" aria-hidden="true"><use href="#i-select-all"/></svg></button>
-              <button class="icon-button" id="pan-tool" type="button" title="Перемещать вид" aria-label="Перемещать вид" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-hand"/></svg></button>
+              <button class="icon-button selected" id="select-tool" type="button" title="Двойной щелчок открывает меню детали. Alt отключает привязку при перетаскивании" aria-label="Выделить контуры щелчком или рамкой" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-cursor"/></svg></button>
               <button class="icon-button" id="fit-tool" type="button" title="Показать полотно целиком" aria-label="Показать полотно целиком"><svg class="icon" aria-hidden="true"><use href="#i-fit"/></svg></button>
-              <button class="icon-button" id="grid-tool" type="button" title="Сетка" aria-label="Сетка" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg></button>
-              <button class="icon-button" id="contour-settings" type="button" title="Параметры контуров" aria-label="Параметры контуров" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg></button>
+              <button class="icon-button" id="measure-tool" type="button" title="Линейка (L)" aria-label="Линейка" aria-keyshortcuts="L" aria-pressed="false" disabled><svg class="icon" aria-hidden="true"><use href="#i-ruler"/></svg></button>
             </div>
-            <div class="zoom-controls" role="group" aria-label="Масштаб">
-              <button type="button" class="icon-button" id="zoom-out" title="Уменьшить" aria-label="Уменьшить"><svg class="icon" aria-hidden="true"><use href="#i-minus"/></svg></button>
-              <button type="button" class="zoom-label" id="zoom-reset" title="Вернуться к рабочему масштабу">100%</button>
-              <button type="button" class="icon-button" id="zoom-in" title="Увеличить" aria-label="Увеличить"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
+            <div class="tool-row canvas-history" role="group" aria-label="История правок">
+              <button class="icon-button" id="undo-tool" type="button" title="Отменить (Ctrl+Z)" aria-label="Отменить" aria-keyshortcuts="Control+Z Meta+Z" disabled><svg class="icon" aria-hidden="true"><use href="#i-undo"/></svg></button>
+              <button class="icon-button" id="redo-tool" type="button" title="Повторить (Ctrl+Shift+Z)" aria-label="Повторить" aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z Control+Y" disabled><svg class="icon" aria-hidden="true"><use href="#i-redo"/></svg></button>
             </div>
           </div>
-          <svg id="drawing-svg" xmlns="http://www.w3.org/2000/svg" role="group" tabindex="0" aria-label="Рабочий стол. Ноль справа внизу. X увеличивается вверх, Y — влево. Щёлкните деталь или протяните рамку для выделения. Правый щелчок открывает меню детали. Стрелки влево и вправо выбирают детали. Delete удаляет выделенное.">
-            <defs><pattern id="minor-grid" width="100" height="100" patternUnits="userSpaceOnUse"><path d="M 100 0 L 0 0 0 100" class="minor-line" fill="none" vector-effect="non-scaling-stroke"/></pattern><pattern id="major-grid" width="500" height="500" patternUnits="userSpaceOnUse"><rect width="500" height="500" fill="url(#minor-grid)"/><path d="M 500 0 L 0 0 0 500" class="major-line" fill="none" vector-effect="non-scaling-stroke"/></pattern></defs>
+          <aside id="measurement-panel" class="measurement-panel" aria-label="Линейка" hidden>
+            <div class="measurement-heading">
+              <strong>Размеры</strong><span id="measurement-count">0 / 5</span>
+              <button id="measurement-close" class="icon-button" type="button" aria-label="Закрыть линейку" title="Закрыть (Esc)"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <ol id="measurement-list" class="measurement-list" hidden></ol>
+            <button id="measurement-clear-all" class="button measurement-clear-all" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Удалить все размеры</button>
+            <p id="measurement-hint">Укажите две точки или протяните линию</p>
+            <output id="measurement-distance" aria-live="off" hidden></output>
+            <span class="measurement-keys">Shift фиксирует ось · Alt отключает привязку</span>
+            <span id="measurement-announcement" class="visually-hidden" role="status"></span>
+          </aside>
+          <form id="protractor" class="protractor" aria-label="Свободный поворот" hidden>
+            <label for="protractor-angle">Угол, °</label>
+            <input id="protractor-angle" type="text" inputmode="decimal" autocomplete="off" required>
+            <button class="icon-button protractor-apply" type="submit" aria-label="Применить угол" title="Применить (Enter)"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg></button>
+            <button id="protractor-close" type="button" class="icon-button" aria-label="Закрыть транспортир" title="Закрыть (Esc)"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+          </form>
+          <svg id="drawing-svg" xmlns="http://www.w3.org/2000/svg" role="group" tabindex="0" aria-label="Рабочий стол. Ноль справа внизу. X увеличивается вверх, Y — влево. Колесо меняет масштаб, перетаскивание средней кнопкой перемещает вид. Щёлкните деталь или протяните рамку для выделения. Двойной щелчок открывает меню детали. Alt отключает привязку при перетаскивании. Стрелки влево и вправо выбирают детали. Delete удаляет выделенное.">
             <g id="table-layer"></g>
             <g id="page-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="path-layer"></g>
+            <g id="notch-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="live-trace-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="simulation-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="page-annotation-layer" pointer-events="none"></g>
             <g id="part-label-layer" aria-hidden="true"></g>
+            <path id="snap-guide" class="snap-guide" aria-hidden="true" hidden></path>
             <rect id="selection-marquee" class="selection-marquee" pointer-events="none" aria-hidden="true" hidden></rect>
             <g id="rotation-layer"></g>
+            <g id="measurement-layer" pointer-events="none" aria-hidden="true" hidden>
+              <g id="measurement-committed"></g>
+              <g id="measurement-preview"></g>
+            </g>
             <g id="head-layer"></g>
+            <g id="ruler-layer" pointer-events="none" aria-hidden="true"></g>
           </svg>
           <div class="empty-canvas" id="empty-canvas"><button class="button" id="canvas-import" type="button"><svg class="icon"><use href="#i-upload"/></svg>Открыть чертёж</button><span>Или перетащите DXF / DWG на стол</span></div>
         </div>
+        <div class="launch-controls" id="launch-controls">
+          <section class="machine-panel" aria-labelledby="machine-title">
+            <header class="launch-head">
+              <h2 id="machine-title">Плоттер</h2>
+              <button id="demo-switch" class="demo-switch" type="button" role="switch" aria-label="Демо-режим" aria-checked="false" disabled>
+                <span class="demo-switch-track" aria-hidden="true"></span>Демо
+              </button>
+              <div class="launch-status">
+                <span id="machine-state" class="machine-state"><span class="status-dot"></span><span id="machine-state-label">Проверяем связь</span></span>
+                <span id="machine-address" class="machine-address">—</span>
+              </div>
+            </header>
+            <section class="control-section" aria-label="Готовность станка">
+              <button class="button wide" id="connect-companion" type="button" hidden>Подключить помощник</button>
+              <button class="button wide" id="arm-button" type="button" disabled>Включить управление</button>
+              <div class="motion-verification" id="motion-verification" hidden>
+                <p id="motion-verification-status" role="status">Проверяем остановку. Движение заблокировано.</p>
+                <button class="button wide" id="verify-stop-button" type="button">Станок остановлен. Проверить</button>
+              </div>
+              <button type="button" class="button wide" id="run-acknowledge" hidden>Подтверждаю остановку на пульте</button>
+            </section>
+          </section>
+          <section class="run-section" id="run-panel" aria-labelledby="run-title" hidden>
+            <div class="section-heading"><h2 id="run-title">Ход раскроя</h2><span id="run-state"></span></div>
+            <div class="cut-statistics run-statistics" id="run-statistics"></div>
+            <dl class="run-metrics">
+              <div><dt>Проход</dt><dd id="run-page">—</dd></div><div><dt>Деталей готово</dt><dd id="run-done">—</dd></div>
+            </dl>
+          </section>
+          <section class="launch-panel" id="launch-panel" aria-labelledby="launch-title">
+            <header class="launch-summary">
+              <h2 id="launch-title">Пульт запуска</h2>
+              <div class="launch-file">
+                <svg class="icon" aria-hidden="true"><use href="#i-drawing-file"/></svg>
+                <div class="launch-file-info">
+                  <p class="job-identity" id="job-identity" hidden></p>
+                  <p class="job-detail" id="job-detail" hidden></p>
+                </div>
+              </div>
+            </header>
+            <div class="pass-panel" id="job-pass-frame" hidden>
+              <div class="job-page" id="job-page-field" hidden>
+                <select id="job-page" aria-label="Проходы"></select>
+                <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+              </div>
+              <button class="button roll-reset" id="roll-reset" type="button" hidden disabled>Начать раскрой заново</button>
+            </div>
+            <div class="launch-actions">
+              <p class="job-status" id="loaded-job" role="status">Откройте DXF или DWG</p>
+              <label class="job-verification" id="manual-auto-run" hidden>
+                <input id="manual-auto-run-off" type="checkbox" autocomplete="off" checked><span>Проверить, что Auto Run выключен</span>
+              </label>
+              <div class="upload-row" id="job-prepare-actions" hidden>
+                <button class="button primary launch-start" id="controller-upload-button" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>Старт</span></button>
+              </div>
+              <input id="job-verified" type="checkbox" autocomplete="off" hidden checked>
+              <div class="action-row job-actions" id="job-action-row" role="group" aria-label="Выполнение задания" hidden>
+                <button class="button" id="pause-button" type="button" data-operation="pause-cut" hidden disabled><svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg><span>Пауза</span></button>
+                <button class="button stop" id="cancel-button" type="button" data-operation="cancel-cut" title="Отменить раскрой" aria-label="Стоп — отменить раскрой" hidden disabled><svg class="icon" aria-hidden="true"><use href="#i-stop"/></svg>Стоп</button>
+              </div>
+              <p id="machine-feedback" class="machine-feedback" role="status" hidden></p>
+            </div>
+          </section>
+        </div>
         <div class="canvas-controls" id="canvas-controls">
-          <div class="drawing-actions" role="group" aria-label="Раскладка и оптимизация">
+          <section class="file-panel" id="xiao-handoff" aria-labelledby="file-title" hidden>
+            <h2 id="file-title">DXF для Xiao</h2>
+            <div class="file-actions">
+              <button class="button" id="prepare-xiao-download" type="button" disabled>Скачать DXF</button>
+              <button class="button" id="prepare-xiao-open" type="button" hidden disabled>Открыть в Xiao</button>
+            </div>
+            <p class="help-copy" id="xiao-result" role="status" hidden></p>
+          </section>
+          <div class="drawing-actions" id="drawing-actions" role="group" aria-label="Инструменты раскладки">
             <button class="button primary" id="nest-button" type="button" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-nest"/></svg>Автораскладка</button>
             <button class="button" id="optimize-button" type="button" title="Оптимизировать маршрут реза" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-route"/></svg>Оптимизировать</button>
+            <button class="button" id="contour-check-button" type="button" title="Проверить незамкнутые контуры" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-select-all"/></svg>Проверить контуры</button>
+            <button class="button" id="simulation-button" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>Симуляция</button>
           </div>
           <section class="motion-panel" aria-labelledby="motion-title">
             <h2 id="motion-title">Перемещение</h2>
@@ -155,71 +254,6 @@
         </section>
       </div>
     </section>
-
-    <aside class="inspector" aria-label="Управление станком">
-      <header class="inspector-head">
-        <div><h2>Пульт станка</h2><span id="machine-address" class="machine-address">—</span></div>
-        <span id="machine-state" class="machine-state"><span class="status-dot"></span><span id="machine-state-label">Проверяем связь</span></span>
-      </header>
-      <div class="inspector-body">
-        <section class="panel-section control-section" aria-label="Готовность станка">
-          <button class="button primary wide" id="arm-button" type="button" disabled>Включить управление</button>
-          <div class="motion-verification" id="motion-verification" hidden>
-            <p id="motion-verification-status" role="status">Проверяем остановку. Движение заблокировано.</p>
-            <button class="button wide" id="verify-stop-button" type="button">Станок остановлен. Проверить</button>
-          </div>
-        </section>
-        <section class="panel-section job-section" aria-labelledby="job-title">
-          <div class="section-heading"><h3 id="job-title">Раскрой</h3><span class="tool-label">SP4</span></div>
-          <p class="job-identity" id="job-identity" hidden></p>
-          <p class="job-detail" id="job-detail" hidden></p>
-          <label class="job-page" id="job-page-field" hidden>
-            <span>Проход реза</span>
-            <select id="job-page"></select>
-          </label>
-          <p class="job-status" id="loaded-job" role="status">Откройте DXF или DWG</p>
-          <p class="roll-continuation-note" id="roll-continuation-note" hidden></p>
-          <label class="job-verification" id="manual-auto-run" hidden>
-            <input id="manual-auto-run-off" type="checkbox" autocomplete="off" checked><span>Проверить, что Auto Run выключен</span>
-          </label>
-          <label class="job-verification" id="roll-advance" hidden>
-            <input id="roll-advance-confirmed" type="checkbox" autocomplete="off" checked><span id="roll-advance-label"></span>
-          </label>
-          <div class="upload-row" id="job-prepare-actions">
-            <button class="button" id="simulation-button" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>Симуляция</button>
-            <button class="button primary" id="controller-upload-button" type="button" disabled>Загрузить</button>
-            <button class="button primary" id="prepare-xiao-open" type="button" hidden disabled>Открыть в Xiao</button>
-          </div>
-          <div class="xiao-handoff" id="xiao-handoff" hidden>
-            <button class="button" id="prepare-xiao-download" type="button" disabled>Скачать DXF для Xiao</button>
-            <p class="help-copy" id="xiao-result" role="status" hidden></p>
-          </div>
-          <label class="job-verification" id="job-verification" hidden>
-            <input id="job-verified" type="checkbox" autocomplete="off"><span id="job-verified-label">Сверил деталь и её положение на станке</span>
-          </label>
-          <div class="action-row job-actions" role="group" aria-label="Выполнение задания">
-            <button class="button primary" id="start-button" type="button" data-operation="cut" title="Запустить загруженное задание" disabled><svg class="icon"><use href="#i-play"/></svg>Старт</button>
-            <button class="button" id="pause-button" type="button" data-operation="pause-cut" disabled><svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg><span>Пауза</span></button>
-            <button class="button stop" id="cancel-button" type="button" data-operation="cancel-cut" title="Отменить раскрой" aria-label="Стоп — отменить раскрой" disabled><svg class="icon" aria-hidden="true"><use href="#i-stop"/></svg>Стоп</button>
-          </div>
-          <button class="button roll-reset" id="roll-reset" type="button" hidden disabled>Завершить сеанс рулона</button>
-        </section>
-        <section class="panel-section run-section" id="run-panel" aria-labelledby="run-title" hidden>
-          <div class="section-heading"><h3 id="run-title">Ход раскроя</h3><span id="run-state"></span></div>
-          <div class="cut-statistics run-statistics" id="run-statistics"></div>
-          <dl class="run-metrics">
-            <div><dt>Проход</dt><dd id="run-page">—</dd></div><div><dt>Деталей готово</dt><dd id="run-done">—</dd></div>
-          </dl>
-          <button type="button" class="button wide" id="run-acknowledge" hidden>Подтверждаю остановку на пульте</button>
-          <details class="run-telemetry"><summary>Данные контроллера</summary>
-            <p class="help-copy" id="run-update"></p>
-            <p class="help-copy" id="run-coordinates"></p>
-            <p class="help-copy">Время прохода: <span id="run-elapsed">—</span> · Точка: <span id="run-index">—</span></p>
-          </details>
-        </section>
-      </div>
-      <p id="machine-feedback" class="machine-feedback" role="status" hidden></p>
-    </aside>
   </main>
 
   <template id="cut-statistics-template">
@@ -243,10 +277,14 @@
   </template>
 
   <div id="part-menu" class="part-menu" role="menu" aria-labelledby="part-menu-title" hidden>
-    <div id="part-menu-title" class="part-menu-title">Деталь</div>
-    <div class="part-menu-group" role="group" aria-label="Ручной поворот">
-      <button type="button" role="menuitem" data-rotate-part="-90" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-turn-cw"/></svg>Поворот направо</button>
-      <button type="button" role="menuitem" data-rotate-part="90" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-turn-ccw"/></svg>Поворот налево</button>
+    <div class="part-menu-heading">
+      <strong id="part-menu-title">Деталь</strong>
+      <span id="part-menu-status" class="part-menu-status"></span>
+    </div>
+    <div class="part-menu-group" role="group" aria-labelledby="part-menu-manual-title">
+      <div id="part-menu-manual-title" class="part-menu-title">Ручной поворот</div>
+      <button type="button" role="menuitem" data-rotate-part="-90" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-turn-cw"/></svg>Повернуть вправо на 90°</button>
+      <button type="button" role="menuitem" data-rotate-part="90" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-turn-ccw"/></svg>Повернуть влево на 90°</button>
       <button type="button" role="menuitem" data-rotate-part="free" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>Свободный поворот</button>
     </div>
     <div class="part-menu-group" role="group" aria-labelledby="part-menu-auto-title">
@@ -255,27 +293,75 @@
       <button type="button" role="menuitemradio" data-part-rotation="none" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Запретить поворот</button>
       <button type="button" role="menuitemradio" data-part-rotation="" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>По общим настройкам</button>
     </div>
+    <div class="part-menu-group" role="group" aria-label="Действия с деталью">
+      <button type="button" role="menuitem" data-part-action="placement" aria-haspopup="dialog" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>Размер и положение</button>
+      <button type="button" role="menuitem" id="part-menu-exclude" data-part-action="exclude" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-minus"/></svg><span>Исключить из раскроя</span></button>
+      <button type="button" role="menuitem" id="part-menu-delete" class="part-menu-delete" data-part-action="delete" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Удалить деталь</button>
+    </div>
   </div>
 
-  <dialog class="plotter-dialog drawing-dialog" id="upload-confirm-dialog" aria-labelledby="upload-confirm-title" aria-describedby="upload-confirm-instructions">
-    <header class="drawing-dialog-heading"><h2 id="upload-confirm-title">Подтверждение загрузки</h2></header>
-    <div class="drawing-dialog-body">
-      <div id="upload-confirm-instructions">
-        <p id="upload-confirm-target"></p>
-        <ul>
-          <li id="upload-confirm-auto-run">Auto Run выключен на штатном пульте.</li>
-          <li id="upload-confirm-zero"></li>
-          <li id="upload-confirm-seam" hidden>Метки стыка совпадают, полотно не смещено поперёк.</li>
-        </ul>
+  <dialog class="plotter-dialog" id="new-cut-dialog" aria-labelledby="new-cut-title" aria-describedby="new-cut-description">
+    <header class="drawing-dialog-heading"><h2 id="new-cut-title">Начать новый раскрой?</h2></header>
+    <form method="dialog">
+      <div class="drawing-dialog-body">
+        <p id="new-cut-description">Текущий чертёж, раскладка и ход задания будут очищены. Исходный файл останется на диске.</p>
       </div>
-      <div class="upload-confirm-actions">
-        <button class="button" id="upload-confirm-cancel" type="button" autofocus>Отмена</button>
-        <button class="button primary" id="upload-confirm-accept" type="button">Подтвердить и загрузить</button>
-      </div>
-    </div>
+      <footer class="dialog-actions">
+        <button class="button" id="new-cut-cancel" type="submit" value="cancel" autofocus>Отмена</button>
+        <button class="button primary" id="new-cut-confirm" type="submit" value="confirm">Очистить и начать</button>
+      </footer>
+    </form>
   </dialog>
 
-  <dialog class="plotter-dialog drawing-dialog" id="contour-dialog" aria-labelledby="contour-dialog-title">
+  <dialog class="plotter-dialog" id="roll-reset-dialog" aria-labelledby="roll-reset-title" aria-describedby="roll-reset-description">
+    <header class="drawing-dialog-heading"><h2 id="roll-reset-title">Начать раскрой заново?</h2></header>
+    <form method="dialog">
+      <div class="drawing-dialog-body" id="roll-reset-description">
+        <p>Текущий чертёж останется на столе.</p>
+        <p id="roll-reset-continuation" hidden>Продолжение незавершённой детали потребует повторного реза предыдущего прохода.</p>
+        <p id="roll-reset-stop" hidden>Подтвердите, что станок остановлен.</p>
+      </div>
+      <footer class="dialog-actions">
+        <button class="button" type="submit" value="cancel" autofocus>Отмена</button>
+        <button class="button primary" type="submit" value="confirm"><span id="roll-reset-confirm">Начать заново</span></button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="plotter-dialog" id="upload-confirm-dialog" aria-labelledby="upload-confirm-title" aria-describedby="upload-confirm-target">
+    <header class="drawing-dialog-heading"><h2 id="upload-confirm-title">Запустить раскрой?</h2></header>
+    <div class="drawing-dialog-body">
+      <p id="upload-confirm-target"></p>
+      <ul class="upload-checks" id="upload-confirm-checks" role="list" hidden>
+        <li id="upload-confirm-auto-run" hidden>
+          <strong>Auto Run</strong>
+          <span>Убедитесь, что Auto Run выключен на штатном пульте.</span>
+        </li>
+        <li id="upload-confirm-feed" hidden>
+          <strong>Протяжка полотна</strong>
+          <span id="upload-confirm-feed-text"></span>
+        </li>
+        <li id="upload-confirm-zero" hidden>
+          <strong>Рабочий ноль (X = 0)</strong>
+          <span id="upload-confirm-zero-text"></span>
+        </li>
+        <li id="upload-confirm-seam" hidden>
+          <strong>Метки стыка</strong>
+          <span>Совместите метки стыка без поперечного смещения полотна.</span>
+        </li>
+        <li id="upload-confirm-placement" hidden>
+          <strong>Раскладка на станке</strong>
+          <span>Сверьте выбранную раскладку и положение материала на станке.</span>
+        </li>
+      </ul>
+    </div>
+    <footer class="dialog-actions">
+      <button class="button" id="upload-confirm-cancel" type="button" autofocus>Отмена</button>
+      <button class="button primary" id="upload-confirm-accept" type="button">Подтвердить и запустить</button>
+    </footer>
+  </dialog>
+
+  <dialog class="plotter-dialog" id="contour-dialog" aria-labelledby="contour-dialog-title">
     <header class="drawing-dialog-heading">
       <h2 id="contour-dialog-title">Параметры контуров</h2>
       <button class="icon-button" id="contour-close" type="button" aria-label="Закрыть" title="Закрыть" autofocus><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
@@ -288,16 +374,15 @@
         <label title="Меняет ширину и высоту с сохранением пропорций">Ширина, мм<input id="size-width" type="number" step="any" min="0" placeholder="—" disabled></label>
         <label title="Меняет ширину и высоту с сохранением пропорций">Высота, мм<input id="size-height" type="number" step="any" min="0" placeholder="—" disabled></label>
       </div>
-      <div class="contour-actions">
-        <button class="button" id="rotate-button" type="button" title="Повернуть выделение на 90°" aria-label="Повернуть выделение на 90°" disabled>↺ 90°</button>
-        <button class="button" id="exclude-button" type="button" disabled>Исключить</button>
-        <button class="button delete-button" id="delete-button" type="button" title="Удалить выделенные контуры (Delete)" disabled>Удалить</button>
-        <button class="button" id="drawing-undo" type="button" hidden>Отменить</button>
-      </div>
     </div>
+    <footer class="dialog-actions">
+      <button class="button" id="rotate-button" type="button" title="Повернуть выделение на 90°" aria-label="Повернуть выделение на 90°" disabled>↺ 90°</button>
+      <button class="button" id="exclude-button" type="button" disabled>Исключить</button>
+      <button class="button delete-button" id="delete-button" type="button" title="Удалить выделенные контуры (Delete)" disabled>Удалить</button>
+    </footer>
   </dialog>
 
-  <dialog class="plotter-dialog drawing-dialog layout-dialog" id="nest-dialog" aria-labelledby="nest-dialog-title">
+  <dialog class="plotter-dialog" id="nest-dialog" aria-labelledby="nest-dialog-title">
     <header class="drawing-dialog-heading">
       <h2 id="nest-dialog-title">Автораскладка</h2>
       <button class="icon-button" id="nest-cancel" type="button" aria-label="Закрыть" title="Закрыть" autofocus><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
@@ -306,6 +391,7 @@
       <div class="drawing-dialog-body">
         <div class="drawing-fields">
           <label>Ширина полотна, мм<input id="nest-width" type="number" min="1" max="1650" step="any" placeholder="1380" value="1380"></label>
+          <label>Длина полотна, мм<input id="nest-length" type="number" min="1" max="1000000000" step="any" placeholder="Без ограничения"></label>
           <label>Зазор, мм<input id="nest-gap" type="number" min="0" max="100" step="any" value="10" required></label>
           <label>Отступ от края, мм<input id="nest-margin" type="number" min="0" max="100" step="any" value="10" required></label>
           <label>Поворот по умолчанию
@@ -315,7 +401,6 @@
             </select>
           </label>
         </div>
-        <p class="route-result" id="nest-pass-limit" hidden></p>
         <div class="nest-feedback" id="nest-feedback" hidden>
           <p id="nest-status" class="nest-status" role="status"></p>
           <button class="button" id="nest-show-blocking" type="button" hidden>Выделить мешающие контуры</button>
@@ -323,13 +408,13 @@
           <button class="button" id="nest-recheck" type="button" hidden>Проверить версию снова</button>
         </div>
       </div>
-      <footer class="layout-dialog-actions">
+      <footer class="dialog-actions">
         <button class="button primary" id="nest-apply" type="submit" disabled>Разложить на полотне</button>
       </footer>
     </form>
   </dialog>
 
-  <dialog class="plotter-dialog drawing-dialog layout-dialog" id="optimize-dialog" aria-labelledby="optimize-dialog-title">
+  <dialog class="plotter-dialog route-dialog" id="optimize-dialog" aria-labelledby="optimize-dialog-title">
     <header class="drawing-dialog-heading">
       <h2 id="optimize-dialog-title">Оптимизация маршрута</h2>
       <button class="icon-button" id="optimize-cancel" type="button" aria-label="Закрыть" title="Закрыть" autofocus><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
@@ -338,19 +423,41 @@
       <div class="optimization-options">
         <label class="optimization-option">
           <input id="optimize-route" type="checkbox" checked>
-          <span>Сократить холостой ход на каждом проходе</span>
+          <strong>Сократить холостой ход</strong>
         </label>
         <label class="optimization-option">
           <input id="optimize-join" type="checkbox" checked>
-          <span>Соединить линии в точных стыках</span>
+          <strong>Соединить линии в точных стыках</strong>
         </label>
       </div>
-      <p class="route-result" id="optimize-result" hidden></p>
-      <p class="route-result" id="repair-result" role="status" hidden></p>
+      <section class="route-summary" aria-labelledby="route-summary-title">
+        <h3 id="route-summary-title">Холостой ход</h3>
+        <p id="optimize-result" role="status" hidden></p>
+        <dl class="route-comparison" id="optimize-comparison" hidden>
+          <div><dt>Исходный маршрут</dt><dd id="optimize-before"></dd></div>
+          <div><dt>Текущий маршрут</dt><dd id="optimize-after"></dd></div>
+          <div><dt>Сокращение</dt><dd id="optimize-saved"></dd></div>
+        </dl>
+      </section>
     </div>
-    <footer class="layout-dialog-actions">
-      <button class="button" id="repair-contours" type="button" disabled>Восстановить замкнутые контуры</button>
-      <button class="button primary" id="optimize-apply" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#i-route"/></svg>Применить к маршруту</button>
+    <footer class="dialog-actions">
+      <button class="button" id="optimize-dismiss" type="button">Отмена</button>
+      <button class="button primary" id="optimize-apply" type="button" disabled>Применить</button>
+    </footer>
+  </dialog>
+
+  <dialog class="plotter-dialog" id="contour-check-dialog" aria-labelledby="contour-check-title">
+    <header class="drawing-dialog-heading">
+      <h2 id="contour-check-title">Проверка контуров</h2>
+      <button class="icon-button" id="contour-check-close" type="button" aria-label="Закрыть" title="Закрыть" autofocus><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </header>
+    <div class="drawing-dialog-body">
+      <p class="contour-check-description">Проверка ищет незамкнутые контуры раскроя. Исправление соединяет линии и закрывает небольшие разрывы, если контур можно восстановить однозначно.</p>
+      <p class="contour-check-status" id="contour-check-status" role="status">Проверяем контуры…</p>
+    </div>
+    <footer class="dialog-actions">
+      <button class="button" id="contour-check-scan" type="button" disabled>Проверить снова</button>
+      <button class="button primary" id="contour-check-apply" type="button" disabled>Исправить</button>
     </footer>
   </dialog>
 

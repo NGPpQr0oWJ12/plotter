@@ -21,6 +21,7 @@ JOINT_GRID_MM = 0.0001
 MAX_NOTCH_LENGTH_MM = 10.0
 NOTCH_EDGE_TOLERANCE_MM = 0.25
 NOTCH_EXTENSION_MM = 0.75
+NOTCH_LAYER_WORDS = {"notch", "notches", "насечка", "насечки", "надсечка", "надсечки"}
 MAX_GEOMETRY_TESTS = 8_000_000
 SEARCH_BINS = 12
 SEARCH_RECTS = 96
@@ -95,6 +96,7 @@ class Path:
     closed: bool
     part_number: int | None
     part_rotation: str | None
+    part_angle: float
 
 
 @dataclass(frozen=True)
@@ -117,8 +119,13 @@ def _paths(value):
         if not isinstance(layer, str) or len(layer) > 255 or type(closed) is not bool or not isinstance(points, list):
             raise PlotterError(f"Контур {index}: неверные свойства.")
         part_number, part_rotation = path.get("partNumber"), path.get("partRotation")
+        if "notch" in path and type(path["notch"]) is not bool:
+            raise PlotterError(f"Контур {index}: неверный признак насечки.")
         if "partNumber" in path and (type(part_number) is not int or not 1 <= part_number <= MAX_PART_NUMBER):
             raise PlotterError(f"Контур {index}: неверный номер детали.")
+        part_angle = path.get("partAngle", 0)
+        if type(part_angle) not in (int, float) or not 0 <= part_angle < 360:
+            raise PlotterError(f"Контур {index}: неверный угол детали.")
         if "partRotation" in path and (part_number is None or part_rotation not in ("none", "any", "quarter")):
             raise PlotterError(f"Контур {index}: неверное правило поворота детали.")
         point_count += len(points)
@@ -131,7 +138,7 @@ def _paths(value):
         vertices = tuple((float(x), float(y)) for x, y in points)
         if len(set(vertices)) < (3 if closed else 2):
             raise PlotterError(f"Контур {index}: недостаточно различных точек.")
-        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation))
+        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle))
     return paths
 
 
@@ -241,12 +248,16 @@ class Boundary:
             self.tree = BoxTree([(_bounds(edge), edge) for edge in self.edges])
         return self.tree.search(target)
 
-    def notch_distance(self, segments, budget):
+    def notch_distance(self, segments, budget, *, transverse=False):
         closest = float("inf")
         for first, second, extended, box in segments:
             budget.check()
             for third, fourth in self.nearby_edges(box):
                 budget.check()
+                if transverse and abs(_cross(first, second, fourth) - _cross(first, second, third)) <= (
+                    GEOMETRY_EPSILON * dist(first, second) * dist(third, fourth)
+                ):
+                    continue
                 if _edges_cross(first, second, third, fourth):
                     return 0.0
                 distance = min(_distance_to_edge(first, third, fourth), _distance_to_edge(second, third, fourth),
@@ -365,14 +376,17 @@ def _is_short_mark(paths, members, bounds):
                     <= limit for member in members))
 
 
-def _notch_owner(paths, members, boundaries, index, bounds, groups, budget):
+def _notch_segments(points):
     segments = []
-    for member in members:
-        points = paths[member].points
-        for first, second in zip(points, points[1:]):
-            if first != second:
-                extended = _extended_segment(first, second)
-                segments.append((first, second, extended, _bounds(extended).expanded(NOTCH_EDGE_TOLERANCE_MM)))
+    for first, second in zip(points, points[1:]):
+        if first != second:
+            extended = _extended_segment(first, second)
+            segments.append((first, second, extended, _bounds(extended).expanded(NOTCH_EDGE_TOLERANCE_MM)))
+    return segments
+
+
+def _notch_owner(paths, members, boundaries, index, bounds, groups, budget):
+    segments = [segment for member in members for segment in _notch_segments(paths[member].points)]
     distances = {}
     for position in index.search(bounds.expanded(NOTCH_EXTENSION_MM)):
         budget.check()
@@ -399,6 +413,60 @@ def _containing_outline(paths, members, outlines, index, bounds, budget):
         if all(outline.has_point(point, budget) for member in members for point in paths[member].points):
             return outline.owner
     return None
+
+
+def _notch_indices(paths, *, new_outlines=()):
+    marked = set()
+    candidates = []
+    for member, path in enumerate(paths):
+        if path.get("closed"):
+            continue
+        if path.get("notch"):
+            marked.add(member)
+        elif "notch" not in path or new_outlines:
+            if "notch" not in path and path.get("layer", "0").strip().casefold() in NOTCH_LAYER_WORDS:
+                marked.add(member)
+            elif sum(dist(a, b) for a, b in zip(path["points"], path["points"][1:])) <= (
+                MAX_NOTCH_LENGTH_MM + GEOMETRY_EPSILON
+            ):
+                candidates.append(member)
+    if not candidates:
+        return marked
+
+    boundaries = [Boundary(member, path["points"], closed=True) for member, path in enumerate(paths)
+                  if path.get("closed")]
+    boundaries = [boundary for boundary in boundaries if boundary.edges]
+    if not boundaries:
+        return marked
+    index = BoxTree([(boundary.box, position) for position, boundary in enumerate(boundaries)])
+    budget = Budget()
+    try:
+        for member in candidates:
+            path = paths[member]
+            points, part_number = path["points"], path.get("partNumber")
+            segments = _notch_segments(points)
+            if not segments:
+                continue
+            for position in index.search(_bounds(points).expanded(NOTCH_EXTENSION_MM)):
+                budget.check()
+                boundary = boundaries[position]
+                if "notch" in path and boundary.owner not in new_outlines:
+                    continue
+                owner_number = paths[boundary.owner].get("partNumber")
+                if part_number is not None and owner_number is not None and part_number != owner_number:
+                    continue
+                if boundary.notch_distance(segments, budget, transverse=True) <= NOTCH_EXTENSION_MM + GEOMETRY_EPSILON:
+                    marked.add(member)
+                    break
+    except PlotterError:
+        # Editor metadata must not prevent opening otherwise valid dense drawings.
+        pass
+    return marked
+
+
+def annotate_notches(paths, *, new_outlines=()):
+    marked = _notch_indices(paths, new_outlines=new_outlines)
+    return [{**path, "notch": index in marked} for index, path in enumerate(paths)]
 
 
 def _parts(paths):
@@ -629,7 +697,7 @@ def _edge_angles(hull):
     return {angle for _, angle in longest} | {narrowest[1]}, narrowest[1]
 
 
-def _rotation_boxes(part, paths, usable_x, usable_y, may_rotate):
+def _rotation_boxes(part, paths, usable_x, usable_y, may_rotate, *, usable_length=None):
     unrotated = Box(0, 0, part.box.length, part.box.width)
     if not may_rotate:
         return {0: unrotated}
@@ -648,9 +716,11 @@ def _rotation_boxes(part, paths, usable_x, usable_y, may_rotate):
     for angle in angles:
         footprint(angle)
 
-    # Fit a piece right up to the usable width or section length when the
-    # best feasible angle lies between the samples.
-    for axis, limit in (("length", usable_x), ("width", usable_y)):
+    # Refine angles where a footprint crosses a pass or material edge.
+    limits = [("length", usable_x), ("width", usable_y)]
+    if usable_length is not None:
+        limits.append(("length", usable_length))
+    for axis, limit in limits:
         samples = [*angles, 180]
         crossings = [(first, last) for first, last in zip(samples, samples[1:])
                      if (getattr(footprint(first), axis) <= limit) !=
@@ -679,10 +749,13 @@ def _rotation_boxes(part, paths, usable_x, usable_y, may_rotate):
 def identify_parts(paths):
     if paths == []:
         return []
+    parts = _identified_parts(_paths(paths))
+    notches = _notch_indices(paths)
     return [
         {"number": part.number, "indices": list(part.indices),
+         "notchIndices": [index for index in part.indices if index in notches],
          **({"rotation": part.rotation} if part.rotation is not None else {})}
-        for part in _identified_parts(_paths(paths))
+        for part in parts
     ]
 
 
@@ -793,9 +866,12 @@ def _long_layout(long, usable_y, gap):
             for index, (lane, y, rotation, length, width) in positions.items()}
 
 
-def _continuous_layout(pieces, usable_y, gap, sort_key):
-    # Putting every piece end to end would always fit inside this upper bound.
-    length_limit = sum(max(variant[1] for variant in variants) + gap for _, variants in pieces)
+def _continuous_layout(pieces, usable_y, gap, sort_key, *, usable_length=None):
+    if usable_length is None:
+        # Putting every piece end to end would always fit inside this upper bound.
+        length_limit = sum(max(variant[1] for variant in variants) + gap for _, variants in pieces)
+    else:
+        length_limit = usable_length + gap
     strip = Bin(length_limit, usable_y + gap, roll=True)
     positions = {}
     for index, variants in sorted(pieces, key=sort_key):
@@ -962,13 +1038,14 @@ def _contour_variants(positions, pieces, rotation_boxes, hulls, outlines, *, kee
     return variants
 
 
-def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
+def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm, length_mm=None):
     """Lay out complete pieces without rescaling or reflecting the source paths.
 
     X runs along the material and Y across it. Compare layouts that preserve
     clearance and prefer those whose short parts fit on the roll sections.
     """
     width = number(width_mm, "Ширина полотна, мм", 1, MAX_ABS_COORDINATE_MM)
+    material_length = None if length_mm is None else number(length_mm, "Длина полотна, мм", 1, MAX_ABS_COORDINATE_MM)
     page_length = number(page_length_mm, "Длина рабочего прохода, мм", 1, MAX_ABS_COORDINATE_MM)
     margin = number(margin_mm, "Отступ от края, мм", 0, width / 2)
     spacing = number(gap_mm, "Зазор между деталями, мм", 0, MAX_ABS_COORDINATE_MM)
@@ -982,6 +1059,9 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
     usable_x = page_length - start_margin - edge
     if min(usable_y, usable_x) <= 0:
         raise PlotterError("Для автораскладки уменьшите отступы от края или зазор между деталями.")
+    usable_length = None if material_length is None else material_length - start_margin - margin
+    if usable_length is not None and usable_length <= 0:
+        raise PlotterError("Длина полотна слишком мала для заданных отступов.")
     gap = max(spacing, 1e-5)
     source = _paths(paths)
     parts = _identified_parts(source)
@@ -991,7 +1071,7 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
     blocked_part_count = 0
     for index, part in enumerate(parts):
         may_rotate = part.rotation in ("any", "quarter") or (part.rotation is None and allow_rotation)
-        boxes = _rotation_boxes(part, source, usable_x, usable_y, may_rotate)
+        boxes = _rotation_boxes(part, source, usable_x, usable_y, may_rotate, usable_length=usable_length)
         rotation_boxes.append(boxes)
         variants = [(angle, box.length, box.width) for angle, box in boxes.items()]
         possible = [variant for variant in variants if variant[2] <= usable_y]
@@ -1055,7 +1135,9 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
         nonlocal best
         length, pages, fits = _layout_pages(candidate, parts, source, rotation_boxes, start_margin,
                                             page_length, projected_x, closed_paths)
-        score = (not fits, length, pages)
+        outside_material = material_length is not None and length + margin > material_length + GEOMETRY_EPSILON
+        priority = 2 if outside_material else int(not fits)
+        score = (priority, length, pages)
         if (best is None or score[0] < best[0][0] or score[0] == best[0][0]
                 and (length < best[0][1] - GEOMETRY_EPSILON
                      or abs(length - best[0][1]) <= GEOMETRY_EPSILON
@@ -1083,6 +1165,10 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
             continuous = _continuous_layout(variants_by_part, usable_y, gap, order)
             if continuous is not None:
                 consider(continuous)
+            if usable_length is not None:
+                bounded = _continuous_layout(variants_by_part, usable_y, gap, order, usable_length=usable_length)
+                if bounded is not None:
+                    consider(bounded)
             if len(parts) <= 500:
                 maximal = max_rects_layout(regular, usable_x, usable_y, gap, order)
                 if maximal is not None:
@@ -1176,8 +1262,13 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
                     if candidate is not None and _contours_clear(candidate, outline_at, gap):
                         consider(candidate)
 
-    (_, _, pages), positions = best
+    (priority, _, pages), positions = best
+    if priority == 2:
+        raise PlotterError(f"Не удалось разместить все детали на полотне длиной {material_length:g} мм с заданными отступами.")
+    if material_length is not None and priority == 1:
+        raise PlotterError(f"Не удалось разложить детали на полотне длиной {material_length:g} мм с допустимым разбиением на проходы.")
     result = [None] * len(source)
+    notches = _notch_indices(paths)
     placements = []
     end_x = 0.0
     for index, part in enumerate(parts):
@@ -1197,7 +1288,8 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm):
             path = source[member]
             relative = ((u - part.box.min_x, v - part.box.min_y) for u, v in path.points)
             points = [[base_x + u, base_y + v] for u, v in _project(relative, cosine, sine)]
-            result[member] = {"points": points, "closed": path.closed, "layer": path.layer, **metadata}
+            result[member] = {"points": points, "closed": path.closed, "layer": path.layer,
+                              "notch": member in notches, "partAngle": (path.part_angle + angle) % 360, **metadata}
     if end_x + margin > MAX_ABS_COORDINATE_MM:
         raise PlotterError("Раскладка слишком длинная. Разбейте работу на несколько чертежей.")
     return {

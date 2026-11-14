@@ -102,7 +102,7 @@ class CadImportTests(unittest.TestCase):
             {"points": [[0, 0], [20, 0]], "closed": False, "layer": "0", "partNumber": 8},
             {"points": [[40, 0], [40, 5]], "closed": False, "layer": "0", "partNumber": 9},
             {"points": [[20, -5], [20, 0], [20, 10], [0, 10], [0, 0]],
-             "closed": False, "layer": "0", "partNumber": 8, "partRotation": "none"},
+             "closed": False, "layer": "0", "partNumber": 8, "partRotation": "none", "partAngle": 127.5},
             {"points": [[50, 0], [51, 5]], "closed": False, "layer": "0", "partNumber": 9},
         ]
 
@@ -122,6 +122,7 @@ class CadImportTests(unittest.TestCase):
         self.assertEqual(repaired.excluded, [0, 3])
         self.assertEqual(repaired.paths[2]["partNumber"], 8)
         self.assertEqual(repaired.paths[2]["partRotation"], "none")
+        self.assertEqual([path.get("partAngle") for path in repaired.paths], [None, 127.5, 127.5, None])
         self.assertEqual(segments(repaired.paths), segments(paths))
         self.assertEqual(repair_closed_contours(repaired.paths).closed_count, 0)
 

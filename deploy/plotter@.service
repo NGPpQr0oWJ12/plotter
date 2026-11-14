@@ -1,0 +1,23 @@
+[Unit]
+Description=Plotter central web application (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=plotter
+Group=plotter
+EnvironmentFile=/etc/plotter/%i.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/srv/plotter/slots/%i/web-plotter
+ExecStart=/srv/plotter/slots/%i/.venv/bin/python server.py --central --port ${PORT} --profile /etc/plotter/machine-profile.json --workspace /srv/plotter/shared/workspace.json --public-origin ${PUBLIC_ORIGIN}
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/srv/plotter/shared
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

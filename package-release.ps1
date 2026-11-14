@@ -4,10 +4,11 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$Version,
 
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist')
+    [string]$OutputDirectory
 )
 
 $ErrorActionPreference = 'Stop'
+if (!$OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot 'dist' }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -26,6 +27,14 @@ $files = @(
     'web-plotter/.gitignore',
     'web-plotter/requirements.txt',
     'web-plotter/start.ps1',
+    'web-plotter/install-companion.ps1',
+    'deploy/README.md',
+    'deploy/check-state.py',
+    'deploy/deploy.conf.example',
+    'deploy/plotter.nginx.conf.example',
+    'deploy/plotter@.service',
+    'deploy/release.sh',
+    'research/machine-profile.example.json',
     'web-plotter/auto_run.py',
     'web-plotter/cad.py',
     'web-plotter/contour_packing.py',
@@ -33,6 +42,7 @@ $files = @(
     'web-plotter/cut_journal.py',
     'web-plotter/cut_metrics.py',
     'web-plotter/cut_plan.py',
+    'web-plotter/demo_controller.py',
     'web-plotter/machine.py',
     'web-plotter/nesting.py',
     'web-plotter/panel_diagnostics.py',

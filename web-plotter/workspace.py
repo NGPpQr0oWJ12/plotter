@@ -1,11 +1,12 @@
 import json
 import math
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from cad import MAX_ENTITIES, MAX_POINTS
+from cad import MAX_ABS_COORDINATE_MM, MAX_ENTITIES, MAX_POINTS
 
 
 VERSION = 1
@@ -16,6 +17,10 @@ MAX_WORKSPACE_BYTES = 96 * 1024 * 1024
 
 class WorkspaceConflict(ValueError):
     """The tab is trying to overwrite a newer workspace."""
+
+
+def validate_workspace(value):
+    return _workspace(value)
 
 
 def _revision(value):
@@ -99,6 +104,11 @@ def _workspace(value):
                 or rotation not in ("none", "any", "half", "quarter")):
             raise ValueError("Неверные настройки автораскладки.")
         settings["nesting"] = {"widthMm": width, "gapMm": gap, "marginMm": margin, "rotation": rotation}
+        if "lengthMm" in nesting:
+            length = nesting["lengthMm"]
+            if length is not None and (not _number(length) or not 1 <= length <= MAX_ABS_COORDINATE_MM):
+                raise ValueError("Неверная длина полотна для автораскладки.")
+            settings["nesting"]["lengthMm"] = length
         if "widthExplicit" in nesting:
             width_explicit = nesting.get("widthExplicit")
             if type(width_explicit) is not bool:
@@ -136,11 +146,20 @@ def drawing_paths(paths):
                     or not _number(point[0]) or not _number(point[1])):
                 raise ValueError("Неверные координаты контура рабочей области.")
         clean_path = {"points": points, "layer": layer, "closed": closed}
+        if "notch" in path:
+            if type(path["notch"]) is not bool:
+                raise ValueError("Неверный признак насечки рабочей области.")
+            clean_path["notch"] = path["notch"]
         part_number = path.get("partNumber")
         if "partNumber" in path:
             if not _revision(part_number) or part_number == 0:
                 raise ValueError("Неверный номер детали рабочей области.")
             clean_path["partNumber"] = part_number
+        if "partAngle" in path:
+            angle = path["partAngle"]
+            if type(angle) not in (int, float) or not 0 <= angle < 360:
+                raise ValueError("Неверный угол детали рабочей области.")
+            clean_path["partAngle"] = angle
         if "partRotation" in path:
             rotation = path["partRotation"]
             if part_number is None or rotation not in ("none", "any", "quarter"):
@@ -193,10 +212,24 @@ def replace_file(path, contents):
 
 
 class WorkspaceStore:
-    def __init__(self, path):
+    def __init__(self, path, *, shared=False):
         self.path = Path(path)
         self.backup = self.path.with_suffix(self.path.suffix + ".bak")
         self.lock = Lock()
+        self.shared = shared
+
+    @contextmanager
+    def _locked(self):
+        with self.lock:
+            if not self.shared:
+                yield
+                return
+            import fcntl
+
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.with_suffix(self.path.suffix + ".lock").open("a+b") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                yield
 
     def _current(self):
         primary_error = None
@@ -219,7 +252,7 @@ class WorkspaceStore:
         return 0, None, None, False
 
     def read(self):
-        with self.lock:
+        with self._locked():
             revision, workspace, _, recovered = self._current()
         return {"revision": revision, "workspace": workspace, "recovered": recovered}
 
@@ -227,7 +260,7 @@ class WorkspaceStore:
         if not _revision(expected_revision):
             raise ValueError("Неверная редакция рабочей области.")
         workspace = _workspace(workspace)
-        with self.lock:
+        with self._locked():
             revision, _, previous, _ = self._current()
             if revision != expected_revision:
                 raise WorkspaceConflict("Рабочая область изменилась в другой вкладке. Обновите страницу.")

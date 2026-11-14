@@ -4,7 +4,6 @@ const $ = (id) => document.getElementById(id);
 const svg = $("drawing-svg");
 const svgNamespace = "http://www.w3.org/2000/svg";
 const formatNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
-const formatCoordinate = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 const formatFeedDistance = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 3 });
 const controllerDirections = {
   xMinus: { axis: "x", direction: -1 }, xPlus: { axis: "x", direction: 1 },
@@ -17,17 +16,36 @@ const runLabels = {
   feeding: "Протяжка", unknown: "Сверьте пульт", error: "Ошибка",
 };
 const activeRunStates = new Set(["starting", "running", "pausing", "paused", "resuming", "cancelling", "feeding", "unknown", "error"]);
-const clockFormat = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const holdButtons = Array.from(document.querySelectorAll("[data-controller-hold]"));
 const operationButtons = Array.from(document.querySelectorAll("[data-operation]"));
 const placementFields = ["offset-x", "offset-y", "rotation", "size-width", "size-height"];
 const DEFAULT_FABRIC_WIDTH_MM = 1380;
+const MIN_RULER_STEP_MM = 5;
+const RULER_SPACING_PX = 88;
+const CLOSE_ZOOM_SPACING_PX = 60;
+const ROTATION_SNAP_STEP = 45;
+const MEASUREMENT_SNAP_PX = 14;
+const MEASUREMENT_AXIS_THRESHOLD_PX = 5;
+const MEASUREMENT_COLORS = ["#2159bc", "#8c359a", "#a94b0e", "#007881", "#b1264f"];
 const sectionColors = ["#373737", "#5a5a5a", "#444444", "#686868"];
 const trackedHeadStates = new Set(["ready", "starting", "running", "pausing", "paused", "resuming", "cancelling"]);
 const number = (value) => formatNumber.format(value);
 const included = () => placed.filter((_, index) => !excluded.has(index));
 const focused = () => document.visibilityState === "visible" && document.hasFocus();
+const demoSwitch = $("demo-switch");
+const newCutDialog = $("new-cut-dialog");
+const rollResetDialog = $("roll-reset-dialog");
 
+let demoMode = readStoredBoolean("plotter.demoMode");
+const companionAddress = "http://127.0.0.1:8767";
+const companionRoutes = new Set(["/api/status", "/api/cut-plan", "/api/controller-live", "/api/control-session",
+  "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset"]);
+let centralMode = false;
+let companionConnected = false;
+let companionConnecting = false;
+let demoAvailable = false;
+let switchingMachineMode = false;
+let machineModeEpoch = 0;
 let machine = { ip: "—", width: 2500, height: 1650 };
 let nestingBackend = "checking";
 let live = { responded: false, busy: false, hold: {}, operations: {}, position: null };
@@ -53,6 +71,7 @@ let uploadUncertain = false;
 let currentUpload = null;
 const uploadConfirmDialog = $("upload-confirm-dialog");
 let uploadConfirmation = null;
+let rollResetIntent = null;
 let transferChecklistPlanId = null;
 let activeRun = null;
 let controllerRoll = null;
@@ -71,7 +90,6 @@ let headSample = null;
 let headStaleTimer;
 let trackedRun = readTrackedRun();
 const runStatistics = new CutStatistics($("run-statistics"), formatDuration, number);
-let lastPositionAt = null;
 
 let source = null;
 let placed = [];
@@ -83,26 +101,41 @@ let menuPartNumber = null;
 let includedBounds = null;
 let selection = new Set();
 let selectedBounds = null;
-let selectionAngle = 0;
 let excluded = new Set();
 const drawingUndo = [];
+const drawingRedo = [];
 let routeApplied = true;
 let contourRepair = null;
+let contourRepairProposal = null;
+const contourCheckDialog = $("contour-check-dialog");
 let nestingSettings = null;
 let nestRequest = null;
 let nestBlocking = [];
 let jobError = "";
 let isLoading = false;
 let toastTimer;
-let gridVisible = true;
-let panMode = false;
+let measureMode = false;
+let measurement = null;
+let savedMeasurements = new Map();
+const measurementUndo = [];
+const measurementRedo = [];
+let measurementCloseHistory = null;
+let measurePointer = null;
+let measurementFrame = null;
+let measurementHover = null;
+let measurementCursor = null;
 let drag = null;
 let freeRotation = null;
+let renderedPaths = [];
+const notchMarkers = new Map();
+const partLabels = new Map();
 let fileDragDepth = 0;
 // The camera uses SVG coordinates. From the operator's end, X goes up and Y goes left.
 let baseCamera = null;
 let camera = null;
 let cameraMode = "work";
+let cameraFrame = null;
+let cameraViewport = null;
 let workspaceRevision = null;
 let restoringWorkspace = true;
 let workspaceChange = 0;
@@ -110,11 +143,14 @@ let workspaceSaved = 0;
 let saveTimer;
 let savePromise = null;
 let cutPlan = null;
+let pendingCanvasPlan = null;
 let cutPlanError = "";
 let cutPlanEpoch = 0;
 let cutPlanTimer;
 let cutPlanRequest = null;
+let keepViewForPlan = false;
 let warningIndices = new Set();
+let placementConflicts = new Set();
 let sectionByPath = new Map();
 let xiaoHandoff = null;
 let xiaoResult = null;
@@ -128,8 +164,8 @@ const simulation = new CutSimulation({
   onChange: () => { updateCanvasSection(); renderHead(); renderCutProgress(); renderControls(); },
   onProgress: renderCanvasStatus,
 });
-let clampLowered = readStoredBoolean("plotter.clampLowered");
-let vacuumEnabled = readStoredBoolean("plotter.vacuumEnabled");
+let clampLowered = readStoredBoolean(machineStorageKey("clampLowered"));
+let vacuumEnabled = readStoredBoolean(machineStorageKey("vacuumEnabled"));
 let stopNeedsVerification = false;
 
 function formatDuration(seconds) {
@@ -142,7 +178,7 @@ function formatDuration(seconds) {
 
 function readTrackedRun() {
   try {
-    return JSON.parse(sessionStorage.getItem("plotter.runStatistics"));
+    return JSON.parse(sessionStorage.getItem(machineStorageKey("runStatistics")));
   } catch {
     return null;
   }
@@ -229,10 +265,24 @@ function messageFrom(error) {
   return error.message || "Не удалось выполнить действие.";
 }
 
-async function checkedFetch(url, options = {}) {
+function updateText(node, value) {
+  if (node.textContent !== value) node.textContent = value;
+}
+
+function updateAttribute(node, name, value) {
+  if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+}
+
+function updateControl(node, property, value) {
+  if (node[property] !== value) node[property] = value;
+}
+
+async function checkedFetch(url, options = {}, useCompanion = companionRoutes.has(url)) {
   let response;
   try {
-    response = await fetch(url, { cache: "no-store", ...options });
+    const path = demoMode && url.startsWith("/api/") ? "/demo" + url : url;
+    response = !demoMode && centralMode && companionConnected && useCompanion
+      ? await companionFetch(url, options) : await fetch(path, { cache: "no-store", ...options });
   } catch (error) {
     if (error instanceof TypeError) throw new Error("Локальный сервер недоступен. Проверьте, что он запущен.");
     throw error;
@@ -244,6 +294,42 @@ async function checkedFetch(url, options = {}) {
   failure.status = response.status;
   failure.details = details;
   throw failure;
+}
+
+function companionFetch(path, options = {}) {
+  const headers = new Headers(options.headers);
+  if (options.method === "POST") headers.set("X-Plotter-Companion", "1");
+  return fetch(companionAddress + path, { cache: "no-store", credentials: "omit", redirect: "error",
+    targetAddressSpace: "loopback", ...options, headers });
+}
+
+async function connectCompanion() {
+  if (!centralMode || demoMode || companionConnected || companionConnecting || busy()) return;
+  companionConnecting = true;
+  const modeEpoch = machineModeEpoch;
+  renderControls();
+  try {
+    const response = await companionFetch("/api/status", { signal: AbortSignal.timeout(3500) });
+    if (!response.ok) throw new Error();
+    const status = await response.json();
+    if (modeEpoch !== machineModeEpoch || demoMode) return;
+    if (!status.companionMode || status.companionProtocol !== 1) throw new Error();
+    if (status.machine.width !== machine.width || status.machine.height !== machine.height) {
+      setMachineError("Размер рабочего поля в профиле помощника отличается от общей настройки.");
+      return;
+    }
+    companionConnected = true;
+    setMachineError();
+    if (!await readConfiguration()) throw new Error();
+    try { sessionStorage.setItem("plotter.companion", "true"); } catch { /* Storage is optional. */ }
+    scheduleLiveRead(0);
+  } catch {
+    companionConnected = false;
+    if (modeEpoch === machineModeEpoch) setMachineError("Нет связи с помощником. Проверьте, что он запущен и браузеру разрешён локальный доступ.");
+  } finally {
+    companionConnecting = false;
+    renderControls();
+  }
 }
 
 async function getJson(url, options) {
@@ -288,6 +374,15 @@ function colorCutSection(node, section) {
   return node;
 }
 
+function gridSpacing(units) {
+  const minimum = Math.max(2 * MIN_RULER_STEP_MM, units * RULER_SPACING_PX);
+  const decade = 10 ** Math.floor(Math.log10(minimum));
+  const multiplier = [1, 2, 2.5, 5].find((value) => value * decade >= minimum) ?? 10;
+  const major = multiplier * decade;
+  const minor = Math.max(MIN_RULER_STEP_MM, major / (multiplier === 2 ? 4 : 5));
+  return { major, minor };
+}
+
 function renderTable() {
   if (!camera) return;
   const { width, height } = machine;
@@ -296,12 +391,46 @@ function renderTable() {
   const units = camera.width / Math.max(svg.clientWidth, 1);
   const surface = svgBox({ minX: 0, minY: 0, maxX: length, maxY: height });
   const parts = [element("rect", { ...surface, class: "table-background" })];
-  const materialWidth = cutPlan?.material?.widthMm ?? nestingSettings?.widthMm;
+  const materialWidth = nestingSettings?.widthMm ?? height;
   const fabric = includedBounds && materialWidth > 0 ? Math.min(materialWidth, height) : 0;
   if (fabric) {
     parts.push(element("rect", { x: -fabric, y: -length, width: fabric, height: length, class: "material-surface" }));
   }
-  if (gridVisible) parts.push(element("rect", { ...surface, fill: "url(#major-grid)" }));
+  const { major, minor } = gridSpacing(units);
+  const firstX = Math.max(0, -camera.y - camera.height);
+  const lastX = Math.min(length, -camera.y);
+  const firstY = Math.max(0, -camera.x - camera.width);
+  const lastY = Math.min(height, -camera.x);
+  const verticalRuler = Math.min(0, Math.max(camera.x + 3 * units, camera.x + camera.width - 76 * units));
+  const horizontalRuler = Math.min(0, camera.y + camera.height - 25 * units);
+  const grid = [[], []];
+  const ticks = [[], []];
+  const labels = [];
+  if (firstX <= lastX && firstY <= lastY) {
+    if (verticalRuler < 0) ticks[1].push(`M${verticalRuler} ${-lastX}V${Math.min(-firstX, horizontalRuler)}`);
+    if (horizontalRuler < 0) ticks[1].push(`M${-lastY} ${horizontalRuler}H${Math.min(-firstY, verticalRuler)}`);
+    const step = minor;
+    for (let y = Math.ceil(firstY / step) * step; y <= lastY; y += step) {
+      const main = y % major === 0;
+      const level = Number(main);
+      grid[level].push(`M${-y} ${-lastX}V${-firstX}`);
+      if (verticalRuler < 0 && -y > verticalRuler - 8 * units) continue;
+      ticks[level].push(`M${-y} ${horizontalRuler}v${(main ? 7 : 3) * units}`);
+      if (main && -y >= camera.x + 16 * units) labels.push(rulerText(number(y), -y, horizontalRuler + 21 * units, 12 * units));
+    }
+    for (let x = Math.max(step, Math.ceil(firstX / step) * step); x <= lastX; x += step) {
+      const main = x % major === 0;
+      const level = Number(main);
+      grid[level].push(`M${-lastY} ${-x}H${-firstY}`);
+      if (-x > horizontalRuler - 8 * units) continue;
+      ticks[level].push(`M${verticalRuler} ${-x}h${(main ? 7 : 3) * units}`);
+      if (main && -x >= camera.y + 9 * units) labels.push(rulerText(number(x), verticalRuler + 11 * units, -x + 4 * units, 12 * units, "start"));
+    }
+  }
+  for (const [index, lines] of grid.entries()) {
+    if (lines.length) parts.push(element("path", { d: lines.join(" "), class: index ? "major-line" : "minor-line",
+      fill: "none", "vector-effect": "non-scaling-stroke" }));
+  }
   parts.push(element("rect", { ...surface, class: "table-border", "vector-effect": "non-scaling-stroke" }));
   if (fabric) {
     parts.push(element("path", {
@@ -309,35 +438,30 @@ function renderTable() {
     }));
   }
 
-  const step = [100, 250, 500, 1000, 2000, 5000, 10000, 25000].find((mm) => mm >= units * 54) ?? 50000;
-  const stroke = { class: "ruler-tick", "vector-effect": "non-scaling-stroke" };
-  for (let y = 0; y <= height; y += step) {
-    parts.push(element("path", { d: `M${-y} 0v${5 * units}`, ...stroke }));
-    parts.push(rulerText(number(y), -y, 22 * units, 12 * units));
-  }
-  const firstX = Math.max(step, Math.ceil((-camera.y - camera.height) / step) * step);
-  for (let x = firstX; x <= Math.min(length, -camera.y); x += step) {
-    parts.push(element("path", { d: `M0 ${-x}h${5 * units}`, ...stroke }));
-    parts.push(rulerText(number(x), 10 * units, -x + 4 * units, 12 * units, "start"));
-  }
+  const rulers = [];
+  for (const [index, lines] of ticks.entries()) if (lines.length) rulers.push(element("path", {
+    d: lines.join(" "), class: index ? "ruler-tick" : "ruler-tick minor", fill: "none", "vector-effect": "non-scaling-stroke",
+  }));
+  rulers.push(...labels);
   const axis = 25 * units;
   const tip = 3 * units;
   const axisPath = `M0 ${-axis}V0H${-axis} M${-tip} ${tip - axis}l${tip} ${-tip} ${tip} ${tip} M${tip - axis} ${-tip}l${-tip} ${tip} ${tip} ${tip}`;
-  parts.push(element("path", { d: axisPath, class: "axis-mark", "vector-effect": "non-scaling-stroke" }));
-  parts.push(rulerText("Y", -axis - 7 * units, 3 * units, 11 * units, "end", "axis-label"));
-  parts.push(rulerText("X", 0, -axis - 5 * units, 11 * units, "middle", "axis-label"));
+  rulers.push(element("path", { d: axisPath, class: "axis-mark", "vector-effect": "non-scaling-stroke" }));
+  rulers.push(rulerText("Y", -axis - 7 * units, 3 * units, 11 * units, "end", "axis-label"));
+  rulers.push(rulerText("X", 0, -axis - 5 * units, 11 * units, "middle", "axis-label"));
   layer.replaceChildren(...parts);
+  $("ruler-layer").replaceChildren(...rulers);
 }
 
-function canvasSection() {
-  if (cutPlan?.mode !== "roll") return null;
+function canvasSection(plan = cutPlan) {
+  if (plan?.mode !== "roll") return null;
   const tracked = trackedCanvasRun();
-  const matching = tracked?.planId === cutPlan.planId && !["completed", "cancelled", "error"].includes(tracked.state);
+  const matching = tracked?.planId === plan.planId && !["completed", "cancelled", "error"].includes(tracked.state);
   const waiting = matching && tracked.state === "advance";
   const kind = simulation.active ? "simulation" : waiting ? "next" : matching ? "current" : "preview";
   const number = simulation.active ? simulation.visiblePage
     : waiting ? tracked.page + 1 : matching ? tracked.page : previewCutPage ?? shownCutPage ?? 1;
-  const page = cutPlan.pages[number - 1] ?? cutPlan.pages[0];
+  const page = plan.pages[number - 1] ?? plan.pages[0];
   return page ? { page, kind } : null;
 }
 
@@ -347,23 +471,25 @@ function trackedCanvasRun() {
 }
 
 function updateCanvasSection() {
-  const section = canvasSection();
+  const plan = cutPlan ?? pendingCanvasPlan;
+  const section = canvasSection(plan);
   const tools = $("canvas-section-tools");
-  tools.hidden = !section;
+  updateControl(tools, "hidden", !section);
   if (section) {
     const page = section.page;
-    $("section-focus").textContent = `Проход ${page.number} из ${cutPlan.pages.length}`;
-    const locked = section.kind === "current" || section.kind === "next";
-    $("section-prev").disabled = locked || page.number === 1;
-    $("section-next").disabled = locked || page.number === cutPlan.pages.length;
+    updateText($("section-focus"), `Проход ${page.number} из ${plan.pages.length}`);
+    updateControl($("section-focus"), "disabled", !cutPlan);
+    const locked = !cutPlan || section.kind === "current" || section.kind === "next";
+    updateControl($("section-prev"), "disabled", locked || page.number === 1);
+    updateControl($("section-next"), "disabled", locked || page.number === plan.pages.length);
   }
-  const pageKey = section ? `${cutPlan.planId}/${section.page.number}` : "";
-  const paintKey = section ? `${pageKey}/${section.kind}` : "";
+  const pageKey = section ? `${plan.planId}/${section.page.number}` : "";
+  const paintKey = section ? `${pageKey}/${section.kind}/${Boolean(cutPlan)}` : "";
   if (paintKey === paintedSectionKey) return;
   paintedSectionKey = paintKey;
   if (pageKey !== followedSectionKey) {
     followedSectionKey = pageKey;
-    if (cameraMode === "work" && !drag) {
+    if (cameraMode === "work" && !drag && !keepViewForPlan) {
       resizeCamera();
       return;
     }
@@ -395,10 +521,48 @@ function openCanvasSection(page) {
   return true;
 }
 
+function renderSeamMarkers(plan, selected, units, elements, tags) {
+  const pages = plan.pages;
+  const seamsByBoundary = new Map();
+  for (const seam of plan.seams || []) {
+    if (!seamsByBoundary.has(seam.x)) seamsByBoundary.set(seam.x, []);
+    seamsByBoundary.get(seam.x).push(seam);
+  }
+  const boundaries = pages.slice(1).flatMap((page, index) => {
+    const seams = page.incomingSeams ?? seamsByBoundary.get(page.startX) ?? [];
+    const previous = pages[index];
+    const y = -page.startX;
+    return (seams.length || page.canStart === false) && y >= camera.y && y <= camera.y + camera.height
+      ? [{ previous, page, seams, y, active: selected === previous || selected === page }] : [];
+  });
+  if (!boundaries.length) return;
+  boundaries.sort((a, b) => b.active - a.active);
+  const left = -Math.max(machine.height, includedBounds?.maxY ?? 0);
+  const right = -Math.min(0, includedBounds?.minY ?? 0);
+  for (const { previous, page, seams, y, active } of boundaries) {
+    const activeClass = active ? " is-active" : "";
+    const description = `Граница проходов ${previous.number} и ${page.number}. Раскрой детали продолжается на следующем проходе.`;
+    const marker = element("g", { class: "page-seam-group" + activeClass, role: "img", "aria-label": description });
+    const title = element("title");
+    title.textContent = description;
+    marker.append(title);
+    elements.push(element("path", {
+      d: `M${left} ${y}H${right}`, class: "page-seam-line" + activeClass, "vector-effect": "non-scaling-stroke",
+    }));
+    const points = [...new Set(seams.map(({ y: across }) => -across))]
+      .filter((x) => x >= camera.x - 10 * units && x <= camera.x + camera.width + 10 * units);
+    for (const [kind, radius] of [["halo", 10], ["dot", 7.5], ["core", 2.5]]) {
+      for (const x of points) marker.append(element("circle", { cx: x, cy: y, r: radius * units, class: "page-seam-" + kind }));
+    }
+    tags.push(marker);
+  }
+}
+
 function renderPages() {
   const layer = $("page-layer");
   const annotations = $("page-annotation-layer");
-  if (!camera || cutPlan?.mode !== "roll") {
+  const plan = cutPlan ?? pendingCanvasPlan;
+  if (!camera || plan?.mode !== "roll") {
     layer.replaceChildren();
     annotations.replaceChildren();
     return;
@@ -406,9 +570,9 @@ function renderPages() {
   const units = camera.width / Math.max(svg.clientWidth, 1);
   const elements = [];
   const tags = [];
-  const section = canvasSection();
+  const section = canvasSection(plan);
   const selected = section?.page;
-  const width = Math.min(cutPlan.material?.widthMm ?? machine.height, machine.height);
+  const width = Math.min(plan.material?.widthMm ?? machine.height, machine.height);
   if (selected) {
     const highlight = element("rect", {
       x: -width, y: -selected.endX, width, height: selected.endX - selected.startX,
@@ -423,7 +587,7 @@ function renderPages() {
   const visibleTop = camera.y + 20 * units;
   const visibleBottom = camera.y + camera.height - 20 * units;
   const viewingLocked = section?.kind === "current" || section?.kind === "next";
-  for (const page of cutPlan.pages) {
+  for (const page of plan.pages) {
     if (-page.startX < camera.y || -page.endX > camera.y + camera.height) continue;
     if (page.number > 1) {
       elements.push(element("path", {
@@ -447,7 +611,7 @@ function renderPages() {
     const tag = element("g", {
       class: `page-tag${page === selected ? " is-active" : ""}`,
       transform: `translate(${tagX} ${y - tagHeight * units / 2}) scale(${units})`,
-      ...(!viewingLocked || page === selected ? {
+      ...(cutPlan && (!viewingLocked || page === selected) ? {
         role: "button", tabindex: 0, "data-canvas-page": page.number,
         "aria-label": `Открыть проход ${page.number}, ${length}`,
       } : {}),
@@ -459,17 +623,7 @@ function renderPages() {
     );
     tags.push(colorCutSection(tag, page.number));
   }
-  const dots = [];
-  const activeDots = [];
-  for (const seam of cutPlan.seams) {
-    const [x, y] = projectPoint(seam.x, seam.y);
-    if (x < camera.x || x > camera.x + camera.width || y < camera.y || y > camera.y + camera.height) continue;
-    const active = selected && Math.abs(seam.x - selected.startX) < 1e-6;
-    const radius = (active ? 5.5 : 4) * units;
-    (active ? activeDots : dots).push(`M${x - radius} ${y}a${radius} ${radius} 0 1 0 ${2 * radius} 0a${radius} ${radius} 0 1 0 ${-2 * radius} 0`);
-  }
-  if (dots.length) elements.push(element("path", { d: dots.join(""), class: "page-seam", "vector-effect": "non-scaling-stroke" }));
-  if (activeDots.length) elements.push(element("path", { d: activeDots.join(""), class: "page-seam is-active", "vector-effect": "non-scaling-stroke" }));
+  renderSeamMarkers(plan, selected, units, elements, tags);
   layer.replaceChildren(...elements);
   annotations.replaceChildren(...tags);
 }
@@ -529,27 +683,43 @@ function renderHead(now = performance.now()) {
   if (!hidden) {
     const [x, y] = headSample.point;
     const units = camera.width / Math.max(svg.clientWidth, 1);
-    headMarker.setAttribute("transform", `translate(${x} ${y}) scale(${units})`);
+    updateAttribute(headMarker, "transform", `translate(${x} ${y}) scale(${units})`);
     headStaleTimer = setTimeout(renderHead, Math.max(1, (stale ? visibleFor : freshFor) - age));
   }
 }
 
 function drawCamera() {
+  if (cameraFrame !== null) {
+    cancelAnimationFrame(cameraFrame);
+    cameraFrame = null;
+  }
   if (!camera) return;
-  svg.setAttribute("viewBox", `${camera.x} ${camera.y} ${camera.width} ${camera.height}`);
-  $("zoom-reset").textContent = `${Math.round(baseCamera.width / camera.width * 100)}%`;
+  updateAttribute(svg, "viewBox", `${camera.x} ${camera.y} ${camera.width} ${camera.height}`);
   renderTable();
   renderPages();
   renderHead();
   renderPartLabels();
   renderFreeRotation();
+  renderManualGuides();
+  renderMeasurement(true);
   simulation.render();
 }
 
-function newCamera(content, controlGutter) {
+function scheduleCameraDraw() {
+  if (cameraFrame !== null) return;
+  cameraFrame = requestAnimationFrame(() => {
+    cameraFrame = null;
+    drawCamera();
+  });
+}
+
+function newCamera(content, overlayInsets) {
   const { clientWidth: viewWidth, clientHeight: viewHeight } = svg;
-  const left = Math.min(120, viewWidth * .32);
-  const right = Math.max(Math.min(80, viewWidth * .32), controlGutter);
+  const leftInset = Math.max(Math.min(120, viewWidth * .32), overlayInsets.left);
+  const rightInset = Math.max(Math.min(80, viewWidth * .32), overlayInsets.right);
+  const insetScale = Math.min(1, viewWidth * .65 / (leftInset + rightInset));
+  const left = leftInset * insetScale;
+  const right = rightInset * insetScale;
   const top = Math.min(32, viewHeight * .22);
   const bottom = Math.min(34, viewHeight * .2);
   const units = Math.max(content.width / (viewWidth - left - right),
@@ -563,21 +733,43 @@ function newCamera(content, controlGutter) {
   };
 }
 
-function resizeCamera() {
+function overlayWidth(id) {
+  const panel = $(id);
+  return panel && getComputedStyle(panel).position === "absolute" ? panel.offsetWidth + 28 : 0;
+}
+
+function resizeCamera({ keepView = false } = {}) {
   if (!svg.clientWidth || !svg.clientHeight) return;
-  const controls = $("canvas-controls");
-  const controlGutter = getComputedStyle(controls).position === "absolute" ? controls.offsetWidth + 28 : 0;
+  const { clientWidth: width, clientHeight: height } = svg;
+  const oldViewport = cameraViewport;
+  cameraViewport = { width, height };
+  const overlayInsets = {
+    left: overlayWidth("launch-controls"),
+    right: overlayWidth("canvas-controls"),
+  };
   const content = {
     minX: Math.min(0, includedBounds?.minX || 0), minY: Math.min(0, includedBounds?.minY || 0),
     maxX: Math.max(machine.width, includedBounds?.maxX || 0), maxY: Math.max(machine.height, includedBounds?.maxY || 0),
   };
   const previousBase = baseCamera;
-  baseCamera = newCamera(svgBox(content), controlGutter);
+  if (keepView && camera) {
+    if (oldViewport && (oldViewport.width !== width || oldViewport.height !== height)) {
+      const units = camera.width / oldViewport.width;
+      const newWidth = width * units, newHeight = height * units;
+      camera = { x: camera.x + (camera.width - newWidth) / 2, y: camera.y + (camera.height - newHeight) / 2,
+        width: newWidth, height: newHeight };
+      const baseUnits = baseCamera.width / oldViewport.width;
+      baseCamera = { ...baseCamera, width: width * baseUnits, height: height * baseUnits };
+    }
+    drawCamera();
+    return;
+  }
+  baseCamera = newCamera(svgBox(content), overlayInsets);
   if (cameraMode === "work") {
     const page = canvasSection()?.page;
     const start = page?.startX ?? content.minX;
     const end = page?.endX ?? machine.width;
-    camera = newCamera(svgBox({ ...content, minX: start, maxX: end }), controlGutter);
+    camera = newCamera(svgBox({ ...content, minX: start, maxX: end }), overlayInsets);
   } else if (cameraMode === "overview" || !camera) {
     camera = { ...baseCamera };
   } else {
@@ -604,20 +796,25 @@ function hasRollLayout() {
   return cutPlan?.mode === "roll" || includedBounds?.maxX > machine.width;
 }
 
-function zoom(factor, px = 0.5, py = 0.5) {
-  if (!camera) return;
-  const scale = Math.max(0.04, Math.min(hasRollLayout() ? 1 : 2.4, (camera.width / baseCamera.width) / factor));
-  if (hasRollLayout() && scale === 1 && factor < 1) {
-    fitCamera("overview");
+function zoom(factor, px = 0.5, py = 0.5, deferPaint = false) {
+  if (!camera || !svg.clientWidth) return;
+  const roll = hasRollLayout();
+  const fineScale = MIN_RULER_STEP_MM * svg.clientWidth / (CLOSE_ZOOM_SPACING_PX * baseCamera.width);
+  const minimumScale = Math.min(0.04, fineScale);
+  const scale = Math.max(minimumScale, Math.min(roll ? 1 : 2.4, (camera.width / baseCamera.width) / factor));
+  if (roll && scale === 1 && factor < 1) {
+    if (cameraMode !== "overview") fitCamera("overview");
     return;
   }
   const width = baseCamera.width * scale;
   const height = baseCamera.height * scale;
+  if (Math.abs(width - camera.width) < 1e-9) return;
   cameraMode = "manual";
   camera = {
     x: camera.x + (camera.width - width) * px, y: camera.y + (camera.height - height) * py, width, height,
   };
-  drawCamera();
+  if (deferPaint) scheduleCameraDraw();
+  else drawCamera();
   scheduleWorkspaceSave();
 }
 
@@ -631,15 +828,364 @@ function drawingPoint(event) {
   return projectPoint(camera.x + px * camera.width, camera.y + py * camera.height);
 }
 
-function setTool(isPan) {
+function setMeasureMode(enabled, closeHistory = null) {
+  if (enabled && (!placed.length || drawingLocked())) return;
   cancelCanvasGesture();
   endFreeRotation();
-  panMode = isPan;
-  svg.classList.toggle("pan", isPan);
-  for (const [id, active] of [["select-tool", !isPan], ["pan-tool", isPan]]) {
+  closePartMenu();
+  measureMode = enabled;
+  measurementCloseHistory = closeHistory;
+  clearMeasurement();
+  svg.classList.toggle("measuring", enabled);
+  for (const [id, active] of [["select-tool", !enabled], ["measure-tool", enabled]]) {
     $(id).setAttribute("aria-pressed", String(active));
     $(id).classList.toggle("selected", active);
   }
+  renderMeasurement();
+  renderHistoryControls();
+}
+
+function dismissMeasurement() {
+  setMeasureMode(false, savedMeasurements.size ? "closed" : null);
+  svg.focus({ preventScroll: true });
+}
+
+function clearMeasurement() {
+  const pointer = measurePointer;
+  measurePointer = null;
+  measurement = null;
+  measurementHover = null;
+  measurementCursor = null;
+  if (pointer && svg.hasPointerCapture(pointer.id)) svg.releasePointerCapture(pointer.id);
+  if (measurementFrame !== null) {
+    cancelAnimationFrame(measurementFrame);
+    measurementFrame = null;
+  }
+}
+
+function clearSavedMeasurements() {
+  savedMeasurements.clear();
+  measurementUndo.length = 0;
+  measurementRedo.length = 0;
+  measurementCloseHistory = null;
+  clearMeasurement();
+  renderMeasurementList();
+}
+
+function rememberMeasurements(label) {
+  measurementUndo.push({ items: new Map(savedMeasurements), label });
+  if (measurementUndo.length > 10) measurementUndo.shift();
+  measurementRedo.length = 0;
+  measurementCloseHistory = null;
+}
+
+function hasMeasurementCloseStep(redo) {
+  return measurementCloseHistory === (redo ? "reopened" : "closed");
+}
+
+function stepEditHistory(redo = false) {
+  if (drawingLocked()) return;
+  if (hasMeasurementCloseStep(redo)) {
+    setMeasureMode(!redo, redo ? "closed" : "reopened");
+    svg.focus({ preventScroll: true });
+    return;
+  }
+  if (!measureMode) return stepDrawingHistory(redo);
+  const from = redo ? measurementRedo : measurementUndo;
+  const to = redo ? measurementUndo : measurementRedo;
+  if (!from.length) return;
+  measurementCloseHistory = null;
+  const { items, label } = from.pop();
+  to.push({ items: savedMeasurements, label });
+  savedMeasurements = items;
+  clearMeasurement();
+  renderMeasurementList();
+  updateText($("measurement-announcement"), redo ? `Повторено: ${label}.` : `Отменено: ${label}.`);
+  svg.focus({ preventScroll: true });
+}
+
+function findMeasurementPoint(point, paths, pathBoxes, tolerance) {
+  const [x, y] = point;
+  if (!Number.isFinite(tolerance) || tolerance < 0) return { point: [x, y], snapped: false };
+  let bestPoint = null;
+  let bestDistance = tolerance * tolerance;
+  let bestIsVertex = false;
+  let bestIsNotch = false;
+  let bestEdge = null;
+
+  for (let index = 0; index < paths.length; index++) {
+    const { points, closed, notch } = paths[index];
+    if (points.length < 2) continue;
+    const box = pathBoxes?.[index];
+    if (box) {
+      const dx = Math.max(box.minX - x, x - box.maxX, 0);
+      const dy = Math.max(box.minY - y, y - box.maxY, 0);
+      if (dx * dx + dy * dy > bestDistance) continue;
+    }
+
+    for (let i = closed ? 0 : 1; i < points.length; i++) {
+      const [ax, ay] = points.at(i - 1);
+      const [bx, by] = points[i];
+      const dx = bx - ax, dy = by - ay;
+      const span = dx * dx + dy * dy;
+      const along = span ? ((x - ax) * dx + (y - ay) * dy) / span : 0;
+      const at = Math.max(0, Math.min(1, along));
+      const sx = at === 1 ? bx : ax + dx * at;
+      const sy = at === 1 ? by : ay + dy * at;
+      const distance = (x - sx) ** 2 + (y - sy) ** 2;
+      const isVertex = at === 0 || at === 1;
+      if (distance < bestDistance || (distance === bestDistance && (!bestPoint || notch && !bestIsNotch
+          || Boolean(notch) === bestIsNotch && isVertex && !bestIsVertex))) {
+        bestPoint = [sx, sy];
+        bestDistance = distance;
+        bestIsVertex = isVertex;
+        bestIsNotch = Boolean(notch);
+        bestEdge = [points.at(i - 1), points[i]];
+      }
+    }
+  }
+  return bestPoint ? { point: bestPoint, snapped: true, notch: bestIsNotch, edge: bestEdge } : { point, snapped: false };
+}
+
+function measurementPoint(event, draft = null) {
+  const raw = drawingPoint(event);
+  const units = camera.width / svg.clientWidth;
+  const match = event.altKey ? { point: raw, snapped: false }
+    : findMeasurementPoint(raw, placed, pathBoxes, MEASUREMENT_SNAP_PX * units);
+  if (!draft) return match;
+  if (!event.shiftKey) {
+    draft.lockedCoordinate = null;
+    return match;
+  }
+  const anchor = draft.start.point;
+  const dx = Math.abs(raw[0] - anchor[0]), dy = Math.abs(raw[1] - anchor[1]);
+  if (draft.lockedCoordinate === null && Math.hypot(dx, dy) >= MEASUREMENT_AXIS_THRESHOLD_PX * units) {
+    draft.lockedCoordinate = dx >= dy ? 1 : 0;
+  }
+  const axis = draft.lockedCoordinate ?? (dx >= dy ? 1 : 0);
+  const point = [...match.point];
+  point[axis] = anchor[axis];
+  return match.snapped && Math.abs(match.point[axis] - point[axis]) > 1e-6
+    ? { ...match, point, target: match.point } : { ...match, point };
+}
+
+function startMeasurement(event) {
+  if (measurePointer || savedMeasurements.size >= MEASUREMENT_COLORS.length) return;
+  if (measurementFrame !== null) {
+    cancelAnimationFrame(measurementFrame);
+    measurementFrame = null;
+  }
+  measurementHover = null;
+  measurementCursor = event;
+  const second = Boolean(measurement);
+  if (!second) {
+    const color = MEASUREMENT_COLORS.findIndex((_, index) => !savedMeasurements.has(index));
+    measurement = { start: measurementPoint(event), end: null, color, lockedCoordinate: null };
+  } else measurement.end = measurementPoint(event, measurement);
+  measurePointer = { id: event.pointerId, x: event.clientX, y: event.clientY, second, moved: false };
+  svg.setPointerCapture(event.pointerId);
+  renderMeasurement();
+}
+
+function moveMeasurementPointer(event) {
+  if (savedMeasurements.size >= MEASUREMENT_COLORS.length) return;
+  if (measurePointer) {
+    if (measurePointer.id !== event.pointerId) return;
+    measurePointer.moved ||= Math.hypot(event.clientX - measurePointer.x, event.clientY - measurePointer.y) >= 4;
+    if (!measurePointer.moved && !measurePointer.second) return;
+  }
+  measurementCursor = event;
+  if (measurementFrame !== null) return;
+  measurementFrame = requestAnimationFrame(() => {
+    measurementFrame = null;
+    updateMeasurementPreview();
+  });
+}
+
+function updateMeasurementPreview() {
+  if (!measureMode || drag || !measurementCursor || savedMeasurements.size >= MEASUREMENT_COLORS.length) return;
+  measurementHover = measurementPoint(measurementCursor, measurement);
+  if (measurement) measurement.end = measurementHover;
+  renderMeasurement();
+}
+
+function updateMeasurementModifiers(event) {
+  if (!measureMode || !["Shift", "Alt"].includes(event.key)) return;
+  if (!event.shiftKey && measurement) measurement.lockedCoordinate = null;
+  if (!measurementCursor || (measurePointer && !measurePointer.second && !measurePointer.moved)) return;
+  const { clientX, clientY } = measurementCursor;
+  measurementCursor = { clientX, clientY, shiftKey: event.shiftKey, altKey: event.altKey };
+  updateMeasurementPreview();
+}
+
+function finishMeasurement(event) {
+  const pointer = measurePointer;
+  measurePointer = null;
+  if (svg.hasPointerCapture(pointer.id)) svg.releasePointerCapture(pointer.id);
+  if (measurementFrame !== null) {
+    cancelAnimationFrame(measurementFrame);
+    measurementFrame = null;
+  }
+  if (!measurement) return;
+  const completed = pointer.second || pointer.moved;
+  if (completed) {
+    measurement.end = measurementPoint(event, measurement);
+    rememberMeasurements("добавление размера");
+    savedMeasurements.set(measurement.color, measurement);
+    const description = measurementLabel(measurement);
+    clearMeasurement();
+    renderMeasurementList();
+    updateText($("measurement-announcement"), `Добавлен размер ${description}.`);
+    return;
+  }
+  measurementHover = null;
+  measurementCursor = null;
+  renderMeasurement();
+}
+
+function measurementLabel({ start, end }) {
+  const dx = end.point[0] - start.point[0], dy = end.point[1] - start.point[1];
+  return `${formatFeedDistance.format(Math.hypot(dx, dy))} мм`;
+}
+
+function renderMeasurementList() {
+  const list = $("measurement-list");
+  updateText($("measurement-count"), `${savedMeasurements.size} / ${MEASUREMENT_COLORS.length}`);
+  for (const row of [...list.children]) {
+    if (!savedMeasurements.has(Number(row.dataset.measurementId))) row.remove();
+  }
+  for (const [index, [id, item]] of [...savedMeasurements].entries()) {
+    const current = list.querySelector(`[data-measurement-id="${id}"]`);
+    if (current) {
+      if (current !== list.children[index]) list.insertBefore(current, list.children[index] ?? null);
+      continue;
+    }
+    const row = document.createElement("li");
+    row.dataset.measurementId = id;
+    row.style.setProperty("--measurement-color", MEASUREMENT_COLORS[id]);
+    const label = document.createElement("span");
+    label.className = "measurement-list-value";
+    label.textContent = measurementLabel(item);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button measurement-remove";
+    remove.dataset.removeMeasurement = id;
+    remove.setAttribute("aria-label", `Удалить размер ${id + 1}: ${label.textContent}`);
+    remove.title = "Удалить размер";
+    const icon = element("svg", { class: "icon", "aria-hidden": "true" });
+    icon.append(element("use", { href: "#i-trash" }));
+    remove.append(icon);
+    row.append(label, remove);
+    list.insertBefore(row, list.children[index] ?? null);
+  }
+  updateControl(list, "hidden", savedMeasurements.size === 0);
+  updateControl($("measurement-clear-all"), "hidden", savedMeasurements.size === 0);
+  renderMeasurement(true);
+  renderHistoryControls();
+}
+
+function removeMeasurement(button) {
+  const id = Number(button.dataset.removeMeasurement);
+  const item = savedMeasurements.get(id);
+  if (!item) return;
+  const row = button.closest("li");
+  const next = (row.nextElementSibling ?? row.previousElementSibling)?.querySelector("button");
+  rememberMeasurements("удаление размера");
+  savedMeasurements.delete(id);
+  renderMeasurementList();
+  updateText($("measurement-announcement"), `Удалён размер ${measurementLabel(item)}.`);
+  (next ?? svg).focus({ preventScroll: true });
+}
+
+function removeAllMeasurements() {
+  if (!measureMode || !savedMeasurements.size) return;
+  rememberMeasurements("удаление всех размеров");
+  savedMeasurements.clear();
+  clearMeasurement();
+  renderMeasurementList();
+  updateText($("measurement-announcement"), "Удалены все размеры. Чтобы вернуть их, нажмите Ctrl+Z.");
+  svg.focus({ preventScroll: true });
+}
+
+function measurementPin(x, y, { snapped, notch }, units) {
+  return element("circle", { cx: x, cy: y, r: (notch ? 5.5 : 4.5) * units,
+    class: `measurement-pin${snapped ? " is-snapped" : ""}${notch ? " is-notch" : ""}`, "vector-effect": "non-scaling-stroke" });
+}
+
+function measurementMarks(item, units, committed = false) {
+  const { start, end, color } = item;
+  const attributes = { style: `--measurement-color:${MEASUREMENT_COLORS[color]}` };
+  if (committed) attributes["data-measurement-id"] = color;
+  const group = element("g", attributes);
+  const [x1, y1] = projectPoint(...start.point);
+  if (end) {
+    const [x2, y2] = projectPoint(...end.point);
+    const dx = Math.abs(x2 - x1), dy = Math.abs(y2 - y1);
+    if (dx && dy) group.append(element("path", { d: `M${x1} ${y1}H${x2}V${y2}`,
+      class: `measurement-components${start.notch || end.notch ? " is-notch" : ""}`, "vector-effect": "non-scaling-stroke" }));
+    if (end.target) {
+      const [tx, ty] = projectPoint(...end.target);
+      group.append(element("line", { x1: x2, y1: y2, x2: tx, y2: ty,
+        class: `measurement-projection${end.notch ? " is-notch" : ""}`, "vector-effect": "non-scaling-stroke" }),
+      measurementPin(tx, ty, end, units));
+    }
+    for (const className of ["measurement-halo", "measurement-line"]) {
+      group.append(element("line", { x1, y1, x2, y2, class: className, "vector-effect": "non-scaling-stroke" }));
+    }
+    if (Math.hypot(dx, dy) > 56 * units) {
+      group.append(rulerText(measurementLabel(item), (x1 + x2) / 2 + (dx < dy ? 18 * units : 0), (y1 + y2) / 2 - 12 * units,
+        17 * units, dx < dy ? "start" : "middle", "measurement-caption"));
+    }
+    group.append(measurementPin(x2, y2, end.target ? { snapped: false } : end, units));
+  }
+  group.append(measurementPin(x1, y1, start, units));
+  return group;
+}
+
+function renderMeasurement(redrawSaved = false) {
+  const layer = $("measurement-preview");
+  updateControl($("measurement-panel"), "hidden", !measureMode);
+  $("measurement-layer").toggleAttribute("hidden", !measureMode);
+  const units = camera ? camera.width / Math.max(svg.clientWidth, 1) : 1;
+  if (redrawSaved) {
+    $("measurement-committed").replaceChildren(...[...savedMeasurements.values()].map((item) => measurementMarks(item, units, true)));
+  }
+  if (!measureMode || !camera) {
+    if (layer.firstChild) layer.replaceChildren();
+    updateText($("measurement-announcement"), "");
+    return;
+  }
+  const markers = [];
+  const { start, end } = measurement ?? {};
+  if (measurementHover?.snapped) {
+    const [x, y] = projectPoint(...(measurementHover.target ?? measurementHover.point));
+    const reach = 34 * units;
+    const [[ax, ay], [bx, by]] = measurementHover.edge.map((point) => projectPoint(...point));
+    const span = Math.hypot(bx - ax, by - ay);
+    const tone = measurementHover.notch ? " is-notch" : "";
+    if (span) {
+      const along = Math.hypot(x - ax, y - ay);
+      const from = Math.max(0, along - 20 * units) / span;
+      const to = Math.min(span, along + 20 * units) / span;
+      markers.push(element("line", { x1: ax + (bx - ax) * from, y1: ay + (by - ay) * from,
+        x2: ax + (bx - ax) * to, y2: ay + (by - ay) * to, class: `measurement-snap-edge${tone}`,
+        "vector-effect": "non-scaling-stroke" }));
+    }
+    markers.push(element("path", { d: `M${x - reach} ${y}H${x + reach} M${x} ${y - reach}V${y + reach}`,
+      class: `measurement-snap-guide${tone}`, "vector-effect": "non-scaling-stroke" }));
+    if (!measurement) markers.push(measurementPin(x, y, measurementHover, units));
+  }
+  const hint = $("measurement-hint"), distance = $("measurement-distance");
+  updateControl(hint, "hidden", Boolean(end));
+  updateControl(distance, "hidden", !end);
+  updateText(hint, start ? "Укажите вторую точку" : savedMeasurements.size >= MEASUREMENT_COLORS.length
+    ? "Удалите один размер, чтобы добавить новый" : "Укажите две точки или протяните линию");
+  if (end) {
+    updateText(distance, measurementLabel(measurement));
+    distance.style.setProperty("--measurement-color", MEASUREMENT_COLORS[measurement.color]);
+  }
+  if (start) markers.push(measurementMarks(measurement, units));
+  layer.replaceChildren(...markers);
 }
 
 function bounds(paths) {
@@ -655,11 +1201,18 @@ function bounds(paths) {
   return Number.isFinite(result.minX) ? result : null;
 }
 
-function outsideMaterial(box) {
-  if (!box) return false;
-  const epsilon = 0.000001;
-  const materialWidth = Math.min(nestingSettings?.widthMm ?? machine.height, machine.height);
-  return box.minX < -epsilon || box.minY < -epsilon || box.maxY > materialWidth + epsilon;
+function materialLimits() {
+  const margin = nestingSettings?.marginMm ?? 0;
+  return {
+    minX: margin, minY: margin,
+    maxX: nestingSettings?.lengthMm == null ? Infinity : nestingSettings.lengthMm - margin,
+    maxY: Math.min((nestingSettings?.widthMm ?? machine.height) - margin, machine.height - 0.01),
+  };
+}
+
+function outsideMaterial(box, limits = materialLimits()) {
+  return Boolean(box && (box.minX < limits.minX - placementEpsilon || box.minY < limits.minY - placementEpsilon
+    || box.maxX > limits.maxX + placementEpsilon || box.maxY > limits.maxY + placementEpsilon));
 }
 
 function fieldNumber(id) {
@@ -677,7 +1230,15 @@ function translatePath(path, dx, dy) {
 
 function drawingLocked() {
   return restoringWorkspace || isLoading || nestRequest !== null || contourRepair !== null
-    || ["upload", "cut"].includes(pendingCommand) || runInProgress();
+    || ["upload", "cut", "new-cut"].includes(pendingCommand) || runInProgress();
+}
+
+function placementPreviewActive() {
+  return Boolean(drag?.moved && ["move", "rotate"].includes(drag.type));
+}
+
+function cutPlacementPreviewActive() {
+  return placementPreviewActive() && Boolean(drag.placement?.moving.length);
 }
 
 function runInProgress() {
@@ -689,16 +1250,21 @@ function selectAllContours() {
 }
 
 function rememberDrawing(label) {
-  drawingUndo.push({ placed, excluded, selection, selectionAngle, nestingSettings, routeApplied, label });
+  measurementCloseHistory = null;
+  drawingUndo.push(drawingHistoryState(label));
   if (drawingUndo.length > 10) drawingUndo.shift();
+  drawingRedo.length = 0;
 }
 
-function editSelection(transform, label, angle = selectionAngle) {
+function drawingHistoryState(label) {
+  return { placed, excluded, selection, nestingSettings, routeApplied, label };
+}
+
+function editSelection(transform, label, { keepRotation = false } = {}) {
   if (!selectedBounds || drawingLocked() || !drawingPartsReady) return;
   rememberDrawing(label);
   placed = placed.map((path, index) => selection.has(index) ? transform(path, index) : path);
-  selectionAngle = angle;
-  updateDrawing();
+  updateDrawing({ keepRotation, changedIndices: selection });
 }
 
 function moveSelection(dx, dy) {
@@ -711,22 +1277,36 @@ function rotationTransform(radians, [x, y]) {
   return ([u, v]) => [x + (u - x) * cosine - (v - y) * sine, y + (u - x) * sine + (v - y) * cosine];
 }
 
-function rotateSelection(angle) {
-  if (!selectedBounds || drawingLocked() || !drawingPartsReady || angle === selectionAngle) return;
-  const radians = ((angle - selectionAngle) % 360) * Math.PI / 180;
+function normalizeAngle(angle) {
+  const wrapped = angle % 360;
+  if (Math.abs(wrapped) < 1e-9 || Math.abs(wrapped) > 360 - 1e-9) return 0;
+  return wrapped < 0 ? wrapped + 360 : wrapped;
+}
+
+function selectedAngle() {
+  if (!selection.size) return null;
+  const [first] = selection;
+  const angle = placed[first].partAngle ?? 0;
+  for (const index of selection) {
+    if (Math.abs((placed[index].partAngle ?? 0) - angle) > 1e-7) return null;
+  }
+  return angle;
+}
+
+function rotateSelectionBy(delta, pivot = null) {
+  if (!selectedBounds || drawingLocked() || !drawingPartsReady) return;
+  delta = normalizeAngle(delta);
+  if (!delta) return;
   const { minX, minY } = selectedBounds;
-  const rotate = rotationTransform(radians, [minX, minY]);
-  const placement = prepareManualPlacement();
-  const rotated = bounds([...selection].map((index) => mapPath(placed[index], rotate)));
-  const transform = (point) => {
-    const [x, y] = rotate(point);
-    return [x + minX - rotated.minX, y + minY - rotated.minY];
-  };
-  if (!checkManualPlacement(placement, transform).valid) {
-    notifyError("Для поворота недостаточно места с учётом зазора и отступов.");
+  const rotate = rotationTransform(delta * Math.PI / 180, pivot ?? [minX, minY]);
+  if (pivot) {
+    editSelection((path) => ({ ...mapPath(path, rotate), partAngle: normalizeAngle((path.partAngle ?? 0) + delta) }),
+      "поворот", { keepRotation: true });
     return;
   }
-  editSelection((path) => mapPath(path, transform), "поворот", angle);
+  const rotated = bounds([...selection].map((index) => mapPath(placed[index], rotate)));
+  editSelection((path) => ({ ...translatePath(mapPath(path, rotate), minX - rotated.minX, minY - rotated.minY),
+    partAngle: normalizeAngle((path.partAngle ?? 0) + delta) }), "поворот");
 }
 
 function applyPlacement(id) {
@@ -740,7 +1320,7 @@ function applyPlacement(id) {
   const { minX, minY, maxX, maxY } = selectedBounds;
   if (id === "offset-x") moveSelection(value - minX, 0);
   if (id === "offset-y") moveSelection(0, value - minY);
-  if (id === "rotation") rotateSelection(value % 360);
+  if (id === "rotation") rotateSelectionBy(value - (selectedAngle() ?? 0));
   if (id === "size-width" || id === "size-height") {
     const current = id === "size-width" ? maxY - minY : maxX - minX;
     if (value < 0.001 || current < 0.001) {
@@ -768,9 +1348,19 @@ function deleteSelection() {
   placed = remaining;
   excluded = remainingExcluded;
   selection = new Set();
-  selectionAngle = 0;
   updateDrawing();
-  if (placed.length) fitCamera();
+}
+
+function toggleSelectionExcluded() {
+  if (!selection.size || drawingLocked() || !drawingPartsReady) return;
+  const restore = [...selection].every((index) => excluded.has(index));
+  rememberDrawing(restore ? "возврат контуров" : "исключение");
+  excluded = new Set(excluded);
+  for (const index of selection) {
+    if (restore) excluded.delete(index);
+    else excluded.add(index);
+  }
+  updateDrawing();
 }
 
 function pathData(path) {
@@ -782,34 +1372,71 @@ function pathData(path) {
 }
 
 function renderPaths() {
-  const fragment = document.createDocumentFragment();
+  const layer = $("path-layer");
+  const notches = $("notch-layer");
+  const limits = materialLimits();
+  const warnings = expandToWholeParts(warningIndices);
   for (const [index, path] of placed.entries()) {
-    const group = element("g", { "data-index": index });
+    let group = layer.children[index];
+    if (!group) {
+      group = element("g", { "data-index": index });
+      group.append(
+        element("path", { "vector-effect": "non-scaling-stroke" }),
+        element("path", { class: "cut-hit", "vector-effect": "non-scaling-stroke" }),
+      );
+      layer.append(group);
+    }
     const classes = ["cut-path"];
     if (path.closed) classes.push("closed");
+    if (path.notch) classes.push("notch");
     if (selection.has(index)) classes.push("selected");
     if (excluded.has(index)) classes.push("excluded");
-    if (!excluded.has(index) && (outsideMaterial(pathBoxes[index]) || warningIndices.has(index))) classes.push("outside");
+    const partBox = drawingParts.get(path.partNumber)?.activeBox ?? pathBoxes[index];
+    if (!excluded.has(index) && (outsideMaterial(partBox, limits) || warnings.has(index)
+        || placementConflicts.has(partProgressKey(index)))) classes.push("outside");
     if (completedDrawingPaths.has(index)) classes.push("is-cut-complete");
     if (completedDrawingParts.has(partProgressKey(index))) classes.push("is-part-complete");
     const section = sectionByPath.get(index);
     if (section === null) classes.push("crosses-sections");
-    const attributes = { d: pathData(path), "vector-effect": "non-scaling-stroke" };
-    if (section) colorCutSection(group, section);
-    group.append(
-      element("path", { ...attributes, class: classes.join(" ") }),
-      element("path", { ...attributes, class: "cut-hit" }),
-    );
-    fragment.append(group);
+    if (section && group.dataset.cutSection !== String(section)) colorCutSection(group, section);
+    if (!section && group.hasAttribute("data-cut-section")) {
+      group.removeAttribute("data-cut-section");
+      group.style.removeProperty("--section-color");
+    }
+    const [shape, hit] = group.children;
+    updateAttribute(shape, "class", classes.join(" "));
+    if (renderedPaths[index] !== path) {
+      const route = pathData(path);
+      updateAttribute(shape, "d", route);
+      updateAttribute(hit, "d", route);
+    }
+    const marker = notchMarkers.get(index);
+    if (path.notch) {
+      const visible = marker ?? element("path", { class: "notch-marker", "vector-effect": "non-scaling-stroke" });
+      updateAttribute(visible, "d", shape.getAttribute("d"));
+      visible.classList.toggle("excluded", excluded.has(index));
+      if (!marker) {
+        notchMarkers.set(index, visible);
+        notches.append(visible);
+      }
+    } else if (marker) {
+      marker.remove();
+      notchMarkers.delete(index);
+    }
   }
-  $("path-layer").replaceChildren(fragment);
+  while (layer.children.length > placed.length) layer.lastElementChild.remove();
+  for (const [index, marker] of notchMarkers) if (index >= placed.length) {
+    marker.remove();
+    notchMarkers.delete(index);
+  }
+  renderedPaths = placed.slice();
 }
 
 function syncPlacementFields() {
   const box = selectedBounds;
-  const values = box ? [box.minX, box.minY, selectionAngle, box.maxY - box.minY, box.maxX - box.minX] : [];
+  const values = box ? [box.minX, box.minY, selectedAngle(), box.maxY - box.minY, box.maxX - box.minX] : [];
   for (const [index, id] of placementFields.entries()) {
-    $(id).value = values.length ? String(Number(values[index].toFixed(3))) : "";
+    $(id).value = values[index] == null ? "" : String(Number(values[index].toFixed(3)));
   }
 }
 
@@ -829,7 +1456,7 @@ function indexDrawingParts() {
     }
     const box = pathBoxes[index];
     if (!drawingParts.has(id)) {
-      drawingParts.set(id, { number: id, indices: [], box: { ...box }, rotation: "" });
+      drawingParts.set(id, { number: id, indices: [], box: { ...box }, activeBox: null, rotation: "" });
     }
     const part = drawingParts.get(id);
     part.indices.push(index);
@@ -838,6 +1465,9 @@ function indexDrawingParts() {
     part.box.minY = Math.min(part.box.minY, box.minY);
     part.box.maxX = Math.max(part.box.maxX, box.maxX);
     part.box.maxY = Math.max(part.box.maxY, box.maxY);
+    if (!excluded.has(index)) {
+      part.activeBox = part.activeBox ? unionPlacementBoxes(part.activeBox, box) : box;
+    }
   }
 }
 
@@ -890,7 +1520,9 @@ function renderCutProgress() {
     ? Math.max(0, current.path.points.length + Number(current.path.closed) - (current.end - tracking.index))
     : 0;
   const signature = tracking ? `${tracking.page}/${firstPage}/${lastDone}/${prefix}/${verifiedVertices}` : "none";
-  if (!model || model.signature !== signature) {
+  const layer = $("live-trace-layer");
+  if (model ? model.signature !== signature
+    : completedDrawingPaths.size || completedDrawingParts.size || layer.firstElementChild) {
     const nextPaths = new Set();
     const nextParts = new Set();
     const verifiedTrace = [];
@@ -924,9 +1556,12 @@ function renderCutProgress() {
       model.count = 0;
       model.signature = signature;
     }
-    $("live-trace-layer").replaceChildren(...(verifiedTrace.length ? [element("path", {
-      d: verifiedTrace.join(" "), class: "cut-trace", "vector-effect": "non-scaling-stroke",
-    })] : []));
+    const trace = layer.firstElementChild;
+    if (verifiedTrace.length) {
+      const route = verifiedTrace.join(" ");
+      if (trace) updateAttribute(trace, "d", route);
+      else layer.append(element("path", { d: route, class: "cut-trace", "vector-effect": "non-scaling-stroke" }));
+    } else if (trace) trace.remove();
     const groups = $("path-layer").children;
     const changed = new Set();
     for (const paths of [completedDrawingPaths, nextPaths]) {
@@ -948,14 +1583,7 @@ function renderCutProgress() {
     if (labelsChanged) renderPartLabels();
   }
   $("live-trace-layer").toggleAttribute("hidden", simulation.active);
-  if (!simulation.active && tracking) {
-    const page = tracking.state === "advance" ? Math.min(tracking.page + 1, tracking.pages) : tracking.page;
-    const state = tracking.state === "advance" ? "Смена прохода" : runLabels[tracking.state];
-    renderCanvasStatus("live", page, tracking.pages, [state, `Детали ${model.count} / ${model.total}`].filter(Boolean).join(" · "),
-      tracking.state === "completed");
-  } else if (!simulation.active) {
-    $("canvas-cut-status").hidden = true;
-  }
+  if (!simulation.active) $("canvas-cut-status").hidden = true;
   return tracking ? { count: model.count, total: model.total } : null;
 }
 
@@ -965,7 +1593,7 @@ function renderCanvasStatus(mode, page, total, detail, complete = false) {
   chip.dataset.mode = mode;
   chip.classList.toggle("is-complete", complete);
   for (const [id, value] of [
-    ["canvas-cut-mode", mode === "live" ? "Раскрой" : "Симуляция"],
+    ["canvas-cut-mode", "Симуляция"],
     ["canvas-cut-page", `Проход ${page} из ${total}`],
     ["canvas-cut-count", detail],
   ]) {
@@ -987,7 +1615,7 @@ function expandToWholeParts(indices) {
 }
 
 function identifyDrawingParts() {
-  if (drawingPartsReady) return Promise.resolve();
+  if (drawingPartsReady && placed.every((path) => typeof path.notch === "boolean")) return Promise.resolve();
   if (partDiscovery?.paths === placed) return partDiscovery.promise;
   const paths = placed;
   const request = { paths };
@@ -997,16 +1625,20 @@ function identifyDrawingParts() {
       const result = await getJson("/api/nest-parts", jsonRequest({ paths }, AbortSignal.timeout(30_000)));
       if (paths !== placed) return;
       const numbered = new Array(paths.length).fill(null);
-      for (const { number: id, indices, rotation } of result.parts) {
+      for (const { number: id, indices, rotation, notchIndices } of result.parts) {
+        const notches = new Set(notchIndices);
         for (const index of indices) {
-          numbered[index] = { ...paths[index], partNumber: id, ...(rotation ? { partRotation: rotation } : {}) };
+          numbered[index] = { ...paths[index], partNumber: paths[index].partNumber ?? id,
+            ...(rotation ? { partRotation: rotation } : {}),
+            ...(Array.isArray(notchIndices) ? { notch: notches.has(index) } : {}) };
         }
       }
       if (numbered.some((path) => !path)) throw new Error("Сервер вернул неполный список деталей.");
       placed = numbered;
       indexDrawingParts();
       selection = expandToWholeParts(selection);
-      resetCutPlan();
+      refreshPlacementWarnings();
+      resetCutPlan({ keepView: true });
       updateSelection();
       scheduleWorkspaceSave();
     } finally {
@@ -1027,53 +1659,78 @@ function partRotationText(rotation) {
 
 function renderPartLabels() {
   const layer = $("part-label-layer");
-  if (!camera || !svg.clientWidth || !drawingParts.size || (drag?.moved && ["move", "rotate"].includes(drag.type))) {
+  if (drag?.labels) return;
+  if (!camera || !svg.clientWidth || !drawingParts.size) {
     layer.replaceChildren();
+    partLabels.clear();
     return;
   }
   const units = camera.width / svg.clientWidth;
   const selectedParts = new Set([...selection].map((index) => placed[index]?.partNumber));
-  const fragment = document.createDocumentFragment();
   const visible = [];
   for (const part of drawingParts.values()) {
-    const { x, y, width, height } = svgBox(part.box);
-    const px = (x + width / 2 - camera.x) / units;
-    const py = (y + height / 2 - camera.y) / units;
+    const { minX, maxX, minY, maxY } = part.box;
+    const center = [(minX + maxX) / 2, (minY + maxY) / 2];
+    const [x, y] = projectPoint(...center);
+    const px = (x - camera.x) / units;
+    const py = (y - camera.y) / units;
     if (px < 0 || px > svg.clientWidth || py < 0 || py > svg.clientHeight) continue;
-    visible.push({ part, px, py, area: width * height, active: selectedParts.has(part.number) });
+    visible.push({ part, px, py, center, area: (maxX - minX) * (maxY - minY), active: selectedParts.has(part.number) });
   }
-  visible.sort((a, b) => b.active - a.active || Boolean(b.part.rotation) - Boolean(a.part.rotation) || b.area - a.area);
-  const occupied = [];
-  for (const { part, px, py, active } of visible) {
-    if (occupied.length === 200) break;
+  visible.sort((a, b) => b.active - a.active || Number(partLabels.has(b.part.number)) - Number(partLabels.has(a.part.number))
+    || Boolean(b.part.rotation) - Boolean(a.part.rotation) || b.area - a.area);
+  const occupied = [], selectedOccupied = [];
+  const shown = new Set();
+  for (const { part, px, py, center, active } of visible) {
+    const region = active ? selectedOccupied : occupied;
+    if (region.length >= 200) continue;
     const label = `№${part.number}`;
     const complete = completedDrawingParts.has(part.number);
     const width = 12 + label.length * 8 + (part.rotation || complete ? 17 : 0);
     const left = px - width / 2;
-    if (occupied.some((box) => Math.abs(box.y - py) < 25 && left < box.right + 3 && left + width > box.left - 3)) continue;
-    occupied.push({ left, right: left + width, y: py });
+    if (region.some((box) => Math.abs(box.y - py) < 25 && left < box.right + 3 && left + width > box.left - 3)) continue;
+    region.push({ left, right: left + width, y: py });
+    shown.add(part.number);
     const classes = ["part-label", part.rotation, active ? "is-active" : "",
       part.indices.every((index) => excluded.has(index)) ? "is-excluded" : "", complete ? "is-complete" : ""];
-    const badge = element("g", {
-      class: classes.join(" "), "data-part-number": part.number,
-      transform: `translate(${camera.x + left * units} ${camera.y + (py - 11) * units}) scale(${units})`,
-    });
-    const title = element("title");
-    title.textContent = `Деталь ${label} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
-    const text = element("text", { x: 6, y: 15.5 });
-    text.textContent = label;
-    badge.append(title, element("rect", { width, height: 22, rx: 5, class: "part-label-bg" }), text);
-    if (complete) {
-      badge.append(element("path", { class: "part-check", d: `M${width - 16} 11l3 3 5 -6` }));
-    } else if (part.rotation) {
-      badge.append(element("use", {
-        class: "icon", href: part.rotation === "none" ? "#i-lock" : "#i-turn-cw",
-        x: width - 17, y: 5, width: 12, height: 12,
-      }));
+    let entry = partLabels.get(part.number);
+    if (!entry) {
+      const node = element("g", { "data-part-number": part.number });
+      entry = { node };
+      partLabels.set(part.number, entry);
+      layer.append(node);
     }
-    fragment.append(badge);
+    const { node } = entry;
+    const marker = complete ? "complete" : part.rotation;
+    if (entry.marker !== marker || !node.firstChild) {
+      const title = element("title");
+      title.textContent = `Деталь ${label} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
+      const text = element("text", { x: 6, y: 15.5 });
+      text.textContent = label;
+      node.replaceChildren(title, element("rect", { width, height: 22, rx: 5, class: "part-label-bg" }), text);
+      if (complete) {
+        node.append(element("path", { class: "part-check", d: `M${width - 16} 11l3 3 5 -6` }));
+      } else if (part.rotation) {
+        node.append(element("use", { class: "icon", href: part.rotation === "none" ? "#i-lock" : "#i-turn-cw",
+          x: width - 17, y: 5, width: 12, height: 12 }));
+      }
+      entry.marker = marker;
+    }
+    entry.center = center;
+    entry.units = units;
+    entry.halfWidth = width / 2;
+    updateAttribute(node, "class", classes.join(" "));
+    positionPartLabel(entry, entry.center);
   }
-  layer.replaceChildren(fragment);
+  for (const [number, entry] of partLabels) if (!shown.has(number)) {
+    entry.node.remove();
+    partLabels.delete(number);
+  }
+}
+
+function positionPartLabel({ node, units, halfWidth }, point) {
+  const [x, y] = projectPoint(...point);
+  updateAttribute(node, "transform", `translate(${x - halfWidth * units} ${y - 11 * units}) scale(${units})`);
 }
 
 function updateSelection() {
@@ -1094,9 +1751,8 @@ function setSelection(indices) {
   for (const index of selection) if (!indices.has(index)) groups[index]?.firstElementChild.classList.remove("selected");
   for (const index of indices) if (!selection.has(index)) groups[index].firstElementChild.classList.add("selected");
   selection = indices;
-  selectionAngle = 0;
   updateSelection();
-  renderControls();
+  renderSelectionControls(drawingLocked());
 }
 
 
@@ -1239,7 +1895,7 @@ function joinTouchingContours(paths) {
     group.records.push(record);
 
     const { points, closed } = record.path;
-    if (closed || points.length < 2 || sameContourPoint(points[0], points.at(-1))) continue;
+    if (record.path.notch || closed || points.length < 2 || sameContourPoint(points[0], points.at(-1))) continue;
     record.ends = [points[0], points.at(-1)].map((point, side) => {
       const key = contourPointKey(point);
       if (!group.nodes.has(key)) group.nodes.set(key, { point, links: [], blocked: false });
@@ -1305,17 +1961,16 @@ function joinTouchingContours(paths) {
 
 function applyContourOptimization() {
   if (drawingLocked()) return;
-  cancelCanvasGesture();
-  const paths = included();
-  const join = $("optimize-join").checked ? joinTouchingContours(paths) : { paths, joined: 0, skipped: false };
+  const join = previewContourJoin();
   const optimize = $("optimize-route").checked;
-  if (join.joined || optimize !== routeApplied) {
-    rememberDrawing(join.joined ? "соединение контуров" : "настройку маршрута");
-    routeApplied = optimize;
-    if (join.joined) replaceJoinedContours(join.paths);
-    updateDrawing();
+  if (!join?.joined && optimize === routeApplied) return;
+  rememberDrawing(join?.joined ? "соединение контуров" : "настройку маршрута");
+  routeApplied = optimize;
+  if (join?.joined) {
+    replaceJoinedContours(join.paths);
+    optimizationJoined = true;
   }
-  if (join.skipped) notifyError("Чертёж слишком сложный для проверки всех стыков.");
+  updateDrawing();
 }
 
 function replaceJoinedContours(paths) {
@@ -1334,53 +1989,99 @@ function replaceJoinedContours(paths) {
     if (allSelected || selectedPaths.has(path) || selectedParts.has(path.partNumber)) selection.add(index);
     if (excludedPaths.has(path)) excluded.add(index);
   }
-  selectionAngle = 0;
 }
 
-function undoDrawingEdit() {
-  if (!drawingUndo.length || drawingLocked()) return;
+function stepDrawingHistory(redo = false) {
+  const from = redo ? drawingRedo : drawingUndo;
+  const to = redo ? drawingUndo : drawingRedo;
+  if (!from.length || drawingLocked()) return;
+  measurementCloseHistory = null;
   cancelCanvasGesture();
-  ({ placed, excluded, selection, selectionAngle, nestingSettings, routeApplied } = drawingUndo.pop());
+  const state = from.pop();
+  to.push(drawingHistoryState(state.label));
+  ({ placed, excluded, selection, nestingSettings, routeApplied } = state);
   updateDrawing();
-  fitCamera();
+  if (!contourDialog.open) svg.focus({ preventScroll: true });
 }
 
-function showRepairResult(message) {
-  const result = $("repair-result");
-  result.hidden = !message;
-  result.textContent = message;
+function matchesContourRepair(snapshot) {
+  return snapshot.source === source && snapshot.paths === placed && snapshot.excluded === excluded
+    && snapshot.planEpoch === cutPlanEpoch;
 }
 
-async function restoreClosedContours() {
-  if (drawingLocked() || !included().length) return;
+function contourCheckAvailable() {
+  return !drawingLocked() && !busy() && !live.stopAvailable
+    && activeRun?.state !== "transferring" && !xiaoHandoff && placed.length > excluded.size;
+}
+
+function updateContourCheckControls() {
+  const available = contourCheckAvailable();
+  updateControl($("contour-check-button"), "disabled", !available);
+  if (!contourCheckDialog.open) return;
+  if (contourRepairProposal && !matchesContourRepair(contourRepairProposal)) {
+    contourRepairProposal = null;
+    setContourCheckStatus("Чертёж изменился. Запустите проверку ещё раз.");
+  }
+  updateControl($("contour-check-scan"), "disabled", !available);
+  updateControl($("contour-check-apply"), "disabled", !available || !contourRepairProposal);
+}
+
+function setContourCheckStatus(message) {
+  updateText($("contour-check-status"), message);
+}
+
+async function scanDrawingContours() {
+  if (!contourCheckDialog.open || !contourCheckAvailable()) return;
   cancelCanvasGesture();
+  const snapshot = { source, paths: placed, excluded, planEpoch: cutPlanEpoch };
+  contourRepairProposal = null;
   const request = new AbortController();
   contourRepair = request;
-  showRepairResult("Проверяем стыки контуров…");
+  setContourCheckStatus("Проверяем стыки контуров…");
   renderControls();
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
-    const result = await getJson("/api/close-contours", jsonRequest({ paths: placed, excluded: [...excluded] }, signal));
-    if (signal.aborted || runInProgress()) return;
-    if (result.closedCount) {
-      rememberDrawing("восстановление замкнутых контуров");
-      selection = new Set(result.sources.flatMap((indices, index) => indices.some((old) => selection.has(old)) ? [index] : []));
-      placed = result.paths;
-      excluded = new Set(result.excluded);
-      selectionAngle = 0;
-      updateDrawing();
+    const result = await getJson("/api/close-contours",
+      jsonRequest({ paths: snapshot.paths, excluded: [...snapshot.excluded] }, signal));
+    if (contourRepair !== request || !contourCheckDialog.open) return;
+    signal.throwIfAborted();
+    if (!matchesContourRepair(snapshot)) {
+      setContourCheckStatus("Чертёж изменился. Запустите проверку ещё раз.");
+      return;
     }
-    const message = result.closedCount
-      ? `Восстановлено замкнутых контуров: ${number(result.closedCount)}.`
-      : "Контуров, которые можно уверенно замкнуть, не найдено.";
-    showRepairResult(message);
+    if (result.closedCount > 0) contourRepairProposal = { ...snapshot, result };
+    const checked = `Проверено контуров: ${number(placed.length - excluded.size)}.`;
+    const skipped = excluded.size ? ` Пропущено исключённых контуров: ${number(excluded.size)}.` : "";
+    const findings = result.closedCount > 0 ? ` Контуров, которые можно замкнуть: ${number(result.closedCount)}.`
+      : " Контуров, которые можно уверенно замкнуть, не найдено.";
+    setContourCheckStatus(checked + skipped + findings);
   } catch (error) {
-    if (request.signal.aborted) return;
-    showRepairResult(error.status === 404 ? "Перезапустите локальную программу плоттера для восстановления контуров." : messageFrom(error));
+    if (contourRepair !== request || !contourCheckDialog.open) return;
+    setContourCheckStatus(error.status === 404 ? "Перезапустите локальную программу плоттера для проверки контуров." : messageFrom(error));
   } finally {
-    contourRepair = null;
-    renderControls();
+    if (contourRepair === request) {
+      contourRepair = null;
+      renderControls();
+    }
   }
+}
+
+function applyContourRepair() {
+  const proposal = contourRepairProposal;
+  if (!contourCheckDialog.open || !contourCheckAvailable() || !proposal) return;
+  contourRepairProposal = null;
+  if (!matchesContourRepair(proposal)) {
+    setContourCheckStatus("Чертёж изменился. Запустите проверку ещё раз.");
+    updateContourCheckControls();
+    return;
+  }
+  const { result } = proposal;
+  rememberDrawing("восстановление замкнутых контуров");
+  selection = new Set(result.sources.flatMap((indices, index) => indices.some((old) => selection.has(old)) ? [index] : []));
+  placed = result.paths;
+  excluded = new Set(result.excluded);
+  updateDrawing();
+  setContourCheckStatus(`Замкнуто контуров: ${number(result.closedCount)}.`);
 }
 
 function setNestStatus(message, blocking = [], error = true, offerRotation = false) {
@@ -1423,15 +2124,13 @@ function defaultFabricWidthMm() {
 }
 
 function applyNestingSettings() {
-  const passLimit = $("nest-pass-limit");
-  passLimit.hidden = !Number.isFinite(machine.rollPassLengthMm) || machine.rollPassLengthMm <= 0;
-  if (!passLimit.hidden) passLimit.textContent = `Длина прохода по столу — до ${number(machine.rollPassLengthMm)} мм`;
   const width = $("nest-width");
   width.max = String(machine.height);
   width.placeholder = String(defaultFabricWidthMm());
   const savedWidth = nestingSettings?.widthMm;
   const oldDefault = nestingSettings?.widthExplicit == null && savedWidth === machine.height;
   width.value = !oldDefault && savedWidth != null ? savedWidth : defaultFabricWidthMm();
+  $("nest-length").value = nestingSettings?.lengthMm ?? "";
   $("nest-gap").value = nestingSettings?.gapMm ?? 10;
   $("nest-margin").value = nestingSettings?.marginMm ?? 10;
   $("nest-rotation").value = ["any", "quarter"].includes(nestingSettings?.rotation) ? "any" : "none";
@@ -1441,8 +2140,10 @@ async function applyNesting() {
   if (drawingLocked() || !nestDialog.open || nestingBackend !== "ready" || !$("nest-form").reportValidity()) return;
   const indices = [];
   const paths = [];
+  const length = $("nest-length");
   const settings = {
     widthMm: $("nest-width").value ? $("nest-width").valueAsNumber : defaultFabricWidthMm(),
+    lengthMm: length.value ? length.valueAsNumber : null,
     gapMm: $("nest-gap").valueAsNumber,
     marginMm: $("nest-margin").valueAsNumber,
     rotation: $("nest-rotation").value,
@@ -1478,6 +2179,9 @@ async function applyNesting() {
         || !Number.isFinite(layout.partCount) || !Number.isFinite(layout.lengthMm)) {
       throw new Error("Сервер вернул неполную раскладку.");
     }
+    if (settings.lengthMm !== null && (layout.lengthMm - settings.lengthMm > 1e-7 || layout.pageCount === 0)) {
+      throw new Error("Полученная раскладка не подходит для заданной длины полотна и разбиения на проходы.");
+    }
     const next = placed.slice();
     indices.forEach((index, i) => { next[index] = layout.paths[i]; });
     const moves = new Map(layout.placements.map((part) => [part.partNumber, part]));
@@ -1496,10 +2200,10 @@ async function applyNesting() {
         const dy = y - oldY;
         return [newX + cosine * dx - sine * dy, newY + sine * dx + cosine * dy];
       });
+      next[index].partAngle = normalizeAngle((path.partAngle ?? 0) + move.angle);
     }
     rememberDrawing("автораскладку");
     placed = next;
-    selectionAngle = 0;
     nestingSettings = { ...settings, widthExplicit: settings.widthMm !== defaultFabricWidthMm() };
     nestRequest = null;
     nestDialog.close();
@@ -1557,11 +2261,11 @@ function buildJob() {
   };
 }
 
-function setSaveStatus(message, failed = false) {
+function setSaveError(message = "") {
   const status = $("workspace-save");
-  status.textContent = message;
-  status.hidden = !message;
-  status.classList.toggle("failed", failed);
+  updateText(status, message);
+  updateControl(status, "hidden", !message);
+  status.classList.toggle("failed", Boolean(message));
 }
 
 function workspaceSnapshot() {
@@ -1574,7 +2278,7 @@ function workspaceSnapshot() {
       zoom: camera && baseCamera ? camera.width / baseCamera.width : 1,
       focusX: camera ? camera.x + camera.width / 2 : 0,
       focusY: camera ? camera.y + camera.height / 2 : 0,
-      grid: gridVisible,
+      grid: true,
       cameraMode,
       ...(previewCutPage ? { section: previewCutPage } : {}),
     },
@@ -1586,18 +2290,17 @@ function workspaceSnapshot() {
 }
 
 function scheduleWorkspaceSave() {
-  if (restoringWorkspace || !source) return;
+  if (restoringWorkspace || pendingCommand === "new-cut" || !source) return;
   workspaceChange++;
   clearTimeout(saveTimer);
   if (workspaceRevision === null) return;
-  setSaveStatus("Сохраняем…");
   saveTimer = setTimeout(() => void persistWorkspace(), 250);
 }
 
 function persistWorkspace() {
   clearTimeout(saveTimer);
-  if (workspaceRevision === null) return Promise.resolve(false);
   if (savePromise) return savePromise;
+  if (workspaceRevision === null || pendingCommand === "new-cut") return Promise.resolve(false);
   if (workspaceSaved === workspaceChange) return Promise.resolve(true);
   savePromise = (async () => {
     try {
@@ -1609,11 +2312,11 @@ function persistWorkspace() {
         workspaceRevision = response.revision;
         workspaceSaved = change;
       }
-      if (source) setSaveStatus("Сохранено");
+      setSaveError();
       return true;
     } catch (error) {
       if (error.status === 409) workspaceRevision = null;
-      setSaveStatus(error.status === 409 ? "Другая вкладка сохранила правки. Перезагрузите страницу." : "Не сохранено: " + messageFrom(error), true);
+      setSaveError(error.status === 409 ? "Другая вкладка сохранила правки. Перезагрузите страницу." : "Не сохранено: " + messageFrom(error));
       return false;
     } finally {
       savePromise = null;
@@ -1631,8 +2334,6 @@ async function restoreWorkspace() {
     source = saved.source;
     placed = saved.paths;
     excluded = new Set(saved.excluded);
-    gridVisible = saved.view.grid;
-    $("grid-tool").setAttribute("aria-pressed", String(gridVisible));
     routeApplied = saved.optimization.routeApplied ?? true;
     $("optimize-join").checked = saved.optimization.join;
     nestingSettings = saved.optimization.nesting || null;
@@ -1651,20 +2352,23 @@ async function restoreWorkspace() {
         drawCamera();
       }
     }
-    setSaveStatus(response.recovered ? "Восстановлено из копии" : "Сохранено");
   } catch (error) {
-    setSaveStatus("Не удалось восстановить: " + messageFrom(error), true);
+    setSaveError("Не удалось восстановить: " + messageFrom(error));
   } finally {
     restoringWorkspace = false;
     renderControls();
   }
 }
 
-function resetCutPlan() {
+function resetCutPlan({ keepView = false } = {}) {
   clearTimeout(cutPlanTimer);
   cutPlanEpoch++;
+  cutPlanRequest?.controller.abort();
+  cutPlanRequest = null;
+  pendingCanvasPlan = keepView && includedBounds ? (cutPlan?.pages.length ? cutPlan : pendingCanvasPlan) : null;
   cutPlan = null;
-  previewCutPage = null;
+  keepViewForPlan = keepView;
+  if (!keepView) previewCutPage = null;
   cutPlanError = "";
   xiaoResult = null;
   closeUploadConfirmation();
@@ -1707,18 +2411,21 @@ function requestCutPlan() {
   if (cutPlanRequest?.epoch === epoch) return cutPlanRequest.promise;
   const includedIndices = placed.flatMap((_, index) => excluded.has(index) ? [] : [index]);
   if (!source || !includedIndices.length) return Promise.resolve(null);
+  const controller = new AbortController();
   const promise = (async () => {
     try {
       const plan = await getJson("/api/cut-plan", jsonRequest({
         job: buildJob(), filename: source.filename,
-      }, AbortSignal.timeout(30_000)));
+      }, AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])));
       if (epoch !== cutPlanEpoch) return null;
       cutPlan = plan;
+      pendingCanvasPlan = null;
       if (plan.planId !== transferChecklistPlanId) {
         transferChecklistPlanId = plan.planId;
         resetTransferChecklist();
       }
       cutPlanError = plan.issues.map(({ message }) => message).join(" ");
+      if (previewCutPage > plan.pages.length || plan.mode !== "roll") previewCutPage = null;
       warningIndices = new Set(plan.issues.flatMap(({ indices }) => indices.map((index) => includedIndices[index])));
       sectionByPath = indexCutSections(plan, includedIndices);
       drawingProgressModel = makeDrawingProgressModel(plan, includedIndices);
@@ -1727,38 +2434,60 @@ function requestCutPlan() {
       renderRun();
       return plan;
     } catch (error) {
-      if (epoch === cutPlanEpoch) cutPlanError = messageFrom(error);
+      if (epoch === cutPlanEpoch) {
+        cutPlanError = messageFrom(error);
+        pendingCanvasPlan = null;
+      }
       return null;
     } finally {
       if (cutPlanRequest?.epoch === epoch) cutPlanRequest = null;
       if (epoch === cutPlanEpoch) {
-        renderControls();
+        keepViewForPlan = false;
+        renderLayoutStatistics();
+        renderLayoutActions();
       }
     }
   })();
-  cutPlanRequest = { epoch, promise };
+  cutPlanRequest = { epoch, promise, controller };
   return promise;
 }
 
-function updateDrawing({ edited = true } = {}) {
+function updateDrawing({ edited = true, keepView = edited, keepRotation = false, changedIndices = null } = {}) {
   cancelCanvasGesture();
-  endFreeRotation();
+  if (!keepRotation) endFreeRotation();
   closePartMenu();
-  if (edited) clearCurrentUpload();
-  pathBoxes = placed.map((path) => bounds([path]));
+  if (!placed.length && (savedMeasurements.size || measurementUndo.length || measurementRedo.length)) clearSavedMeasurements();
+  if (measureMode && !placed.length) setMeasureMode(false);
+  else if (edited && measurement) {
+    clearMeasurement();
+    renderMeasurement();
+  }
+  const affectsCut = !changedIndices || [...changedIndices].some((index) => !excluded.has(index));
+  if (edited && affectsCut) clearCurrentUpload();
+  if (changedIndices) for (const index of changedIndices) pathBoxes[index] = bounds([placed[index]]);
+  else pathBoxes = placed.map((path) => bounds([path]));
   indexDrawingParts();
   selection = expandToWholeParts(selection);
-  includedBounds = bounds(included());
   svg.classList.toggle("has-drawing", placed.length > 0);
   $("empty-canvas").hidden = placed.length > 0;
-  const width = Math.min(nestingSettings?.widthMm ?? machine.height, machine.height);
-  jobError = outsideMaterial(includedBounds)
-    ? `Проверьте начало раскладки и ширину полотна по Y (${number(width)} мм).` : "";
-  resetCutPlan();
-  resizeCamera();
+  if (affectsCut) {
+    const previousLength = Math.max(machine.width, includedBounds?.maxX ?? 0);
+    includedBounds = null;
+    for (const [index, box] of pathBoxes.entries()) if (!excluded.has(index)) {
+      includedBounds = includedBounds ? unionPlacementBoxes(includedBounds, box) : box;
+    }
+    refreshPlacementWarnings();
+    resetCutPlan({ keepView });
+    if (!changedIndices || previousLength !== Math.max(machine.width, includedBounds?.maxX ?? 0)) resizeCamera({ keepView });
+  } else renderPaths();
+  if (changedIndices && keepRotation) renderFreeRotation();
   updateSelection();
   if (edited) scheduleWorkspaceSave();
-  renderControls();
+  if (changedIndices) {
+    renderSelectionControls(drawingLocked());
+    if (affectsCut) renderLayoutStatistics();
+    renderLayoutActions();
+  } else renderControls();
   void identifyDrawingParts().catch(() => {});
 }
 
@@ -1778,14 +2507,15 @@ async function loadDrawing(file) {
     });
     const box = bounds(imported.paths);
     if (!box) throw new Error("В файле нет контуров.");
+    clearSavedMeasurements();
     source = imported;
     placed = imported.paths.map((path) => translatePath(path, 20 - box.minX, 20 - box.minY));
     excluded = new Set();
-    selection = new Set(placed.keys());
-    selectionAngle = 0;
+    selection = new Set();
     routeApplied = true;
     drawingUndo.length = 0;
-    updateDrawing();
+    drawingRedo.length = 0;
+    updateDrawing({ keepView: false });
     fitCamera();
   } catch (error) {
     notifyError(messageFrom(error));
@@ -1798,12 +2528,12 @@ async function loadDrawing(file) {
 
 function setMachineError(message = "") {
   const label = $("machine-feedback");
-  label.textContent = message;
-  label.hidden = !message;
+  updateText(label, message);
+  updateControl(label, "hidden", !message);
 }
 
 function busy() {
-  return Boolean(pendingCommand || stopPending || activeHold);
+  return Boolean(switchingMachineMode || pendingCommand || stopPending || activeHold);
 }
 
 function controlActive() {
@@ -1818,11 +2548,15 @@ function readStoredBoolean(key) {
   }
 }
 
+function machineStorageKey(name) {
+  return demoMode ? "plotter.demo." + name : "plotter." + name;
+}
+
 function setClampLowered(lowered) {
   clampLowered = lowered;
   try {
-    sessionStorage.setItem("plotter.clampLowered", String(lowered));
-    sessionStorage.removeItem("plotter.manualFeed");
+    sessionStorage.setItem(machineStorageKey("clampLowered"), String(lowered));
+    sessionStorage.removeItem(machineStorageKey("manualFeed"));
   } catch {
     // Browser storage is optional.
   }
@@ -1841,7 +2575,7 @@ function setPending(command) {
 function setVacuumEnabled(enabled) {
   vacuumEnabled = enabled;
   try {
-    sessionStorage.setItem("plotter.vacuumEnabled", String(enabled));
+    sessionStorage.setItem(machineStorageKey("vacuumEnabled"), String(enabled));
   } catch {
     // Browser storage is optional.
   }
@@ -1849,7 +2583,7 @@ function setVacuumEnabled(enabled) {
 
 function applyActuatorState(state) {
   if (!state || typeof state.epoch !== "string" || !Number.isInteger(state.revision) || state.revision < 0) return;
-  if (state.epoch === actuatorEpoch && state.revision < actuatorRevision) return;
+  if (state.epoch === actuatorEpoch && state.revision <= actuatorRevision) return;
   actuatorEpoch = state.epoch;
   actuatorRevision = state.revision;
   if (typeof state.clampLowered === "boolean") setClampLowered(state.clampLowered);
@@ -1858,11 +2592,11 @@ function applyActuatorState(state) {
 
 function clearCurrentUpload() {
   currentUpload = null;
-  $("job-verified").checked = false;
 }
 
 function resetTransferChecklist() {
-  for (const id of ["manual-auto-run-off", "roll-advance-confirmed"]) $(id).checked = $(id).defaultChecked;
+  const autoRun = $("manual-auto-run-off");
+  autoRun.checked = autoRun.defaultChecked;
 }
 
 function updateControllerRoll(roll) {
@@ -1907,6 +2641,55 @@ function needsMotionVerification() {
   return stopNeedsVerification || coordinateMove?.state === "unconfirmed";
 }
 
+function canSwitchMachineMode() {
+  return (demoAvailable || demoMode) && liveObserved
+    && !busy() && !runInProgress() && activeRun?.state !== "transferring"
+    && !live.stopAvailable && !live.busy && !coordinateMoveBlocksControl() && !needsMotionVerification() && !xiaoHandoff;
+}
+
+async function toggleDemoMode() {
+  if (!canSwitchMachineMode()) return;
+  switchingMachineMode = true;
+  disarmControl();
+  clearTimeout(liveTimer);
+  liveEpoch++;
+  machineModeEpoch++;
+  demoMode = !demoMode;
+  try {
+    sessionStorage.setItem("plotter.demoMode", String(demoMode));
+  } catch { /* Session storage is optional. */ }
+  machine = { ip: "—", width: machine.width, height: machine.height };
+  live = { responded: false, busy: false, hold: {}, operations: {}, position: null };
+  liveObserved = false;
+  headSample = null;
+  operationRefreshUntil = 0;
+  coordinateMove = null;
+  actuatorEpoch = null;
+  actuatorRevision = -1;
+  clampLowered = readStoredBoolean(machineStorageKey("clampLowered"));
+  vacuumEnabled = readStoredBoolean(machineStorageKey("vacuumEnabled"));
+  stopNeedsVerification = false;
+  uploadUncertain = false;
+  activeRun = null;
+  controllerRoll = null;
+  cutProgress = null;
+  restoredRunStatistics = null;
+  trackedRun = readTrackedRun();
+  pagePickerPlan = null;
+  transferChecklistPlanId = null;
+  resetTransferChecklist();
+  resetCutPlan();
+  setMachineError();
+  renderLive();
+  try {
+    await readConfiguration();
+  } finally {
+    switchingMachineMode = false;
+    renderLive();
+    scheduleLiveRead(0);
+  }
+}
+
 function operationAllowed(action, allowPending = false) {
   if (action === "cancel-cut") {
     const observedStop = live.stopAvailable ?? runInProgress();
@@ -1931,7 +2714,7 @@ function operationAllowed(action, allowPending = false) {
   if (!live.positionFresh && action !== "home") return false;
   if (live.operations[action] === false) return false;
   if (action !== "cut") return true;
-  return Boolean(!jobError && !drawingLocked() && !simulation.active && currentUpload && cutPlan?.planId === currentUpload.planId
+  return Boolean(!jobError && !drawingLocked() && !cutPlacementPreviewActive() && !simulation.active && currentUpload && cutPlan?.planId === currentUpload.planId
     && $("job-verified").checked);
 }
 
@@ -1950,76 +2733,87 @@ function needsManualAutoRunConfirmation() {
   return machine.directRoll === true && machine.autoRunReadback === false;
 }
 
-function renderPagePicker(roll, disabled) {
+function renderPagePicker(plan, roll, disabled) {
   const picker = $("job-page");
-  const visible = Boolean(cutPlan?.mode === "roll" && cutPlan.canUpload && machine.apiVersion >= 17);
-  $("job-page-field").hidden = !visible;
-  if (visible && pagePickerPlan !== cutPlan.planId) {
-    selectedCutPage = cutPlan.pages.find((page) => page.canStart !== false)?.number ?? 1;
-    pagePickerPlan = cutPlan.planId;
-    const total = cutPlan.pages.length;
-    picker.replaceChildren(...cutPlan.pages.map((page) => new Option(
-      `${page.number} из ${total}${page.canStart === false ? " · продолжение" : ""}`, page.number,
-    )));
+  const visible = Boolean(plan?.mode === "roll" && plan.canUpload && machine.apiVersion >= 17);
+  updateControl($("job-page-field"), "hidden", !visible);
+  if (visible && cutPlan && pagePickerPlan !== plan.planId) {
+    const preserved = plan.pages[selectedCutPage - 1];
+    selectedCutPage = preserved && preserved.canStart !== false ? preserved.number
+      : plan.pages.find((page) => page.canStart !== false)?.number ?? 1;
+    pagePickerPlan = plan.planId;
+    const total = plan.pages.length;
+    for (const [index, page] of plan.pages.entries()) {
+      const label = `Проход ${page.number} из ${total}${page.canStart === false ? " · продолжение" : ""}`;
+      if (picker.options[index]) updateControl(picker.options[index], "text", label);
+      else picker.add(new Option(label, page.number));
+    }
+    if (picker.options.length > total) picker.options.length = total;
   }
   const next = visible ? roll?.nextPage ?? roll?.page ?? selectedCutPage : null;
   if (visible) {
-    picker.value = String(next);
+    updateControl(picker, "value", String(next));
     for (const option of picker.options) {
-      option.disabled = !controllerRoll && cutPlan.pages[Number(option.value) - 1]?.canStart === false;
+      updateControl(option, "disabled", !controllerRoll && plan.pages[Number(option.value) - 1]?.canStart === false);
     }
-    picker.disabled = disabled || Boolean(controllerRoll);
-    picker.title = controllerRoll ? "В открытом сеансе следующий проход выбирается по ходу раскроя" : "";
+    updateControl(picker, "disabled", disabled || Boolean(controllerRoll));
+    updateControl(picker, "title", controllerRoll ? "В открытом сеансе следующий проход выбирается по ходу раскроя" : "");
   }
   shownCutPage = next;
   updateCanvasSection();
-}
-
-function renderContinuationNote(roll, pageNumber) {
-  const note = $("roll-continuation-note");
-  const plan = cutPlan;
-  note.hidden = !plan?.hasContinuations || !plan.canUpload || runInProgress()
-    || Boolean(controllerRoll && !roll || roll?.state === "completed");
-  if (note.hidden) return;
-  const page = plan.pages[pageNumber - 1];
-  const next = plan.pages[pageNumber];
-  if (page?.canStart === false && (roll?.state === "advance" || roll?.state === "ready")) {
-    const previous = plan.pages[pageNumber - 2];
-    const feed = previous?.feedAfterMm;
-    const alignment = page.incomingSeams?.length ? "Совместите точки стыка с X = 0 без поперечного сдвига."
-      : "Совместите начало прохода с X = 0 без поперечного сдвига.";
-    note.textContent = roll.state === "advance" && Number.isFinite(feed)
-      ? `Протяните полотно на ${formatFeedDistance.format(feed)} мм. ${alignment}` : alignment;
-  } else if (next?.canStart === false) {
-    note.textContent = `Длинные детали продолжатся на проходе ${next.number}.`
-      + (next.incomingSeams?.length ? " Точки стыка отмечены на чертеже." : "");
-  } else {
-    note.textContent = "Проходы с продолжением доступны после реза предыдущего прохода.";
-  }
 }
 
 function uploadAllowed() {
   const autoRunOff = machine.autoRunReadback === true ? live.autoRunOff === true
     : needsManualAutoRunConfirmation() && live.autoRunOff !== false && $("manual-auto-run-off").checked;
   return machine.verifiedJobUpload === true && controlActive() && autoRunOff
-    && !stopNeedsVerification && !coordinateMoveBlocksControl() && !jobError && !busy() && !drawingLocked() && !simulation.active && activeRun?.state !== "transferring"
+    && !stopNeedsVerification && !coordinateMoveBlocksControl() && !jobError && !busy() && !drawingLocked()
+    && !cutPlacementPreviewActive() && !simulation.active && activeRun?.state !== "transferring"
     && live.responded && !live.busy && live.positionFresh && live.operations.upload !== false
-    && Boolean(uploadPageNumber()) && !currentUpload && workspaceRevision !== null
-    && (!needsPagePositionConfirmation(uploadPageNumber()) || $("roll-advance-confirmed").checked);
+    && Boolean(uploadPageNumber()) && !currentUpload && workspaceRevision !== null;
+}
+
+function hasCurrentCut() {
+  return Boolean(source || controllerRoll || cutProgress);
+}
+
+function canStartNewCut() {
+  return machine.apiVersion >= 21 && hasCurrentCut() && workspaceRevision !== null && !drawingLocked() && !busy()
+    && !live.busy && !live.stopAvailable && !needsMotionVerification() && !coordinateMoveBlocksControl()
+    && activeRun?.state !== "transferring" && !xiaoHandoff;
 }
 
 function renderLayoutStatistics() {
-  const plan = cutPlan?.pages.length ? cutPlan : null;
+  const plan = cutPlan?.pages.length ? cutPlan : pendingCanvasPlan;
   const empty = $("layout-empty");
-  $("layout-statistics").hidden = !plan;
-  empty.hidden = Boolean(plan);
-  if (!plan) {
-    empty.textContent = !source ? "Откройте чертёж для расчёта"
-      : !includedBounds ? "Добавьте контуры к раскладке"
-      : cutPlanError ? "Проверьте раскладку на канвасе" : "Рассчитываем раскладку…";
-    return;
-  }
+  updateControl($("layout-statistics"), "hidden", !source);
+  updateAttribute($("layout-statistics"), "aria-busy", String(Boolean(pendingCanvasPlan)));
+  updateControl(empty, "hidden", Boolean(source));
   if (!simulation.active) layoutStatistics.setPlan(plan, false);
+}
+
+function renderSelectionControls(importing) {
+  const editing = selectedBounds && !importing && drawingPartsReady;
+  for (const id of [...placementFields, "rotate-button", "exclude-button", "delete-button"]) {
+    updateControl($(id), "disabled", !editing);
+  }
+  if (editing) {
+    updateControl($("size-width"), "disabled", selectedBounds.maxY - selectedBounds.minY < 0.001);
+    updateControl($("size-height"), "disabled", selectedBounds.maxX - selectedBounds.minX < 0.001);
+  }
+  updateControl($("measure-tool"), "disabled", importing || !placed.length);
+  renderHistoryControls(importing);
+}
+
+function renderHistoryControls(importing = drawingLocked()) {
+  for (const [id, history, action, shortcut] of [
+    ["undo-tool", measureMode ? measurementUndo : drawingUndo, "Отменить", "Ctrl+Z"],
+    ["redo-tool", measureMode ? measurementRedo : drawingRedo, "Повторить", "Ctrl+Shift+Z"],
+  ]) {
+    const label = hasMeasurementCloseStep(id === "redo-tool") ? "закрытие линейки" : history.at(-1)?.label;
+    updateControl($(id), "title", `${action}${label ? `: ${label}` : ""} (${shortcut})`);
+    updateControl($(id), "disabled", importing || !label);
+  }
 }
 
 function renderControls() {
@@ -2027,124 +2821,138 @@ function renderControls() {
   const locked = busy();
   const importing = drawingLocked();
   const inProgress = runInProgress();
+  const transferring = pendingCommand === "upload" || activeRun?.state === "transferring";
+  const jobActive = inProgress || stopPending || Boolean(live.stopAvailable);
+  updateControl(demoSwitch, "disabled", !canSwitchMachineMode());
+  updateAttribute(demoSwitch, "aria-checked", String(demoMode));
+  updateControl(demoSwitch, "title", demoMode ? "Вернуться к реальному станку" : "Включить виртуальный станок");
+  const connectButton = $("connect-companion");
+  updateControl(connectButton, "hidden", !centralMode || companionConnected || demoMode);
+  updateControl(connectButton, "disabled", companionConnecting || locked);
+  updateText(connectButton, companionConnecting ? "Подключаем…" : "Подключить помощник");
   renderLayoutStatistics();
   if (importing) {
     closePartMenu();
     if (drag?.type === "move" || drag?.type === "rotate") cancelCanvasGesture();
     endFreeRotation();
+    if (measureMode) setMeasureMode(false);
   }
-  $("import-button").disabled = $("canvas-import").disabled = importing;
-  const editing = selectedBounds && !importing && drawingPartsReady;
-  for (const id of [...placementFields, "rotate-button", "exclude-button", "delete-button"]) $(id).disabled = !editing;
-  if (editing) {
-    $("size-width").disabled = selectedBounds.maxY - selectedBounds.minY < 0.001;
-    $("size-height").disabled = selectedBounds.maxX - selectedBounds.minX < 0.001;
-  }
-  $("select-all-tool").disabled = importing || !placed.length;
-  const previous = drawingUndo.at(-1);
-  $("contour-settings").disabled = importing || (!selectedBounds && !previous);
-  $("drawing-undo").hidden = !previous;
-  $("drawing-undo").title = previous ? `Отменить ${previous.label} (Ctrl+Z)` : "";
-  $("drawing-undo").disabled = importing;
+  updateControl($("canvas-import"), "disabled", importing);
+  const newCutButton = $("new-cut-button");
+  updateControl(newCutButton, "hidden", !(machine.apiVersion >= 21) || !hasCurrentCut());
+  updateControl(newCutButton, "disabled", !canStartNewCut());
+  updateControl($("new-cut-confirm"), "disabled", newCutButton.disabled);
+  renderSelectionControls(importing);
   const includedCount = placed.length - excluded.size;
-  $("nest-button").disabled = importing || !includedCount;
-  $("optimize-button").disabled = importing || !includedCount;
+  updateControl($("nest-button"), "disabled", importing || !includedCount);
+  updateControl($("optimize-button"), "disabled", importing || !includedCount);
+  updateContourCheckControls();
   if (nestDialog.open || optimizeDialog.open) updateOptimizationControls();
 
   const armButton = $("arm-button");
-  armButton.disabled = armed ? Boolean(activeHold) || pendingCommand === "arm" : locked || !live.responded || live.busy || (!live.positionFresh && !runInProgress());
-  armButton.textContent = pendingCommand === "arm" ? "Включаем…" : armed ? "Отключить управление" : "Включить управление";
+  updateControl(armButton, "disabled", armed ? Boolean(activeHold) || ["arm", "new-cut"].includes(pendingCommand)
+    : locked || !live.responded || live.busy || (!live.positionFresh && !inProgress));
+  updateText(armButton, pendingCommand === "arm" ? "Включаем…" : armed ? "Отключить управление" : "Включить управление");
   armButton.classList.toggle("armed", armed);
-  armButton.setAttribute("aria-pressed", String(armed));
-  $("motion-verification").hidden = !needsMotionVerification();
-  $("verify-stop-button").disabled = !armed || locked || !live.responded || live.busy || machine.persistentControl !== true;
-  $("motion-verification-status").textContent = machine.persistentControl === true
+  updateAttribute(armButton, "aria-pressed", String(armed));
+  updateControl($("motion-verification"), "hidden", !needsMotionVerification());
+  updateControl($("verify-stop-button"), "disabled", !armed || locked || !live.responded || live.busy || machine.persistentControl !== true);
+  updateText($("motion-verification-status"), machine.persistentControl === true
     ? "Остановка пока не подтверждена. Движение заблокировано."
-    : "Обновите сервер плоттера, чтобы проверить остановку без отключения управления.";
+    : "Обновите сервер плоттера, чтобы проверить остановку без отключения управления.");
 
   for (const button of holdButtons) {
     const held = activeHold?.button === button && !activeHold.released;
     const direction = button.dataset.controllerHold;
     const available = !stopNeedsVerification && !coordinateMoveBlocksControl() && live.positionFresh && live.hold[direction] === true;
-    button.setAttribute("aria-pressed", String(held));
-    button.disabled = !held && (!armed || locked || runInProgress() || activeRun?.state === "transferring" || !live.responded || live.busy || !available);
+    updateAttribute(button, "aria-pressed", String(held));
+    updateControl(button, "disabled", !held && (!armed || locked || runInProgress() || activeRun?.state === "transferring" || !live.responded || live.busy || !available));
   }
   const pause = $("pause-button");
-  pause.dataset.operation = activeRun?.state === "paused" ? "resume-cut" : "pause-cut";
-  pause.querySelector("span").textContent = pause.dataset.operation === "resume-cut" ? "Продолжить" : "Пауза";
-  pause.hidden = !inProgress;
-  for (const button of operationButtons) button.disabled = !operationAllowed(button.dataset.operation);
+  const stop = $("cancel-button");
+  updateAttribute(pause, "data-operation", activeRun?.state === "paused" ? "resume-cut" : "pause-cut");
+  updateText(pause.querySelector("span"), pause.dataset.operation === "resume-cut" ? "Продолжить" : "Пауза");
+  for (const button of operationButtons) updateControl(button, "disabled", !operationAllowed(button.dataset.operation));
+  updateControl(pause, "hidden", !inProgress || !["running", "pausing", "paused", "resuming"].includes(activeRun?.state));
+  updateControl(stop, "hidden", !jobActive);
+  updateControl($("job-action-row"), "hidden", pause.hidden && stop.hidden);
   renderClamp();
   renderVacuum();
+  renderLayoutActions({ importing, locked, inProgress, transferring, jobActive, armed });
+  const acknowledgeRun = $("run-acknowledge");
+  updateControl(acknowledgeRun, "hidden", !(runInProgress() && ["unknown", "error"].includes(activeRun?.state)));
+  updateControl(acknowledgeRun, "disabled", !operationAllowed("acknowledge-run"));
+  if (!acknowledgeRun.hidden) updateText(acknowledgeRun, demoMode
+    ? "Подтверждаю остановку виртуального станка" : "Подтверждаю остановку на пульте");
+}
 
-  $("simulation-button").disabled = importing || !includedBounds || Boolean(cutPlan && !cutPlan.pages.length);
+function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inProgress = runInProgress(),
+  transferring = pendingCommand === "upload" || activeRun?.state === "transferring",
+  jobActive = inProgress || stopPending || Boolean(live.stopAvailable), armed = controlActive() } = {}) {
+  const partMoving = cutPlacementPreviewActive();
+  const displayedPlan = cutPlan ?? pendingCanvasPlan;
+  const planPending = !cutPlan && Boolean(includedBounds) && !cutPlanError;
+  updateControl($("simulation-button"), "disabled", importing || partMoving || stopPending || Boolean(currentUpload) || Boolean(jobError)
+    || planPending || !includedBounds || Boolean(cutPlan && !cutPlan.pages.length));
   const uploadButton = $("controller-upload-button");
-  const roll = controllerRoll?.planId === cutPlan?.planId ? controllerRoll : null;
-  renderPagePicker(roll, importing || locked || Boolean(currentUpload));
-  const uploadPage = uploadPageNumber();
-  renderContinuationNote(roll, uploadPage ?? shownCutPage);
+  const roll = controllerRoll?.planId === displayedPlan?.planId ? controllerRoll : null;
+  renderPagePicker(displayedPlan, roll, importing || partMoving || !cutPlan || locked || Boolean(currentUpload));
   const directRoll = cutPlan?.mode === "roll" && cutPlan.canUpload && machine.directRoll === true;
   const waitingForAdvance = roll?.state === "advance";
-  const manualAutoRun = Boolean(uploadPage && !currentUpload && needsManualAutoRunConfirmation());
-  const requiresAdvance = needsPagePositionConfirmation(uploadPage);
+  const visibleUploadPage = uploadPageNumber(displayedPlan);
+  const manualAutoRun = Boolean(visibleUploadPage && !currentUpload && !jobActive && needsManualAutoRunConfirmation());
   const canResetRoll = Boolean(controllerRoll && ["completed", "cancelled", "unknown", "ready", "advance"].includes(controllerRoll.state));
-  $("manual-auto-run").hidden = !manualAutoRun;
-  $("manual-auto-run-off").disabled = importing || locked || !live.responded || live.busy;
-  $("roll-advance").hidden = !requiresAdvance;
-  $("roll-advance-confirmed").disabled = importing || locked || !armed || !live.responded || live.busy;
-  if (requiresAdvance) {
-    $("roll-advance-label").textContent = `Проверить начало прохода ${uploadPage} у нуля станка (X = 0)`;
-  }
-  $("roll-reset").hidden = !canResetRoll;
-  $("roll-reset").disabled = !armed || locked || importing || live.busy || !live.positionFresh || stopNeedsVerification || coordinateMoveBlocksControl();
-  $("roll-reset").textContent = roll && !cutPlan?.hasContinuations ? "Выбрать другой проход…" : "Завершить сеанс рулона";
-  uploadButton.disabled = !uploadAllowed();
+  updateControl($("manual-auto-run"), "hidden", !manualAutoRun);
+  updateControl($("manual-auto-run-off"), "disabled", importing || partMoving || !cutPlan || locked || !live.responded || live.busy);
+  updateControl($("roll-reset"), "hidden", !canResetRoll || jobActive);
+  updateControl($("job-pass-frame"), "hidden", $("job-page-field").hidden && $("roll-reset").hidden);
+  updateControl($("roll-reset"), "disabled", !armed || locked || importing || live.busy || !live.positionFresh || stopNeedsVerification || coordinateMoveBlocksControl());
+  updateText($("roll-reset"), roll?.state === "ready" && !roll.completedPages && !cutPlan?.hasContinuations
+    ? "Сменить начальный проход" : "Начать раскрой заново");
+  updateControl(uploadButton, "disabled", !(currentUpload ? operationAllowed("cut") : uploadAllowed()));
   if (uploadConfirmDialog.open) {
     if (inProgress || stopPending) closeUploadConfirmation();
-    else $("upload-confirm-accept").disabled = !matchesUploadIntent(uploadConfirmation);
+    else updateControl($("upload-confirm-accept"), "disabled", !matchesLaunchIntent(uploadConfirmation));
   }
-  uploadButton.textContent = pendingCommand === "upload" ? "Загрузка…"
-    : directRoll && uploadPage ? `Загрузить проход ${uploadPage}` : "Загрузить";
-  const canDownloadXiao = cutPlan?.canPrepareXiao === true;
+  updateText(uploadButton.querySelector("span"), transferring ? "Загрузка…" : "Старт");
+  const canDownloadXiao = !jobError && cutPlan?.canPrepareXiao === true;
   const useXiao = canDownloadXiao && !currentUpload && !cutPlan.canUpload;
-  $("job-prepare-actions").hidden = Boolean(currentUpload || inProgress || stopPending);
-  $("job-title").closest(".job-section").classList.toggle("job-in-progress", inProgress || stopPending);
+  updateControl(uploadButton, "hidden", (!visibleUploadPage && !currentUpload && !transferring)
+    || jobActive || ["cut", "new-cut"].includes(pendingCommand));
+  updateControl($("job-prepare-actions"), "hidden", uploadButton.hidden);
   const xiaoOpen = $("prepare-xiao-open");
   const xiaoDownload = $("prepare-xiao-download");
-  uploadButton.hidden = useXiao;
-  xiaoOpen.hidden = !useXiao || !machine.xiaoAvailable;
-  xiaoOpen.disabled = importing || locked || Boolean(xiaoHandoff);
-  xiaoDownload.disabled = importing || Boolean(xiaoHandoff);
-  xiaoOpen.textContent = xiaoHandoff === "open" ? "Открываем…" : "Открыть в Xiao";
-  xiaoDownload.textContent = xiaoHandoff === "download" ? "Готовим DXF…" : "Скачать DXF для Xiao";
-  $("xiao-handoff").hidden = !canDownloadXiao;
-  $("xiao-result").hidden = !xiaoResult;
-  $("xiao-result").textContent = xiaoResult || "";
-  const verificationRequired = Boolean(currentUpload);
-  $("job-verification").hidden = !verificationRequired;
-  $("job-verified").disabled = locked || !armed;
-  $("job-verified-label").textContent = directRoll && currentUpload
-    ? `Сверил проход ${currentUpload.page} из ${cutPlan.pages.length} и его положение на станке`
-    : "Сверил деталь и её положение на станке";
+  const showXiaoOpen = !demoMode && machine.xiaoAvailable && displayedPlan?.canPrepareXiao && !displayedPlan.canUpload;
+  updateControl(xiaoOpen, "hidden", !showXiaoOpen);
+  updateControl(xiaoOpen, "disabled", !useXiao || importing || partMoving || locked || jobActive || Boolean(xiaoHandoff));
+  updateControl(xiaoDownload, "disabled", !canDownloadXiao || importing || partMoving || Boolean(xiaoHandoff));
+  updateControl(xiaoDownload, "title", !canDownloadXiao ? jobError || cutPlanError || "Дождитесь проверки раскладки."
+    : partMoving ? "Завершите перемещение детали." : "");
+  updateText(xiaoOpen, xiaoHandoff === "open" ? "Открываем…" : "Открыть в Xiao");
+  updateText(xiaoDownload, xiaoHandoff === "download" ? "Готовим DXF…" : "Скачать DXF");
+  updateControl($("xiao-handoff"), "hidden", !includedBounds);
+  updateControl($("xiao-result"), "hidden", !xiaoResult);
+  updateText($("xiao-result"), xiaoResult || "");
   let status;
-  if (stopPending) status = "Отправляем команду остановки…";
-  else if (pendingCommand === "upload") status = "Передача чертежа…";
-  else if (runInProgress()) status = runLabels[live.externalMotion || activeRun?.state] || "Проверьте штатный пульт";
+  if (pendingCommand === "new-cut") status = "Очищаем рабочую область…";
+  else if (stopPending) status = "Отправляем команду остановки…";
+  else if (pendingCommand === "cut") status = "Запускаем раскрой…";
+  else if (transferring) status = "Передача чертежа…";
+  else if (inProgress) status = runLabels[live.externalMotion || activeRun?.state] || "Проверьте штатный пульт";
   else if (stopNeedsVerification) status = "Ожидаем подтверждение остановки";
   else if (machine.verifiedJobUpload === false) status = "Перезапустите локальный сервер плоттера";
   else if (!source) status = "Откройте DXF или DWG";
   else if (!includedBounds) status = "Добавьте контур к заданию";
-  else if (cutPlanError || jobError) status = cutPlanError || jobError;
-  else if (!cutPlan) status = "Проверяем геометрию…";
+  else if (jobError || cutPlanError) status = jobError || cutPlanError;
+  else if (!cutPlan) status = "Обновляем расчёт раскладки…";
   else if (controllerRoll && !roll) status = "На станке открыт другой рулон. Завершите его сеанс перед загрузкой.";
-  else if (currentUpload) status = verificationRequired && !$("job-verified").checked
-    ? "Сверьте проход на пульте и поставьте отметку. Затем нажмите «Старт» здесь."
-    : "Проход загружен. Нажмите «Старт».";
+  else if (currentUpload) status = "";
   else if (roll?.state === "completed") status = `Раскрой завершён · ${roll.completedPages} из ${roll.pages - (roll.firstPage ?? 1) + 1} проходов`;
-  else if (cutProgress?.planId === cutPlan.planId && cutProgress.state === "completed") status = "Раскрой завершён";
+  else if (cutProgress?.state === "completed" && cutProgress.planId === cutPlan.planId) status = "Раскрой завершён";
   else if (roll?.state === "cancelled" || roll?.state === "unknown") status = `Сверьте проход ${roll.page} и положение ткани перед продолжением.`;
   else if (waitingForAdvance) status = `Проход ${roll.page} завершён. Следующий проход — ${roll.nextPage}.`;
   else if (useXiao && cutPlan.uploadIssue) status = cutPlan.uploadIssue;
+  else if (useXiao && demoMode) status = "Раскладка доступна для скачивания в DXF.";
   else if (useXiao && [...sectionByPath.values()].includes(null)) {
     status = !machine.continuousRoll ? "Для продолжения длинных деталей обновите локальный сервер. Также можно открыть цельную раскладку в Xiao."
       : "Прямая загрузка недоступна для этой раскладки. Можно открыть цельную раскладку в Xiao.";
@@ -2158,25 +2966,24 @@ function renderControls() {
   else if (!armed) status = "Включите управление для загрузки";
   else if (live.autoRunOff === false) status = "Выключите Auto Run на штатном пульте";
   else if (manualAutoRun && !$("manual-auto-run-off").checked) status = "Отметьте проверку Auto Run для загрузки";
-  else if (requiresAdvance && !$("roll-advance-confirmed").checked) status = "Отметьте проверку положения прохода для загрузки";
-  else if (manualAutoRun || requiresAdvance) status = "Проверки подтвердите при загрузке";
-  else if (machine.autoRunReadback === false) status = "Чтение Auto Run для платы ещё не настроено";
-  else if (live.autoRunOff !== true) status = "Режим Auto Run не считан";
-  else status = live.uploadUnavailableReason || "Можно загрузить";
-  $("loaded-job").textContent = status;
-  uploadButton.title = status;
+  else if (!manualAutoRun && machine.autoRunReadback === false) status = "Чтение Auto Run для платы ещё не настроено";
+  else if (!manualAutoRun && live.autoRunOff !== true) status = "Режим Auto Run не считан";
+  else status = live.uploadUnavailableReason || "";
+  const statusLabel = $("loaded-job");
+  updateText(statusLabel, status);
+  updateControl(statusLabel, "hidden", !status && !includedBounds);
+  statusLabel.classList.toggle("has-layout", Boolean(includedBounds));
+  updateControl(uploadButton, "title", uploadButton.disabled ? status : "Подтвердить и запустить раскрой");
   const identity = $("job-identity");
-  identity.textContent = source?.filename || "";
-  identity.title = identity.textContent;
-  identity.hidden = !identity.textContent;
+  updateText(identity, source?.filename || "");
+  updateControl(identity, "title", identity.textContent);
+  updateControl(identity, "hidden", !identity.textContent);
   const detail = $("job-detail");
   const dimensions = includedBounds
     ? `${number(includedBounds.maxY - includedBounds.minY)} × ${number(includedBounds.maxX - includedBounds.minX)} мм` : "";
-  const passes = $("job-page-field").hidden && cutPlan?.pages.length ? ` · проходов: ${cutPlan.pages.length}` : "";
-  detail.textContent = dimensions ? dimensions + passes : "";
-  detail.hidden = !detail.textContent;
-  $("run-acknowledge").hidden = !(runInProgress() && ["unknown", "error"].includes(activeRun?.state));
-  $("run-acknowledge").disabled = !operationAllowed("acknowledge-run");
+  const passes = $("job-page-field").hidden && displayedPlan?.pages.length ? ` · проходов: ${displayedPlan.pages.length}` : "";
+  updateText(detail, dimensions ? dimensions + passes : "");
+  updateControl(detail, "hidden", !detail.textContent);
 }
 
 function renderClamp() {
@@ -2184,17 +2991,17 @@ function renderClamp() {
   const action = clampLowered ? "raise-clamp" : "clamp";
   const sending = pendingCommand === "clamp" ? "Опускаем…"
     : ["raise-clamp", "cancel-cut"].includes(pendingCommand) ? "Поднимаем…" : "";
-  button.dataset.operation = action;
-  button.querySelector(".material-action-label").textContent = sending || "Лапки";
-  button.querySelector("use").setAttribute("href", clampLowered ? "#i-lift" : "#i-lower");
-  button.setAttribute("aria-busy", String(Boolean(sending)));
+  updateAttribute(button, "data-operation", action);
+  updateText(button.querySelector(".material-action-label"), sending || "Лапки");
+  updateAttribute(button.querySelector("use"), "href", clampLowered ? "#i-lift" : "#i-lower");
+  updateAttribute(button, "aria-busy", String(Boolean(sending)));
   button.classList.toggle("lowered", clampLowered);
-  button.setAttribute("aria-pressed", String(clampLowered));
-  button.disabled = !operationAllowed(action);
-  button.title = sending ? "Команда отправляется. Дождитесь завершения."
+  updateAttribute(button, "aria-pressed", String(clampLowered));
+  updateControl(button, "disabled", !operationAllowed(action));
+  updateControl(button, "title", sending ? "Команда отправляется. Дождитесь завершения."
     : machine.clampControl !== true || !(machine.apiVersion >= 12) ? "Перезапустите сервер плоттера"
     : clampLowered ? "Лапки опущены. Поднять лапки — вакуум выключится, Z поднимется."
-    : "Лапки подняты. Опустить лапки.";
+    : "Лапки подняты. Опустить лапки.");
 }
 
 function renderVacuum() {
@@ -2202,63 +3009,46 @@ function renderVacuum() {
   const action = vacuumEnabled ? "vacuum-off" : "vacuum";
   const sending = pendingCommand === "vacuum" ? "Включаем…"
     : ["vacuum-off", "raise-clamp", "cancel-cut"].includes(pendingCommand) ? "Выключаем…" : "";
-  button.dataset.operation = action;
-  button.querySelector(".material-action-label").textContent = sending || "Вакуум";
-  button.setAttribute("aria-busy", String(Boolean(sending)));
+  updateAttribute(button, "data-operation", action);
+  updateText(button.querySelector(".material-action-label"), sending || "Вакуум");
+  updateAttribute(button, "aria-busy", String(Boolean(sending)));
   button.classList.toggle("enabled", vacuumEnabled);
-  button.setAttribute("aria-pressed", String(vacuumEnabled));
-  button.disabled = !operationAllowed(action);
-  button.title = sending ? "Команда отправляется. Дождитесь завершения."
+  updateAttribute(button, "aria-pressed", String(vacuumEnabled));
+  updateControl(button, "disabled", !operationAllowed(action));
+  updateControl(button, "title", sending ? "Команда отправляется. Дождитесь завершения."
     : machine.independentVacuumControl !== true || !(machine.apiVersion >= 12) ? "Перезапустите сервер плоттера"
-    : vacuumEnabled ? "Вакуум включён. Выключить вакуум." : "Вакуум выключен. Включить вакуум.";
+    : vacuumEnabled ? "Вакуум включён. Выключить вакуум." : "Вакуум выключен. Включить вакуум.");
 }
 
 function renderRun() {
   const run = activeRun;
   const partCounts = renderCutProgress();
-  $("run-panel").hidden = !run && !cutProgress || !cutProgress && run?.state === "idle";
-  if ($("run-panel").hidden) return;
+  const started = cutProgress ? Number.isFinite(cutProgress.startedAt) || cutProgress.completedPages > 0
+    : machine.liveCutProgress !== true && Number.isFinite(run?.startedAt) && run.state !== "idle"
+      && (Boolean(run.startedReceipt) || (trackedRun?.startedAt === run.startedAt && trackedRun.filename === run.filename));
+  const panel = $("run-panel");
+  updateControl(panel, "hidden", !started);
+  if (panel.hidden) return;
   const state = live.externalMotion || cutProgress?.state || run?.state;
-  const label = state === "advance" ? "Смена прохода" : runLabels[state] || "Сверьте пульт";
-  if ($("run-state").textContent !== label) $("run-state").textContent = label;
-  $("run-state").dataset.state = state || "";
-  if (run) renderRunStatistics(run);
+  const label = state === "advance" ? "Смена прохода"
+    : demoMode && (!runLabels[state] || state === "unknown") ? "Состояние не подтверждено"
+    : runLabels[state] || "Сверьте пульт";
+  updateText($("run-state"), label);
+  updateAttribute($("run-state"), "data-state", state || "");
+  renderRunStatistics(run ?? cutProgress);
   const page = cutProgress ?? controllerRoll ?? run;
-  $("run-page").textContent = page?.page ? `${page.state === "advance" ? page.page + 1 : page.page} из ${page.pages}` : "—";
-  $("run-done").textContent = partCounts ? `${partCounts.count} из ${partCounts.total}` : "—";
-  const index = cutProgress ? cutProgress.index : run?.fresh ? run.index : null;
-  const limit = cutProgress?.indexLimit ?? run?.indexLimit;
-  $("run-index").textContent = Number.isInteger(index) && Number.isInteger(limit) ? `${index} / ${limit}` : "—";
-  $("run-update").textContent = Number.isFinite(run?.updatedAt)
-    ? (run.fresh ? "Последний ответ " : "Данные устарели · ") + clockFormat.format(run.updatedAt)
-    : "Подтверждённых данных пока нет";
-  $("run-coordinates").textContent = lastPositionAt === null ? "Координаты —" : [
-    ...["x", "y", "z", "w", "a"].map((axis) => {
-      const coordinate = live.position?.[axis];
-      return `${axis.toUpperCase()} ${Number.isFinite(coordinate) ? formatCoordinate.format(coordinate) : "—"}`;
-    }),
-    ...(!live.positionFresh ? ["устарели " + clockFormat.format(lastPositionAt)] : []),
-  ].join(" · ");
-  renderRunElapsed();
-}
-
-function renderRunElapsed() {
-  if (!activeRun?.startedAt) {
-    $("run-elapsed").textContent = "—";
-    return;
-  }
-  const finish = activeRun.endedAt ?? (runInProgress() ? Date.now() : activeRun.updatedAt);
-  $("run-elapsed").textContent = Number.isFinite(finish) ? formatDuration((finish - activeRun.startedAt) / 1000) : "—";
+  updateText($("run-page"), page?.page ? `${page.state === "advance" ? page.page + 1 : page.page} из ${page.pages}` : "—");
+  updateText($("run-done"), partCounts ? `${partCounts.count} из ${partCounts.total}` : "—");
 }
 
 function renderLive() {
   const state = $("machine-state");
   const link = live.busy ? "busy" : live.responded ? "connected" : liveObserved ? "offline" : "";
-  state.className = ("machine-state " + link).trim();
-  state.title = live.message || "";
-  $("machine-state-label").textContent = live.busy ? "Контроллер занят" : live.responded ? "На связи"
-    : liveObserved ? "Нет связи" : "Проверяем связь";
-  $("machine-address").textContent = live.ip || machine.ip;
+  updateControl(state, "className", ("machine-state " + link).trim());
+  updateControl(state, "title", live.message || "");
+  updateText($("machine-state-label"), live.busy ? "Контроллер занят" : live.responded ? "На связи"
+    : liveObserved ? "Нет связи" : "Проверяем связь");
+  updateText($("machine-address"), demoMode ? "Виртуальный станок" : live.ip || machine.ip || "—");
   renderHead();
   renderRun();
   renderControls();
@@ -2281,7 +3071,6 @@ function applyLive(response) {
       : response.responded ? { 3: "running", 9: "paused", 50: "feeding" }[response.lastEvent?.code] ?? null : live.externalMotion,
     stopAvailable: typeof response.stopAvailable === "boolean" ? response.stopAvailable : undefined,
   };
-  if (response.position && !response.busy) lastPositionAt = Date.now();
   if (response.motionInhibited === true) stopNeedsVerification = true;
   else if (stopNeedsVerification && response.motionInhibited === false && response.position && response.responded && !response.busy) {
     stopNeedsVerification = false;
@@ -2295,9 +3084,14 @@ function applyLive(response) {
 
 async function readConfiguration() {
   const epoch = liveEpoch;
+  const modeEpoch = machineModeEpoch;
   try {
-    const { machine: configuration, apiVersion, roll, cutProgress: progress } = await getJson("/api/status", { signal: AbortSignal.timeout(3500) });
-    if (!configuration) return;
+    const { machine: configuration, apiVersion, roll, cutProgress: progress, demoAvailable: available,
+      demoMode: reportedMode, centralMode: central, companionMode: companion } =
+      await getJson("/api/status", { signal: AbortSignal.timeout(3500) });
+    if (modeEpoch !== machineModeEpoch || !configuration || (reportedMode === true) !== demoMode) return false;
+    if (!companion) centralMode = central === true;
+    demoAvailable = available === true;
     machine = { ...configuration, apiVersion, verifiedJobUpload: configuration.verifiedJobUpload === true };
     const { actuators, ...jobConfiguration } = configuration;
     applyJobStatus(jobConfiguration);
@@ -2308,8 +3102,13 @@ async function readConfiguration() {
     }
     updateDrawing({ edited: false });
     renderLive();
+    if (centralMode && !demoMode && !companionConnected && !companionConnecting && readStoredBoolean("plotter.companion")) {
+      void connectCompanion();
+    }
+    return true;
   } catch {
     // The live controller request reports local connectivity independently.
+    return false;
   }
 }
 
@@ -2337,7 +3136,16 @@ async function readLive() {
     const response = await getJson("/api/controller-live", jsonRequest({}, AbortSignal.timeout(3500)));
     if (epoch === liveEpoch && !busy()) applyLive(response);
   } catch (error) {
-    if (epoch === liveEpoch && !busy()) applyLive({ responded: false, busy: error.status === 409, message: messageFrom(error) });
+    if (epoch === liveEpoch && !busy()) {
+      const companionUnavailable = error.status === undefined || error.status === 403 || error.status === 404 || error.status >= 500;
+      if (!demoMode && centralMode && companionConnected && companionUnavailable && !runInProgress() && !controlActive()) {
+        companionConnected = false;
+        try { sessionStorage.removeItem("plotter.companion"); } catch { /* Storage is optional. */ }
+        setMachineError("Нет связи с помощником. Подключите его снова.");
+        void readConfiguration();
+      }
+      applyLive({ responded: false, busy: error.status === 409, message: messageFrom(error) });
+    }
   } finally {
     liveReading = null;
     finish();
@@ -2363,7 +3171,6 @@ function applyPosition(response) {
   if (response.position) {
     live.position = response.position;
     live.positionFresh = true;
-    lastPositionAt = Date.now();
   }
   if (response.hold) live.hold = response.hold;
   if (response.operations) live.operations = response.operations;
@@ -2532,7 +3339,8 @@ async function stopControllerHold(reason = "") {
     const stopped = ["released", "expired", "cancelled", "stopped"].includes(response.phase);
     const unverified = !stopped || (response.sent === true && response.positionStable !== true);
     if (reason || unverified || response.phase === "expired") {
-      const detail = response.message || (unverified ? "Проверьте положение на штатном пульте."
+      const verify = demoMode ? "Подтвердите остановку виртуального станка." : "Проверьте положение на штатном пульте.";
+      const detail = response.message || (unverified ? verify
         : response.phase === "expired" ? "Удержание прервано." : "");
       setMachineError([reason, detail].filter(Boolean).join(" "));
     }
@@ -2540,7 +3348,8 @@ async function stopControllerHold(reason = "") {
     applyPosition(response);
   } catch {
     stopNeedsVerification = true;
-    setMachineError("Ответ на остановку не получен. Проверьте станок на штатном пульте.");
+    setMachineError(demoMode ? "Ответ на остановку виртуального станка не получен."
+      : "Ответ на остановку не получен. Проверьте станок на штатном пульте.");
   } finally {
     activeHold = null;
     liveEpoch++;
@@ -2575,7 +3384,7 @@ function holdKey(event) {
 function rememberRunStatistics(run, plan) {
   trackedRun = { startedAt: run.startedAt, filename: run.filename, plan };
   try {
-    sessionStorage.setItem("plotter.runStatistics", JSON.stringify(trackedRun));
+    sessionStorage.setItem(machineStorageKey("runStatistics"), JSON.stringify(trackedRun));
   } catch { /* Session storage is optional. */ }
 }
 
@@ -2625,7 +3434,7 @@ async function runControllerOperation(action) {
     if (stopAtStart !== stopRevision) return;
     const rejected = error.status >= 400 && error.status < 500;
     if (action === "cut") clearCurrentUpload();
-    const message = rejected ? messageFrom(error) : "Результат отправки неизвестен. Проверьте штатный пульт.";
+    const message = rejected || demoMode ? messageFrom(error) : "Результат отправки неизвестен. Проверьте штатный пульт.";
     setMachineError(message);
   } finally {
     operationRefreshUntil = performance.now() + 3000;
@@ -2640,6 +3449,7 @@ async function stopControllerCut() {
   liveEpoch++;
   setMachineError();
   renderControls();
+  const retry = demoMode ? "Повторите остановку." : "Используйте физический стоп.";
   try {
     const payload = { action: "cancel-cut", ...(controlActive() ? { controlToken: control.token } : {}) };
     const response = await getJson("/api/controller-operation", jsonRequest(payload, AbortSignal.timeout(5000)));
@@ -2648,10 +3458,10 @@ async function stopControllerCut() {
       clearCurrentUpload();
       if (response.run?.state === "cancelling") live.externalMotion = null;
     } else {
-      setMachineError(response.message || "Команда остановки отклонена. Используйте физический стоп.");
+      setMachineError(response.message || `Команда остановки отклонена. ${retry}`);
     }
   } catch (error) {
-    setMachineError(`${messageFrom(error)} Используйте физический стоп.`);
+    setMachineError(`${messageFrom(error)} ${retry}`);
   } finally {
     stopPending = false;
     liveEpoch++;
@@ -2666,50 +3476,72 @@ function closeUploadConfirmation() {
   if (uploadConfirmDialog.open) uploadConfirmDialog.close();
 }
 
-function matchesUploadIntent(intent) {
-  return Boolean(intent && uploadAllowed() && focusEpoch === intent.focus
-    && control?.token === intent.token && cutPlan?.planId === intent.planId
-    && uploadPageNumber() === intent.page && needsManualAutoRunConfirmation() === intent.checkAutoRun
-    && needsPagePositionConfirmation(intent.page) === intent.checkZero);
+function matchesLaunchIntent(intent) {
+  if (!intent || !focused() || focusEpoch !== intent.focus || stopRevision !== intent.stopRevision
+      || control?.token !== intent.token || cutPlan?.planId !== intent.planId) return false;
+  if (intent.upload) return currentUpload === intent.upload && operationAllowed("cut");
+  return uploadAllowed() && uploadPageNumber() === intent.page
+    && needsManualAutoRunConfirmation() === intent.checkAutoRun
+    && needsPagePositionConfirmation(intent.page) === intent.checkZero;
 }
 
-function requestControllerUpload() {
-  if (!uploadAllowed() || !focused()) return;
+function requestControllerLaunch() {
+  if (!focused() || uploadConfirmDialog.open || !(currentUpload ? operationAllowed("cut") : uploadAllowed())) return;
   cancelCanvasGesture();
-  const page = uploadPageNumber();
+  const page = currentUpload?.page ?? uploadPageNumber();
   const intent = {
-    planId: cutPlan.planId, page, token: control.token, focus: focusEpoch,
-    checkAutoRun: needsManualAutoRunConfirmation(), checkZero: needsPagePositionConfirmation(page),
+    planId: cutPlan.planId, page, token: control.token, focus: focusEpoch, stopRevision, upload: currentUpload,
+    checkAutoRun: !currentUpload && needsManualAutoRunConfirmation(),
+    checkZero: !currentUpload && needsPagePositionConfirmation(page),
   };
-  if (!intent.checkAutoRun && !intent.checkZero) {
-    void uploadControllerDrawing(intent, false);
-    return;
-  }
   uploadConfirmation = intent;
-  $("upload-confirm-target").textContent = cutPlan.mode === "roll"
-    ? `Перед загрузкой прохода ${page} подтвердите:` : "Перед загрузкой подтвердите:";
+  const job = cutPlan.mode === "roll" ? `проход ${page} из ${cutPlan.pages.length}` : "раскрой";
+  const mode = demoMode ? " в деморежиме" : "";
+  $("upload-confirm-target").textContent = intent.upload
+    ? `Запустить ${job}${mode}.` : `Загрузить и запустить ${job}${mode}.`;
+  $("upload-confirm-checks").hidden = demoMode && !intent.checkAutoRun && !intent.checkZero;
+  $("upload-confirm-placement").hidden = demoMode;
   $("upload-confirm-auto-run").hidden = !intent.checkAutoRun;
   $("upload-confirm-zero").hidden = !intent.checkZero;
-  $("upload-confirm-zero").textContent = `Начало прохода ${page} подведено к нулю станка (X = 0).`;
-  $("upload-confirm-seam").hidden = !cutPlan.pages[page - 1]?.incomingSeams?.length;
+  const target = demoMode ? "виртуального станка" : "станка";
+  const feed = controllerRoll?.state === "advance" ? cutPlan.pages[page - 2]?.feedAfterMm : null;
+  const showFeed = intent.checkZero && Number.isFinite(feed) && feed > 0;
+  $("upload-confirm-feed").hidden = !showFeed;
+  if (showFeed) {
+    const feedAction = demoMode ? "Имитируйте протяжку полотна на" : "Протяните полотно на";
+    $("upload-confirm-feed-text").textContent = `${feedAction} ${formatFeedDistance.format(feed)} мм.`;
+  }
+  $("upload-confirm-zero-text").textContent = `Совместите начало прохода ${page} с нулём ${target}.`;
+  $("upload-confirm-seam").hidden = !intent.checkZero || !cutPlan.pages[page - 1]?.incomingSeams?.length;
   $("upload-confirm-accept").disabled = false;
   uploadConfirmDialog.showModal();
 }
 
-async function uploadControllerDrawing(intent, confirmed) {
-  if (!matchesUploadIntent(intent) || !focused() || (intent.checkAutoRun || intent.checkZero) && !confirmed) return;
+async function confirmControllerLaunch(intent) {
+  if (!matchesLaunchIntent(intent)) return;
+  const upload = intent.upload ?? await uploadControllerDrawing(intent);
+  if (!upload) return;
+  if (!matchesLaunchIntent({ ...intent, upload })) {
+    if (currentUpload === upload) setMachineError("Условия запуска изменились. Нажмите «Старт», чтобы повторить.");
+    return;
+  }
+  await runControllerOperation("cut");
+}
+
+async function uploadControllerDrawing(intent) {
   const plan = cutPlan;
   const { page, focus, planId, token, checkAutoRun, checkZero } = intent;
   const payload = {
     planId, controlToken: token, page,
-    autoRunOff: confirmed && checkAutoRun,
-    advanceConfirmed: confirmed && checkZero,
+    autoRunOff: checkAutoRun,
+    advanceConfirmed: checkZero,
   };
   clearCurrentUpload();
   setPending("upload");
   try {
     if (!await persistWorkspace() || !controlActive() || control?.token !== payload.controlToken || !focused()
-        || focusEpoch !== focus || cutPlan?.planId !== payload.planId || uploadPageNumber(plan) !== page) {
+        || focusEpoch !== focus || stopRevision !== intent.stopRevision
+        || cutPlan?.planId !== payload.planId || uploadPageNumber(plan) !== page) {
       setMachineError("Сохраните раскладку и проверьте сеанс управления.");
       return;
     }
@@ -2726,6 +3558,7 @@ async function uploadControllerDrawing(intent, confirmed) {
         verificationRequired: response.verificationRequired,
         page, statistics: snapshotRunPlan(plan, response.indexLimit, page),
       };
+      return currentUpload;
     } else if (uploaded) {
       setMachineError("Сеанс закончился. Включите управление и загрузите текущий чертёж заново.");
     } else {
@@ -2735,22 +3568,47 @@ async function uploadControllerDrawing(intent, confirmed) {
   } catch (error) {
     const rejected = error.status >= 400 && error.status < 500;
     if (!rejected) uploadUncertain = true;
-    setMachineError(rejected ? messageFrom(error) : "Результат передачи неизвестен. Проверьте задание на пульте.");
+    setMachineError(rejected || demoMode ? messageFrom(error) : "Результат передачи неизвестен. Проверьте задание на пульте.");
   } finally {
     renderRun();
     setPending(null);
   }
 }
 
-async function resetControllerRoll() {
-  if (!controllerRoll || $("roll-reset").disabled || !focused()) return;
+function canResetControllerRoll() {
+  const button = $("roll-reset");
+  return Boolean(controllerRoll && !button.hidden && !button.disabled && controlActive() && focused());
+}
+
+function openRollResetDialog() {
+  if (!canResetControllerRoll() || rollResetDialog.open) return;
   const abandoning = cutPlan?.planId === controllerRoll.planId && cutPlan.hasContinuations && controllerRoll.state !== "completed";
-  const message = abandoning
-    ? "Завершить текущий сеанс? После сброса нельзя начать с прохода, который продолжает незавершённую деталь. Подтвердите, что станок остановлен."
-    : "Завершить текущий сеанс рулона? Подтвердите, что станок остановлен. Перед следующей загрузкой подтяните начало выбранного прохода к нулю станка.";
-  if (!window.confirm(message)) return;
-  const { planId } = controllerRoll;
-  const controlToken = control.token;
+  const title = $("roll-reset").textContent;
+  updateText($("roll-reset-title"), `${title}?`);
+  updateText($("roll-reset-confirm"), title === "Сменить начальный проход" ? "Сменить проход" : "Начать заново");
+  updateControl($("roll-reset-continuation"), "hidden", !abandoning);
+  updateControl($("roll-reset-stop"), "hidden", demoMode);
+  rollResetIntent = {
+    roll: controllerRoll,
+    controlToken: control.token,
+    focus: focusEpoch,
+    startedAt: cutProgress?.startedAt,
+  };
+  rollResetDialog.returnValue = "";
+  rollResetDialog.showModal();
+}
+
+async function resetControllerRoll(intent) {
+  if (!intent) return;
+  const { planId, state, page, completedPages } = intent.roll;
+  const { controlToken } = intent;
+  if (!canResetControllerRoll() || intent.focus !== focusEpoch || control.token !== controlToken
+      || controllerRoll.planId !== planId || controllerRoll.state !== state
+      || controllerRoll.page !== page || controllerRoll.completedPages !== completedPages
+      || cutProgress?.startedAt !== intent.startedAt) {
+    setMachineError("Состояние раскроя изменилось. Откройте подтверждение снова.");
+    return;
+  }
   setPending("roll-reset");
   try {
     const response = await getJson("/api/roll-reset",
@@ -2766,17 +3624,78 @@ async function resetControllerRoll() {
   }
 }
 
+function openNewCutDialog() {
+  if (!canStartNewCut()) return;
+  newCutDialog.returnValue = "";
+  newCutDialog.showModal();
+}
+
+async function clearForNewCut() {
+  if (!canStartNewCut()) return;
+  const controlToken = controlActive() ? control.token : null;
+  clearTimeout(saveTimer);
+  setPending("new-cut");
+  try {
+    if (savePromise && !await savePromise) throw new Error("Не удалось сохранить текущие правки перед очисткой.");
+    if (!demoMode && centralMode && companionConnected) {
+      const local = await companionFetch("/api/new-cut", jsonRequest({ stopped: true }, AbortSignal.timeout(6000)));
+      if (!local.ok) throw new Error("Помощник не подтвердил остановку станка. Проверьте состояние на пульте.");
+    }
+    const response = await getJson("/api/new-cut", jsonRequest({
+      revision: workspaceRevision, stopped: true, ...(controlToken ? { controlToken } : {}),
+    }, AbortSignal.timeout(12_000)));
+    workspaceRevision = response.revision;
+    workspaceSaved = workspaceChange;
+    source = null;
+    placed = [];
+    excluded = new Set();
+    selection = new Set();
+    drawingUndo.length = 0;
+    drawingRedo.length = 0;
+    routeApplied = true;
+    nestingSettings = null;
+    nestBlocking = [];
+    $("optimize-join").checked = true;
+    cameraMode = "work";
+    selectedCutPage = 1;
+    pagePickerPlan = null;
+    transferChecklistPlanId = null;
+    resetTransferChecklist();
+    clearCurrentUpload();
+    applyJobStatus(response);
+    activeRun = null;
+    uploadUncertain = false;
+    trackedRun = null;
+    restoredRunStatistics = null;
+    try { sessionStorage.removeItem(machineStorageKey("runStatistics")); } catch { /* Session storage is optional. */ }
+    setSaveError();
+    updateDrawing({ edited: false });
+    renderRun();
+  } catch (error) {
+    setMachineError(messageFrom(error));
+    if (workspaceRevision !== null && workspaceSaved !== workspaceChange) {
+      saveTimer = setTimeout(() => void persistWorkspace(), 250);
+    }
+    return;
+  } finally {
+    setPending(null);
+  }
+  $("canvas-import").focus({ preventScroll: true });
+}
+
 async function prepareXiaoDrawing(openInXiao) {
-  if (xiaoHandoff || drawingLocked() || !cutPlan?.canPrepareXiao || (openInXiao && busy())) return;
-  const { planId, filename } = cutPlan;
+  if (xiaoHandoff || jobError || drawingLocked() || cutPlacementPreviewActive() || !cutPlan?.canPrepareXiao
+      || (openInXiao && $("prepare-xiao-open").disabled)) return;
+  const { planId, exportPlanId, filename } = cutPlan;
   xiaoHandoff = openInXiao ? "open" : "download";
   xiaoResult = null;
   renderControls();
   try {
-    if (!await persistWorkspace() || cutPlan?.planId !== planId) {
+    if (!await persistWorkspace() || cutPlacementPreviewActive() || cutPlan?.planId !== planId) {
       throw new Error("Дождитесь сохранения раскладки и повторите попытку.");
     }
-    const response = await checkedFetch("/api/prepare-xiao", jsonRequest({ planId, openInXiao }, AbortSignal.timeout(30_000)));
+    const payload = { planId, openInXiao, ...(exportPlanId && !openInXiao ? { exportPlanId } : {}) };
+    const response = await checkedFetch("/api/prepare-xiao", jsonRequest(payload, AbortSignal.timeout(30_000)), openInXiao);
     if (openInXiao) {
       const result = await response.json();
       xiaoResult = result.opened
@@ -2789,7 +3708,8 @@ async function prepareXiaoDrawing(openInXiao) {
       link.download = filename.replace(/\.(dxf|dwg)$/i, "") + " — раскладка.dxf";
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      xiaoResult = "DXF подготовлен. Откройте его в Xiao и проверьте размеры, рабочий ноль и SP4.";
+      xiaoResult = demoMode ? "DXF скачан."
+        : "DXF подготовлен. Откройте его в Xiao и проверьте размеры, рабочий ноль и SP4.";
     }
   } catch (error) {
     xiaoResult = messageFrom(error);
@@ -2800,10 +3720,10 @@ async function prepareXiaoDrawing(openInXiao) {
 }
 
 async function playSimulation() {
-  if (drawingLocked() || !includedBounds) return;
+  if ($("simulation-button").disabled) return;
   cancelCanvasGesture();
   const plan = await requestCutPlan();
-  if (drawingLocked() || !plan || !plan.pages.length) return;
+  if ($("simulation-button").disabled || !plan?.pages.length) return;
   try {
     simulation.start(plan, canvasSection()?.page.number ?? 1);
   } catch (error) {
@@ -2820,37 +3740,37 @@ for (const id of placementFields) {
   });
 }
 $("rotate-button").addEventListener("click", () => {
-  rotateSelection((selectionAngle + 90) % 360);
+  rotateSelectionBy(90);
 });
-$("exclude-button").addEventListener("click", () => {
-  if (!selection.size || drawingLocked() || !drawingPartsReady) return;
-  const restore = [...selection].every((index) => excluded.has(index));
-  rememberDrawing(restore ? "возврат контуров" : "исключение");
-  excluded = new Set(excluded);
-  for (const index of selection) {
-    if (restore) excluded.delete(index);
-    else excluded.add(index);
-  }
-  updateDrawing();
-});
+$("exclude-button").addEventListener("click", toggleSelectionExcluded);
 $("delete-button").addEventListener("click", () => {
   deleteSelection();
   contourDialog.close();
   svg.focus({ preventScroll: true });
 });
-$("select-all-tool").addEventListener("click", () => {
-  setTool(false);
-  selectAllContours();
-  svg.focus({ preventScroll: true });
-});
 const contourDialog = $("contour-dialog");
 const nestDialog = $("nest-dialog");
 const optimizeDialog = $("optimize-dialog");
-$("contour-settings").addEventListener("click", () => {
-  cancelCanvasGesture();
-  contourDialog.showModal();
-});
+let contourJoinPreview = null;
+let optimizationJoined = false;
 $("contour-close").addEventListener("click", () => contourDialog.close());
+$("contour-check-button").addEventListener("click", () => {
+  if (!contourCheckAvailable()) return;
+  contourCheckDialog.showModal();
+  void scanDrawingContours();
+});
+$("contour-check-scan").addEventListener("click", () => void scanDrawingContours());
+$("contour-check-apply").addEventListener("click", applyContourRepair);
+$("contour-check-close").addEventListener("click", () => contourCheckDialog.close());
+contourCheckDialog.addEventListener("close", () => {
+  if (contourCheckDialog.open) return;
+  const request = contourRepair;
+  contourRepair = null;
+  contourRepairProposal = null;
+  request?.abort();
+  renderControls();
+  if (!$("contour-check-button").disabled) $("contour-check-button").focus({ preventScroll: true });
+});
 $("nest-button").addEventListener("click", () => {
   cancelCanvasGesture();
   applyNestingSettings();
@@ -2863,41 +3783,84 @@ $("nest-cancel").addEventListener("click", () => {
 });
 nestDialog.addEventListener("cancel", () => nestRequest?.abort());
 function openOptimization() {
+  if (optimizeDialog.open) return;
   cancelCanvasGesture();
+  optimizationJoined = false;
+  contourJoinPreview = null;
   $("optimize-route").checked = routeApplied;
-  showRepairResult("");
-  updateOptimizationControls();
   optimizeDialog.showModal();
+  updateOptimizationControls();
 }
 $("optimize-button").addEventListener("click", openOptimization);
-$("repair-contours").addEventListener("click", () => void restoreClosedContours());
-$("optimize-cancel").addEventListener("click", () => {
-  contourRepair?.abort();
-  optimizeDialog.close();
+$("optimize-cancel").addEventListener("click", () => optimizeDialog.close());
+$("optimize-dismiss").addEventListener("click", () => optimizeDialog.close());
+optimizeDialog.addEventListener("close", () => {
+  if (!optimizeDialog.open) contourJoinPreview = null;
 });
-optimizeDialog.addEventListener("cancel", () => contourRepair?.abort());
+$("optimize-route").addEventListener("change", updateOptimizationControls);
+$("optimize-join").addEventListener("change", updateOptimizationControls);
+
+function previewContourJoin() {
+  if (!$("optimize-join").checked) return null;
+  if (contourJoinPreview?.epoch !== cutPlanEpoch) {
+    contourJoinPreview = { epoch: cutPlanEpoch, result: joinTouchingContours(included()) };
+  }
+  return contourJoinPreview.result;
+}
+
+function renderRouteComparison(outdated, join) {
+  const result = cutPlan?.routeOptimization;
+  const current = cutPlan?.travelDistanceMm;
+  const status = $("optimize-result");
+  const comparison = $("optimize-comparison");
+  const routeChanged = $("optimize-route").checked !== routeApplied;
+  const hasComparison = !outdated && routeApplied
+    && Number.isFinite(result?.beforeMm) && Number.isFinite(current);
+  updateControl(comparison, "hidden", !hasComparison);
+  let message = "";
+  if (outdated) message = "Перезапустите локальную программу плоттера для расчёта маршрута.";
+  else if (cutPlanError && !hasComparison) message = "Сравнение недоступно. Проверьте геометрию раскладки.";
+  else if (!cutPlan) message = "Рассчитываем маршрут…";
+  else if (routeChanged) message = routeApplied ? "После применения вернётся исходный порядок реза."
+    : "После применения пересчитаем порядок реза.";
+  else if (!routeApplied) {
+    message = "Сокращение холостого хода выключено.";
+    if (Number.isFinite(current)) message += ` Текущий холостой ход — ${number(current / 1000)} м.`;
+  }
+  else if (hasComparison) message = result.beforeMm - current > 1e-7
+    ? "Оптимизированный маршрут уже применяется." : "Сокращение холостого хода для этой раскладки не найдено.";
+  else message = "Нет данных для сравнения маршрутов.";
+  const joinMessage = join?.skipped ? "Слишком много контуров для проверки всех стыков."
+    : join?.joined ? "Есть линии, которые можно соединить."
+    : optimizationJoined ? "Линии в точных стыках соединены."
+    : join ? "Точных стыков для соединения не найдено." : "";
+  updateText(status, [message, joinMessage].filter(Boolean).join(" "));
+  updateControl(status, "hidden", !status.textContent);
+  if (hasComparison) {
+    const saved = result.beforeMm > 0 ? Math.max(0, 100 * (result.beforeMm - current) / result.beforeMm) : 0;
+    updateText($("optimize-before"), `${number(result.beforeMm / 1000)} м`);
+    updateText($("optimize-after"), `${number(current / 1000)} м`);
+    updateText($("optimize-saved"), `${number(Math.round(saved * 10) / 10)} %`);
+  }
+}
+
 function updateOptimizationControls() {
   const locked = drawingLocked();
-  const includedCount = placed.length - excluded.size;
-  $("optimize-apply").disabled = locked || !includedCount;
-  $("repair-contours").disabled = locked || !includedCount;
-  const routeResult = $("optimize-result");
-  const result = cutPlan?.routeOptimization;
   const outdated = Number.isInteger(machine.apiVersion) && machine.apiVersion < 14;
-  $("repair-contours").disabled ||= outdated;
-  routeResult.hidden = !outdated && (!result || !routeApplied || !Number.isFinite(result.beforeMm) || !Number.isFinite(result.afterMm));
-  if (outdated) {
-    routeResult.textContent = "Перезапустите локальную программу плоттера, чтобы рассчитать новый маршрут.";
-  } else if (result) {
-    const saved = result.beforeMm > 0 ? 100 * (result.beforeMm - result.afterMm) / result.beforeMm : 0;
-    routeResult.textContent = `Холостой ход: ${number(result.beforeMm / 1000)} → ${number(result.afterMm / 1000)} м${saved > 0.05 ? ` · −${number(saved)} %` : ""}`;
+  if (optimizeDialog.open) {
+    const join = locked ? null : previewContourJoin();
+    const routeChanged = !outdated && $("optimize-route").checked !== routeApplied;
+    const canApply = !locked && placed.length > excluded.size && (routeChanged || Boolean(join?.joined));
+    updateControl($("optimize-apply"), "disabled", !canApply);
+    updateText($("optimize-dismiss"), canApply ? "Отмена" : "Закрыть");
+    renderRouteComparison(outdated, join);
   }
   $("nest-apply").disabled = locked || nestingBackend !== "ready" || placed.length === excluded.size;
   $("nest-apply").textContent = nestRequest ? "Рассчитываем…" : "Разложить на полотне";
   const closeLabel = nestRequest ? "Отменить расчёт" : "Закрыть";
   $("nest-cancel").title = closeLabel;
   $("nest-cancel").setAttribute("aria-label", closeLabel);
-  for (const id of ["nest-width", "nest-gap", "nest-margin", "nest-rotation", "optimize-route", "optimize-join"]) {
+  for (const id of ["nest-width", "nest-length", "nest-gap", "nest-margin", "nest-rotation", "optimize-route", "optimize-join"]) {
     $(id).disabled = locked;
   }
   $("optimize-route").disabled ||= outdated;
@@ -2905,10 +3868,9 @@ function updateOptimizationControls() {
   $("nest-try-rotation").disabled = locked;
 }
 $("optimize-apply").addEventListener("click", () => {
-  if (!optimizeDialog.open) return;
-  optimizeDialog.close();
+  if (!optimizeDialog.open || $("optimize-apply").disabled) return;
   applyContourOptimization();
-  scheduleWorkspaceSave();
+  if ($("optimize-apply").disabled) $("optimize-dismiss").focus({ preventScroll: true });
 });
 $("nest-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -2924,24 +3886,26 @@ $("nest-try-rotation").addEventListener("click", () => {
 });
 $("nest-show-blocking").addEventListener("click", () => {
   if (drawingLocked() || !nestBlocking.length) return;
-  setTool(false);
+  setMeasureMode(false);
   setSelection(new Set(nestBlocking));
   nestDialog.close();
   svg.focus({ preventScroll: true });
 });
-$("drawing-undo").addEventListener("click", () => {
-  undoDrawingEdit();
-  $("contour-close").focus();
-});
-$("import-button").addEventListener("click", () => $("file-input").click());
+$("undo-tool").addEventListener("click", () => stepEditHistory());
+$("redo-tool").addEventListener("click", () => stepEditHistory(true));
 $("canvas-import").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", (event) => void loadDrawing(event.target.files[0]));
 $("toast-close").addEventListener("click", () => { $("toast").hidden = true; });
+$("new-cut-button").addEventListener("click", openNewCutDialog);
+newCutDialog.addEventListener("close", () => {
+  if (newCutDialog.returnValue === "confirm") void clearForNewCut();
+});
+demoSwitch.addEventListener("click", () => void toggleDemoMode());
 $("arm-button").addEventListener("click", () => void armControl());
+$("connect-companion").addEventListener("click", () => void connectCompanion());
 $("verify-stop-button").addEventListener("click", () => void verifyStop());
 $("simulation-button").addEventListener("click", () => void playSimulation());
 $("run-acknowledge").addEventListener("click", () => void runControllerOperation("acknowledge-run"));
-$("job-verified").addEventListener("change", renderControls);
 $("job-page").addEventListener("change", (event) => {
   selectedCutPage = Number(event.currentTarget.value);
   previewCutPage = null;
@@ -2949,9 +3913,13 @@ $("job-page").addEventListener("change", (event) => {
   renderControls();
 });
 $("manual-auto-run-off").addEventListener("change", renderControls);
-$("roll-advance-confirmed").addEventListener("change", renderControls);
-$("roll-reset").addEventListener("click", () => void resetControllerRoll());
-$("controller-upload-button").addEventListener("click", requestControllerUpload);
+$("roll-reset").addEventListener("click", openRollResetDialog);
+rollResetDialog.addEventListener("close", () => {
+  const intent = rollResetIntent;
+  rollResetIntent = null;
+  if (rollResetDialog.returnValue === "confirm") void resetControllerRoll(intent);
+});
+$("controller-upload-button").addEventListener("click", requestControllerLaunch);
 $("upload-confirm-cancel").addEventListener("click", closeUploadConfirmation);
 uploadConfirmDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
@@ -2960,7 +3928,7 @@ uploadConfirmDialog.addEventListener("cancel", (event) => {
 $("upload-confirm-accept").addEventListener("click", () => {
   const intent = uploadConfirmation;
   closeUploadConfirmation();
-  void uploadControllerDrawing(intent, true);
+  void confirmControllerLaunch(intent);
 });
 $("prepare-xiao-open").addEventListener("click", () => void prepareXiaoDrawing(true));
 $("prepare-xiao-download").addEventListener("click", () => void prepareXiaoDrawing(false));
@@ -2998,6 +3966,7 @@ document.addEventListener("pointermove", (event) => {
   if (event.pointerType === "mouse" && event.buttons === 0 && activeHold?.input.pointerId === event.pointerId) interruptControllerHold();
 }, true);
 document.addEventListener("keyup", (event) => {
+  updateMeasurementModifiers(event);
   const key = holdKey(event);
   if (key && activeHold?.input.key === key) {
     event.preventDefault();
@@ -3005,9 +3974,17 @@ document.addEventListener("keyup", (event) => {
   }
 }, true);
 function loseFocus() {
+  measurementCursor = null;
+  measurementHover = null;
+  if (measurement) {
+    measurement.lockedCoordinate = null;
+    measurement.end = null;
+  }
+  if (measureMode) renderMeasurement();
   focusEpoch++;
   liveEpoch++;
   closeUploadConfirmation();
+  if (rollResetDialog.open) rollResetDialog.close("cancel");
   live.positionFresh = false;
   interruptControllerHold();
   renderLive();
@@ -3037,10 +4014,18 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-$("select-tool").addEventListener("click", () => setTool(false));
-$("pan-tool").addEventListener("click", () => setTool(true));
+$("select-tool").addEventListener("click", () => setMeasureMode(false));
+$("measure-tool").addEventListener("click", () => setMeasureMode(!measureMode));
+$("measurement-close").addEventListener("click", () => {
+  setMeasureMode(false);
+  svg.focus({ preventScroll: true });
+});
+$("measurement-clear-all").addEventListener("click", removeAllMeasurements);
+$("measurement-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-measurement]");
+  if (button) removeMeasurement(button);
+});
 $("fit-tool").addEventListener("click", () => fitCamera("overview"));
-$("zoom-reset").addEventListener("click", () => fitCamera());
 $("section-focus").addEventListener("click", () => fitCamera());
 $("section-prev").addEventListener("click", () => navigateCanvasSection(-1));
 $("section-next").addEventListener("click", () => navigateCanvasSection(1));
@@ -3057,21 +4042,21 @@ pageAnnotations.addEventListener("keydown", (event) => {
     $("section-focus").focus({ preventScroll: true });
   }
 });
-$("zoom-in").addEventListener("click", () => zoom(1.25));
-$("zoom-out").addEventListener("click", () => zoom(0.8));
-$("grid-tool").addEventListener("click", () => {
-  gridVisible = !gridVisible;
-  $("grid-tool").setAttribute("aria-pressed", String(gridVisible));
-  renderTable();
-  scheduleWorkspaceSave();
-});
 svg.addEventListener("wheel", (event) => {
   event.preventDefault();
+  if (!event.deltaY) return;
   const [x, y] = screenFraction(event);
-  zoom(event.deltaY < 0 ? 1.15 : 0.87, x, y);
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? svg.clientHeight : 1;
+  const delta = Math.max(-160, Math.min(160, event.deltaY * unit));
+  zoom(Math.exp(-delta * 0.0014), x, y, true);
 }, { passive: false });
 function boxFromPoints([x1, y1], [x2, y2]) {
   return { minX: Math.min(x1, x2), minY: Math.min(y1, y2), maxX: Math.max(x1, x2), maxY: Math.max(y1, y2) };
+}
+
+function unionPlacementBoxes(a, b) {
+  return { minX: Math.min(a.minX, b.minX), minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX), maxY: Math.max(a.maxY, b.maxY) };
 }
 
 function boxContains(outer, inner) {
@@ -3108,7 +4093,7 @@ function manualOutlines(paths) {
     }
     records.push(record);
   }
-  // A dangling notch is part of the clearance check but not part of a closed outline.
+  // A dangling cut is part of the clearance check but not part of a closed outline.
   const leaves = [...nodes.values()].filter((node) => node.links.length === 1);
   for (const node of leaves) {
     if (node.links.length !== 1) continue;
@@ -3127,20 +4112,20 @@ function manualOutlines(paths) {
   return outlines.map((path) => ({ points: path.points, box: bounds([path]) }));
 }
 
-function prepareManualPlacement() {
+function prepareManualPlacement(selected = selection) {
   const moving = [];
   const fixed = [];
-  for (const part of drawingParts.values()) {
-    const paths = part.indices.filter((index) => !excluded.has(index)).map((index) => placed[index]);
-    if (!paths.length) continue;
-    const shape = { paths, box: bounds(paths), outlines: null, tree: null };
-    (selection.has(part.indices[0]) ? moving : fixed).push(shape);
+  for (const [index, path] of placed.entries()) {
+    const part = drawingParts.get(path.partNumber);
+    if (part && index !== part.indices[0]) continue;
+    const indices = (part?.indices ?? [index]).filter((member) => !excluded.has(member));
+    if (!indices.length) continue;
+    const paths = indices.map((member) => placed[member]);
+    const shape = { key: partProgressKey(index), indices, paths, box: part?.activeBox ?? pathBoxes[index],
+      outlineBox: bounds(paths.filter((path) => !path.notch)) };
+    (selected.has(index) ? moving : fixed).push(shape);
   }
-  const margin = nestingSettings?.marginMm ?? 0;
-  const materialWidth = nestingSettings?.widthMm ?? machine.height;
-  // Leave room for the controller's transverse coordinate offset at the machine edge.
-  const maxY = Math.min(materialWidth - margin, machine.height - 0.01);
-  return { moving, fixed, maxY, margin, gap: Math.max(nestingSettings?.gapMm ?? 0, 0.002) };
+  return { moving, fixed, limits: materialLimits(), gap: Math.max(nestingSettings?.gapMm ?? 0, 0.002) };
 }
 
 function placementBoxesNear(a, b, distance) {
@@ -3149,10 +4134,10 @@ function placementBoxesNear(a, b, distance) {
 }
 
 function eachPlacementSegment(paths, visit) {
-  for (const { points, closed } of paths) {
+  for (const { points, closed, notch } of paths) {
     for (let i = closed ? 0 : 1; i < points.length; i++) {
       const first = points.at(i - 1), last = points[i];
-      if (visit(first, last, boxFromPoints(first, last)) === false) return false;
+      if (visit(first, last, boxFromPoints(first, last), notch) === false) return false;
     }
   }
   return true;
@@ -3219,70 +4204,206 @@ function placementSegmentOffset(a, b, c, d) {
   return best;
 }
 
-function checkManualPlacement(placement, transform, snap = 0) {
-  const { moving, fixed, maxY, margin, gap } = placement;
-  const reach = gap + snap;
-  let nearest = null;
-  let valid = true;
-  for (const part of moving) {
-    const paths = part.paths.map((path) => mapPath(path, transform));
-    const box = bounds(paths);
-    if (box.minX < margin - placementEpsilon || box.minY < margin - placementEpsilon
-        || box.maxY > maxY + placementEpsilon) return { valid: false, nearest: null };
-    let outlines;
-    for (const other of fixed) {
-      if (!placementBoxesNear(box, other.box, reach)) continue;
-      if (!other.tree) {
-        const segments = [];
-        eachPlacementSegment(other.paths, (first, last, box) => segments.push({ first, last, box }));
-        other.tree = placementSegmentTree(segments);
+function placementTree(part) {
+  if (!part.tree) {
+    const segments = [];
+    eachPlacementSegment(part.paths, (first, last, box, notch) => segments.push({ first, last, box, notch }));
+    part.tree = placementSegmentTree(segments);
+  }
+  return part.tree;
+}
+
+function placementPartsConflict(part, other, gap) {
+  if (!placementBoxesNear(part.box, other.box, gap)) return false;
+  const tree = placementTree(other);
+  const clearance = (gap - placementEpsilon) ** 2;
+  if (!eachPlacementSegment(part.paths, (a, b, edgeBox) => visitPlacementSegments(tree, edgeBox, gap,
+    ({ first, last }) => placementSegmentOffset(a, b, first, last)[2] >= clearance))) return true;
+  if (!placementBoxesNear(part.box, other.box, 0)) return false;
+  part.outlines ??= manualOutlines(part.paths.filter((path) => !path.notch));
+  other.outlines ??= manualOutlines(other.paths.filter((path) => !path.notch));
+  return part.paths.some((path) => other.outlines.some((outline) => pointInPlacementOutline(path.points[0], outline)))
+    || other.paths.some((path) => part.outlines.some((outline) => pointInPlacementOutline(path.points[0], outline)));
+}
+
+function refreshPlacementWarnings() {
+  placementConflicts = new Set();
+  if (drawingPartsReady) {
+    const { fixed, gap } = prepareManualPlacement(new Set());
+    fixed.sort((a, b) => a.box.minX - b.box.minX);
+    const active = [];
+    for (const part of fixed) {
+      for (let i = active.length - 1; i >= 0; i--) {
+        const other = active[i];
+        if (other.box.maxX + gap < part.box.minX) active.splice(i, 1);
+        else if ((!placementConflicts.has(part.key) || !placementConflicts.has(other.key))
+          && placementPartsConflict(part, other, gap)) {
+          placementConflicts.add(part.key);
+          placementConflicts.add(other.key);
+        }
       }
-      const clear = eachPlacementSegment(paths, (a, b, edgeBox) => visitPlacementSegments(other.tree, edgeBox, reach,
-        ({ first, last }) => {
-          const offset = placementSegmentOffset(a, b, first, last);
-          if (offset[2] < (gap - placementEpsilon) ** 2) valid = false;
-          if (snap && offset[2] > placementEpsilon ** 2 && offset[2] <= reach ** 2
-              && (!nearest || offset[2] < nearest[2])) nearest = offset;
-          return valid || snap > 0;
-        }));
-      if (!clear) return { valid: false, nearest: null };
-      if (placementBoxesNear(box, other.box, 0)) {
-        other.outlines ??= manualOutlines(other.paths);
-        part.outlines ??= manualOutlines(part.paths);
-        outlines ??= part.outlines.map((outline) => {
-          const points = outline.points.map(transform);
-          return { points, box: bounds([{ points }]) };
-        });
-        if (paths.some((path) => other.outlines.some((outline) => pointInPlacementOutline(path.points[0], outline)))
-            || other.paths.some((path) => outlines.some((outline) => pointInPlacementOutline(path.points[0], outline)))) {
-          return { valid: false, nearest: null };
+      active.push(part);
+    }
+  }
+  jobError = outsideMaterial(includedBounds) ? "Красные детали выходят за границы рабочей области."
+    : placementConflicts.size ? "Красные детали пересекаются или расположены слишком близко." : "";
+}
+
+function shiftPlacementBox(box, dx, dy) {
+  return { minX: box.minX + dx, minY: box.minY + dy, maxX: box.maxX + dx, maxY: box.maxY + dy };
+}
+
+function manualPlacementConflicts(placement, transform, offset) {
+  const conflicts = new Set();
+  for (const part of placement.moving) {
+    let paths, shape;
+    const transformedPaths = () => paths ??= part.paths.map((path) => mapPath(path, transform));
+    const box = offset ? shiftPlacementBox(part.box, ...offset) : bounds(transformedPaths());
+    if (outsideMaterial(box, placement.limits) || placement.fixed.some((other) =>
+      placementBoxesNear(box, other.box, placement.gap) && placementPartsConflict(
+        shape ??= { paths: transformedPaths(), box }, other, placement.gap))) conflicts.add(part.key);
+  }
+  return conflicts;
+}
+
+function boundarySnap(placement, dx, dy, radius) {
+  const snap = [null, null];
+  const edges = [["minX", "maxX"], ["minY", "maxY"]];
+  for (const part of placement.moving) {
+    if (!part.outlineBox) continue;
+    for (const [axis, offset] of [dx, dy].entries()) {
+      for (const edge of edges[axis]) {
+        const value = placement.limits[edge];
+        const delta = value - (part.outlineBox[edge] + offset);
+        if (Math.abs(delta) <= radius && (!snap[axis] || Math.abs(delta) < Math.abs(snap[axis].delta))) {
+          snap[axis] = { axis, value, delta };
         }
       }
     }
   }
-  return { valid, nearest };
+  return snap.filter(Boolean);
 }
 
-function previewConstrainedMove(gesture, dx, dy) {
-  const translate = (x, y) => ([u, v]) => [u + x, v + y];
-  const snap = Math.min(35, camera.width / svg.clientWidth * 10);
-  const { valid, nearest } = checkManualPlacement(gesture.placement, translate(dx, dy), snap);
-  if (nearest) {
-    const [x, y, square] = nearest;
-    const distance = Math.sqrt(square);
-    const correction = gesture.placement.gap - distance;
-    if (Math.abs(correction) <= snap) {
-      const snapped = [dx + x * correction / distance, dy + y * correction / distance];
-      if (checkManualPlacement(gesture.placement, translate(...snapped)).valid) {
-        gesture.offset = snapped;
-        previewMove(...snapped);
-        return;
+function contourSnap(placement, dx, dy, radius) {
+  const candidates = [];
+  const reach = placement.gap + radius;
+  const minOverlap = Math.min(12, radius / 2);
+  for (const part of placement.moving) {
+    if (!part.outlineBox) continue;
+    const box = shiftPlacementBox(part.outlineBox, dx, dy);
+    const nearby = placement.fixed.filter((other) => other.outlineBox && placementBoxesNear(box, other.outlineBox, reach));
+    if (!nearby.length) continue;
+    eachPlacementSegment(part.paths, (first, last, edgeBox, notch) => {
+      if (notch) return;
+      const a = [first[0] + dx, first[1] + dy], b = [last[0] + dx, last[1] + dy];
+      const length = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (length < placementEpsilon) return;
+      const ux = (b[0] - a[0]) / length, uy = (b[1] - a[1]) / length;
+      const edge = shiftPlacementBox(edgeBox, dx, dy);
+      for (const other of nearby) {
+        visitPlacementSegments(placementTree(other), edge, reach, ({ first: c, last: d, notch: fixedNotch }) => {
+          if (fixedNotch) return true;
+          const vx = d[0] - c[0], vy = d[1] - c[1];
+          const span = Math.hypot(vx, vy);
+          const parallel = Math.abs((ux * vx + uy * vy) / span);
+          if (!span || parallel < Math.cos(Math.PI / 60)) return true;
+          const project = ([x, y]) => (x - a[0]) * ux + (y - a[1]) * uy;
+          const sc = project(c), sd = project(d);
+          const from = Math.max(0, Math.min(sc, sd)), to = Math.min(length, Math.max(sc, sd));
+          if (to - from < minOverlap) return true;
+          const normal = ([x, y]) => (x - a[0]) * -uy + (y - a[1]) * ux;
+          const nc = normal(c), nd = normal(d);
+          const at = (s) => nc + (nd - nc) * (s - sc) / (sd - sc);
+          const lo = at(from), hi = at(to);
+          const side = Math.sign(lo + hi) || 1;
+          const contact = side * lo <= side * hi ? from : to;
+          const distance = at(contact);
+          const delta = distance - side * placement.gap / parallel;
+          const shift = Math.abs(delta);
+          if (shift > radius || candidates.some(({ offset }) => Math.hypot(offset[0] + delta * uy, offset[1] - delta * ux) < 0.01)) return true;
+          const score = shift - 0.02 * Math.min(to - from, radius * 3);
+          if (candidates.length === 4 && score >= candidates.at(-1).score) return true;
+          const point = (s, n) => [a[0] + s * ux - n * uy, a[1] + s * uy + n * ux];
+          const pad = radius * 1.5;
+          candidates.push({ score, offset: [-delta * uy, delta * ux],
+            lines: [[point(from - pad, delta), point(to + pad, delta)], [point(from, lo), point(to, hi)]] });
+          candidates.sort((a, b) => a.score - b.score);
+          if (candidates.length > 4) candidates.pop();
+          return true;
+        });
+      }
+    });
+  }
+  return candidates;
+}
+
+function alignmentSnap(placement, dx, dy, radius) {
+  const guides = [null, null];
+  const edges = [["minX", "maxX"], ["minY", "maxY"]];
+  for (const part of placement.moving) {
+    if (!part.outlineBox) continue;
+    const box = shiftPlacementBox(part.outlineBox, dx, dy);
+    for (const other of placement.fixed) {
+      const target = other.outlineBox;
+      if (!target || !placementBoxesNear(box, target, Math.max(placement.gap + radius, radius * 8))) continue;
+      for (const [axis, keys] of edges.entries()) {
+        for (const key of keys) {
+          const delta = target[key] - box[key];
+          if (Math.abs(delta) <= radius && (!guides[axis] || Math.abs(delta) < Math.abs(guides[axis].delta))) {
+            guides[axis] = { axis, value: target[key], delta };
+          }
+        }
       }
     }
   }
-  if (valid) {
-    gesture.offset = [dx, dy];
-    previewMove(dx, dy);
+  return guides.filter(Boolean);
+}
+
+function previewManualMove(gesture, { dx, dy, free }) {
+  const { placement } = gesture;
+  const radius = Math.min(40, camera.width / svg.clientWidth * 11);
+  const check = (x, y) => manualPlacementConflicts(placement, ([u, v]) => [u + x, v + y], [x, y]);
+  gesture.guides = [];
+  gesture.edgeGuide = null;
+  const applyGuide = (guide) => {
+    const x = dx + (guide.axis === 0 ? guide.delta : 0);
+    const y = dy + (guide.axis === 1 ? guide.delta : 0);
+    if (check(x, y).size) return;
+    dx = x;
+    dy = y;
+    gesture.guides.push(guide);
+  };
+  if (!free) {
+    for (const guide of boundarySnap(placement, dx, dy, radius)) applyGuide(guide);
+    const shift = gesture.guides.map(({ axis }) => axis);
+    for (const snap of contourSnap(placement, dx, dy, radius)) {
+      if (shift.some((axis) => Math.abs(snap.offset[axis]) > placementEpsilon)) continue;
+      const x = dx + snap.offset[0], y = dy + snap.offset[1];
+      if (!check(x, y).size) {
+        dx = x;
+        dy = y;
+        gesture.edgeGuide = snap.lines;
+        break;
+      }
+    }
+    if (!gesture.edgeGuide) for (const guide of alignmentSnap(placement, dx, dy, radius)) {
+      if (!shift.includes(guide.axis)) applyGuide(guide);
+    }
+  }
+  gesture.offset = [dx, dy];
+  previewPlacementStatus(placement, check(dx, dy));
+  previewMove(dx, dy);
+  renderManualGuides();
+}
+
+function previewPlacementStatus(placement, conflicts) {
+  const groups = $("path-layer").children;
+  for (const part of placement.moving) {
+    const invalid = conflicts.has(part.key);
+    for (const index of part.indices) {
+      groups[index].classList.toggle("move-invalid", invalid);
+      groups[index].classList.toggle("move-valid", !invalid);
+    }
   }
 }
 
@@ -3342,11 +4463,6 @@ function contourAt(event, [x, y]) {
   return best ?? fragmentedPartAt([x, y])?.indices[0] ?? null;
 }
 
-function partAt(event, point) {
-  const index = contourAt(event, point);
-  if (index !== null) return drawingParts.get(placed[index]?.partNumber);
-}
-
 function fragmentedPartAt([x, y]) {
   // Some CAD outlines consist of several open paths, so they have no SVG fill.
   let best;
@@ -3376,6 +4492,7 @@ function fragmentedPartAt([x, y]) {
 
 const partMenu = $("part-menu");
 const partMenuButtons = [...partMenu.querySelectorAll("button")];
+let lastPartClick = null;
 
 function closePartMenu(restoreFocus = false) {
   if (partMenu.hidden) return;
@@ -3389,25 +4506,26 @@ function openPartMenu(part, x, y) {
   cancelCanvasGesture();
   endFreeRotation();
   menuPartNumber = part.number;
-  $("part-menu-title").textContent = `Деталь №${part.number}`;
+  updateText($("part-menu-title"), `Деталь №${part.number}`);
+  const omit = part.indices.every((index) => excluded.has(index));
+  const status = $("part-menu-status");
+  updateText(status, omit ? "Исключена" : "В раскрое");
+  status.classList.toggle("is-excluded", omit);
+  const excludeAction = $("part-menu-exclude");
+  updateText(excludeAction.querySelector("span"), omit ? "Вернуть в раскрой" : "Исключить из раскроя");
+  updateAttribute(excludeAction.querySelector("use"), "href", omit ? "#i-plus" : "#i-minus");
   for (const button of partMenu.querySelectorAll("[data-part-rotation]")) {
     button.setAttribute("aria-checked", String(button.dataset.partRotation === part.rotation));
   }
+  partMenu.style.left = "8px";
+  partMenu.style.top = "8px";
   partMenu.hidden = false;
-  partMenu.style.left = `${Math.max(6, Math.min(x, document.documentElement.clientWidth - partMenu.offsetWidth - 6))}px`;
-  partMenu.style.top = `${Math.max(6, Math.min(y, document.documentElement.clientHeight - partMenu.offsetHeight - 6))}px`;
+  partMenu.scrollTop = 0;
+  const { clientWidth, clientHeight } = document.documentElement;
+  const left = x + partMenu.offsetWidth + 16 > clientWidth ? x - partMenu.offsetWidth - 8 : x + 8;
+  partMenu.style.left = `${Math.max(8, Math.min(left, clientWidth - partMenu.offsetWidth - 8))}px`;
+  partMenu.style.top = `${Math.max(8, Math.min(y + 8, clientHeight - partMenu.offsetHeight - 8))}px`;
   partMenuButtons[0].focus({ preventScroll: true });
-}
-
-async function openPartMenuAtPointer(event) {
-  const boxes = pathBoxes;
-  const point = drawingPoint(event);
-  try {
-    await identifyDrawingParts();
-    if (boxes === pathBoxes) openPartMenu(partAt(event, point), event.clientX, event.clientY);
-  } catch (error) {
-    notifyError(error.status === 404 ? "Для настроек поворота перезапустите программу плоттера." : messageFrom(error));
-  }
 }
 
 for (const button of partMenuButtons) {
@@ -3415,11 +4533,19 @@ for (const button of partMenuButtons) {
     const part = drawingParts.get(menuPartNumber);
     closePartMenu(true);
     if (!part || drawingLocked()) return;
+    if (button.dataset.partAction) {
+      setMeasureMode(false);
+      setSelection(new Set(part.indices));
+      if (button.dataset.partAction === "exclude") toggleSelectionExcluded();
+      else if (button.dataset.partAction === "delete") deleteSelection();
+      else contourDialog.showModal();
+      return;
+    }
     if (button.dataset.rotatePart) {
-      setTool(false);
+      setMeasureMode(false);
       setSelection(new Set(part.indices));
       if (button.dataset.rotatePart === "free") startFreeRotation();
-      else rotateSelection((selectionAngle + Number(button.dataset.rotatePart)) % 360);
+      else rotateSelectionBy(Number(button.dataset.rotatePart));
       return;
     }
     const rotation = button.dataset.partRotation;
@@ -3446,7 +4572,12 @@ partMenu.addEventListener("keydown", (event) => {
     event.preventDefault();
     const next = event.key === "Home" ? 0 : event.key === "End" ? last
       : (index + (event.key === "ArrowDown" ? 1 : last)) % partMenuButtons.length;
-    partMenuButtons[next].focus();
+    const target = partMenuButtons[next];
+    const item = target.getBoundingClientRect();
+    const menu = partMenu.getBoundingClientRect();
+    if (item.bottom > menu.bottom - 5) partMenu.scrollTop += item.bottom - menu.bottom + 5;
+    else if (item.top < menu.top + 5) partMenu.scrollTop -= menu.top + 5 - item.top;
+    target.focus({ preventScroll: true });
   } else if (event.key === "Escape" || event.key === "Tab") {
     event.preventDefault();
     closePartMenu(true);
@@ -3456,12 +4587,21 @@ document.addEventListener("pointerdown", (event) => {
   if (!partMenu.contains(event.target)) closePartMenu();
 }, true);
 window.addEventListener("resize", () => closePartMenu());
-window.addEventListener("scroll", () => closePartMenu(), true);
+window.addEventListener("scroll", (event) => {
+  if (event.target !== partMenu) closePartMenu();
+}, true);
 
 svg.addEventListener("contextmenu", (event) => {
-  if (!camera || !placed.length) return;
+  if (camera && placed.length) event.preventDefault();
+});
+
+svg.addEventListener("dblclick", (event) => {
+  if (event.button !== 0 || measureMode || event.target.closest("[data-canvas-page], [data-rotation-handle]")) return;
+  const click = lastPartClick;
+  lastPartClick = null;
+  if (!click?.samePart || click.paths !== placed) return;
   event.preventDefault();
-  if (!drawingLocked()) void openPartMenuAtPointer(event);
+  openPartMenu(drawingParts.get(click.number), event.clientX, event.clientY);
 });
 function drawMarquee(from, to, crossing) {
   const rect = $("selection-marquee");
@@ -3470,15 +4610,53 @@ function drawMarquee(from, to, crossing) {
   rect.removeAttribute("hidden");
 }
 
-function previewSelection(transform) {
+function previewSelection(transform, transformPoint) {
   const groups = $("path-layer").children;
-  for (const index of selection) groups[index].setAttribute("transform", transform);
-  $("part-label-layer").replaceChildren();
+  for (const index of selection) {
+    groups[index].setAttribute("transform", transform);
+    notchMarkers.get(index)?.setAttribute("transform", transform);
+  }
+  for (const entry of drag.labels) positionPartLabel(entry, transformPoint(entry.center));
 }
 
 function previewMove(dx, dy) {
   const [x, y] = projectPoint(dx, dy);
-  previewSelection(`translate(${x} ${y})`);
+  previewSelection(`translate(${x} ${y})`, ([u, v]) => [u + dx, v + dy]);
+}
+
+function renderManualGuides() {
+  const path = $("snap-guide");
+  if (drag?.type !== "move" || !drag.moved || !camera) {
+    path.setAttribute("hidden", "");
+    return;
+  }
+  const guideLine = ([x1, y1], [x2, y2]) => `M${x1} ${y1}L${x2} ${y2}`;
+  const lines = (drag.guides ?? []).map(({ axis, value }) => axis === 0
+    ? guideLine([camera.x, -value], [camera.x + camera.width, -value])
+    : guideLine([-value, camera.y], [-value, camera.y + camera.height]));
+  if (drag.edgeGuide) {
+    const [moved, fixed] = drag.edgeGuide;
+    lines.push(...[moved, fixed].map((edge) => guideLine(...edge.map((point) => projectPoint(...point)))));
+    const center = ([a, b]) => projectPoint((a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+    lines.push(guideLine(center(moved), center(fixed)));
+  }
+  if (lines.length) updateAttribute(path, "d", lines.join(" "));
+  if (lines.length) path.removeAttribute("hidden");
+  else path.setAttribute("hidden", "");
+}
+
+function manualMoveInput(gesture, event) {
+  const [x, y] = drawingPoint(event);
+  return { dx: x - gesture.start[0], dy: y - gesture.start[1], free: event.altKey };
+}
+
+function scheduleManualMove(gesture, event) {
+  gesture.input = manualMoveInput(gesture, event);
+  if (gesture.frame != null) return;
+  gesture.frame = requestAnimationFrame(() => {
+    gesture.frame = null;
+    if (drag === gesture) previewManualMove(gesture, gesture.input);
+  });
 }
 
 function endFreeRotation() {
@@ -3489,68 +4667,155 @@ function endFreeRotation() {
 
 function startFreeRotation() {
   if (!selectedBounds || !camera) return;
-  const { x, y, width, height } = svgBox(selectedBounds);
-  const cx = x + width / 2, cy = y + height / 2;
-  const pad = 32 * camera.width / svg.clientWidth;
-  const left = camera.x + pad, right = camera.x + camera.width - pad;
-  const top = camera.y + pad, bottom = camera.y + camera.height - pad;
-  const candidates = [[cx, y - pad], [x + width + pad, cy], [cx, y + height + pad], [x - pad, cy]];
-  const handle = candidates.find(([u, v]) => u >= left && u <= right && v >= top && v <= bottom)
-    ?? [Math.min(right, Math.max(left, cx)), Math.min(bottom, Math.max(top, y - pad))];
-  freeRotation = { pivot: projectPoint(cx, cy), handle: projectPoint(...handle) };
+  const { minX, maxX, minY, maxY } = selectedBounds;
+  freeRotation = { pivot: [(minX + maxX) / 2, (minY + maxY) / 2] };
+  updateProtractorAngle(selectedAngle() ?? 0);
   renderFreeRotation();
+}
+
+const protractor = $("protractor");
+const protractorAngle = $("protractor-angle");
+
+function updateProtractorAngle(angle) {
+  const value = String(Number(normalizeAngle(angle).toFixed(6))).replace(".", ",");
+  updateControl(protractorAngle, "value", value);
+}
+
+function rotationDial() {
+  const units = camera.width / svg.clientWidth;
+  const radius = Math.min(100, svg.clientWidth / 4, svg.clientHeight / 4);
+  const padding = (radius + 26) * units;
+  const [x, y] = projectPoint(...freeRotation.pivot);
+  const clamp = (value, start, size) => size < 2 * padding ? start + size / 2
+    : Math.max(start + padding, Math.min(start + size - padding, value));
+  const centerX = clamp(x, camera.x, camera.width);
+  let centerY = clamp(y, camera.y, camera.height);
+  const box = protractor.getBoundingClientRect(), viewport = svg.getBoundingClientRect();
+  const cx = viewport.left + (centerX - camera.x) / units;
+  const cy = viewport.top + (centerY - camera.y) / units;
+  const bottom = (box.bottom - viewport.top) * units + camera.y + padding;
+  if (cx + radius + 22 > box.left && cx - radius - 22 < box.right
+      && cy - radius - 22 < box.bottom && cy + radius + 22 > box.top && bottom + padding <= camera.y + camera.height) {
+    centerY = bottom;
+  }
+  return { x: centerX, y: centerY, units, radius };
+}
+
+function anglePoint(angle, radius) {
+  const radians = angle * Math.PI / 180;
+  return [-Math.sin(radians) * radius, -Math.cos(radians) * radius];
 }
 
 function renderFreeRotation() {
   const layer = $("rotation-layer");
-  if (!freeRotation || !camera || drawingLocked()) {
+  const active = Boolean(freeRotation && camera && drawingPartsReady && !drawingLocked());
+  updateControl(protractor, "hidden", !active);
+  if (!active) {
     layer.replaceChildren();
     return;
   }
-  const delta = drag?.type === "rotate" ? drag.angle : 0;
-  const { pivot, handle } = freeRotation;
-  const radians = delta * Math.PI / 180;
-  const [x, y] = projectPoint(...pivot);
-  const [u, v] = projectPoint(...rotationTransform(radians, pivot)(handle));
-  const units = camera.width / svg.clientWidth;
-  const hx = (u - x) / units, hy = (v - y) / units;
-  const group = element("g", { class: "rotation-guide", transform: `translate(${x} ${y}) scale(${units})` });
+  const gesture = drag?.type === "rotate" ? drag : null;
+  const angle = normalizeAngle((selectedAngle() ?? 0) + (gesture?.angle ?? 0));
+  if (gesture || document.activeElement !== protractorAngle) updateProtractorAngle(angle);
+  const { x, y, units, radius } = gesture?.dial ?? rotationDial();
+  const [px, py] = projectPoint(...freeRotation.pivot);
+  const [hx, hy] = anglePoint(angle, radius);
+  const group = element("g", { class: `rotation-guide${gesture?.snapped ? " is-snapped" : ""}`,
+    transform: `translate(${x} ${y}) scale(${units})` });
+  group.append(element("circle", { r: radius, class: "rotation-ring" }));
+  const ticks = [[], []];
+  for (let mark = 0; mark < 360; mark += 15) {
+    const major = mark % ROTATION_SNAP_STEP === 0;
+    const inner = anglePoint(mark, radius - (major ? 12 : 5));
+    const outer = anglePoint(mark, radius);
+    ticks[Number(major)].push(`M${inner.join(" ")}L${outer.join(" ")}`);
+    if (major && (radius >= 75 || mark % 90 === 0)) {
+      const [tx, ty] = anglePoint(mark, radius - 26);
+      group.append(rulerText(`${mark}°`, tx, ty + 4, 12, "middle", "rotation-mark"));
+    }
+  }
+  group.append(...ticks.map((segments, index) => element("path", {
+    d: segments.join(" "), class: index ? "rotation-ticks major" : "rotation-ticks",
+  })));
+  if (gesture?.snapped) {
+    const [dx, dy] = anglePoint(angle, Math.hypot(camera.width, camera.height) / units);
+    const cx = (px - x) / units, cy = (py - y) / units;
+    group.append(element("line", { x1: cx - dx, y1: cy - dy, x2: cx + dx, y2: cy + dy, class: "rotation-snap-ray" }));
+  }
+  group.append(element("line", { x1: 0, y1: 0, x2: hx, y2: hy, class: "rotation-ray" }),
+    element("circle", { cx: (px - x) / units, cy: (py - y) / units, r: 4, class: "rotation-pivot" }));
   const title = element("title");
-  title.textContent = "Потяните ручку для поворота. Esc закрывает инструмент.";
+  title.textContent = "Потяните ручку для поворота. Alt отключает привязку.";
   const grip = element("g", { class: "rotation-handle", "data-rotation-handle": "", transform: `translate(${hx} ${hy})` });
-  grip.append(title, element("circle", { r: 11 }), element("use", { href: "#i-turn-cw", x: -7, y: -7, width: 14, height: 14 }));
-  const angle = (selectionAngle + delta) % 360;
-  group.append(element("line", { x1: 0, y1: 0, x2: hx, y2: hy }), element("circle", { r: 4, class: "rotation-pivot" }),
-    grip, rulerText(`${number(angle)}°`, hx, hy - 16, 13, "middle", "rotation-angle"));
+  grip.append(title, element("circle", { r: 16 }), element("use", { href: "#i-turn-cw", x: -9, y: -9, width: 18, height: 18 }));
+  group.append(grip);
   layer.replaceChildren(group);
 }
 
-function rotationPointerAngle([x, y]) {
-  return Math.atan2(y - freeRotation.pivot[1], x - freeRotation.pivot[0]);
+function rotationPointerAngle([x, y], dial) {
+  return Math.atan2(y + dial.x, x + dial.y) * 180 / Math.PI;
 }
 
-function previewFreeRotation(gesture, point) {
-  const radians = rotationPointerAngle(point) - gesture.startAngle;
-  const angle = Math.round(Math.atan2(Math.sin(radians), Math.cos(radians)) * 1800 / Math.PI) / 10;
+function previewFreeRotation(gesture, { point, free }) {
+  const initial = selectedAngle() ?? 0;
+  const raw = initial + rotationPointerAngle(point, gesture.dial) - gesture.startAngle;
+  const nearest = Math.round(raw / ROTATION_SNAP_STEP) * ROTATION_SNAP_STEP;
+  gesture.snapped = !free && Math.abs(raw - nearest) <= 4;
+  const target = gesture.snapped ? nearest : Math.round(raw * 10) / 10;
+  const angle = normalizeAngle(target - initial);
   const transform = rotationTransform(angle * Math.PI / 180, freeRotation.pivot);
-  if (!checkManualPlacement(gesture.placement, transform).valid) return;
   gesture.angle = angle;
   const [x, y] = projectPoint(...freeRotation.pivot);
-  previewSelection(`rotate(${-angle} ${x} ${y})`);
+  previewPlacementStatus(gesture.placement, manualPlacementConflicts(gesture.placement, transform));
+  previewSelection(`rotate(${-angle} ${x} ${y})`, transform);
   renderFreeRotation();
 }
 
-function cancelCanvasGesture() {
+protractor.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!freeRotation || drawingLocked()) return;
+  const raw = protractorAngle.value.trim().replace(",", ".");
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw) || !Number.isFinite(Number(raw))) {
+    protractorAngle.setCustomValidity("Введите угол в градусах, например 23,5.");
+    protractorAngle.reportValidity();
+    return;
+  }
+  rotateSelectionBy(Number(raw) - (selectedAngle() ?? 0), freeRotation.pivot);
+  updateProtractorAngle(selectedAngle() ?? 0);
+  protractorAngle.select();
+});
+protractorAngle.addEventListener("input", () => protractorAngle.setCustomValidity(""));
+function closeProtractor() {
+  cancelCanvasGesture();
+  endFreeRotation();
+  svg.focus({ preventScroll: true });
+}
+$("protractor-close").addEventListener("click", closeProtractor);
+protractor.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeProtractor();
+  }
+});
+
+function cancelCanvasGesture({ refreshActions = true } = {}) {
   const gesture = drag;
   if (!gesture) return;
   drag = null;
+  if (gesture.frame != null) cancelAnimationFrame(gesture.frame);
+  renderManualGuides();
   svg.classList.remove("dragging", "moving-contours");
   $("selection-marquee").setAttribute("hidden", "");
   if (["move", "rotate"].includes(gesture.type) && gesture.moved) {
     const groups = $("path-layer").children;
-    for (const index of selection) groups[index]?.removeAttribute("transform");
-    renderPartLabels();
+    for (const index of selection) {
+      groups[index]?.removeAttribute("transform");
+      groups[index]?.classList.remove("move-invalid", "move-valid");
+      notchMarkers.get(index)?.removeAttribute("transform");
+    }
+    for (const entry of gesture.labels ?? []) positionPartLabel(entry, entry.center);
     if (gesture.type === "rotate") renderFreeRotation();
+    if (refreshActions) renderLayoutActions();
   }
   if (svg.hasPointerCapture(gesture.pointerId)) svg.releasePointerCapture(gesture.pointerId);
 }
@@ -3558,7 +4823,14 @@ function cancelCanvasGesture() {
 svg.addEventListener("pointerdown", (event) => {
   if (!camera || drag || !event.isPrimary) return;
   if (event.button === 0 && event.target.closest("[data-canvas-page]")) return;
-  const panning = event.button === 1 || (event.button === 0 && panMode);
+  if (cameraFrame !== null) drawCamera();
+  const panning = event.button === 1;
+  if (!panning && measureMode && event.button === 0 && !drawingLocked()) {
+    event.preventDefault();
+    svg.focus({ preventScroll: true });
+    startMeasurement(event);
+    return;
+  }
   if (!panning && (event.button !== 0 || !placed.length || drawingLocked())) return;
   if (!panning && !drawingPartsReady) {
     void identifyDrawingParts().catch(() => notifyError("Не удалось определить детали и их насечки. Повторите выбор."));
@@ -3576,7 +4848,10 @@ svg.addEventListener("pointerdown", (event) => {
     pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY,
     x: camera.x, y: camera.y, start, index, additive, moved: false,
   };
-  if (rotating) Object.assign(drag, { startAngle: rotationPointerAngle(start), angle: 0, placement: prepareManualPlacement() });
+  if (rotating) {
+    const dial = rotationDial();
+    Object.assign(drag, { dial, startAngle: rotationPointerAngle(start, dial), angle: 0, placement: prepareManualPlacement() });
+  }
   svg.setPointerCapture(event.pointerId);
   if (panning) svg.classList.add("dragging");
 });
@@ -3589,8 +4864,10 @@ svg.addEventListener("pointermove", (event) => {
       cameraMode = "manual";
       camera.x = x;
       camera.y = y;
-      drawCamera();
+      scheduleCameraDraw();
     }
+  } else if (measureMode && event.isPrimary && !drag) {
+    moveMeasurementPointer(event);
   } else if (drag?.pointerId === event.pointerId) {
     if (!drag.moved && Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
       drag.moved = true;
@@ -3600,37 +4877,42 @@ svg.addEventListener("pointermove", (event) => {
         drag.offset = [0, 0];
         svg.classList.add("moving-contours");
       }
+      if (placementPreviewActive()) {
+        const numbers = new Set([...selection].map((index) => placed[index].partNumber));
+        drag.labels = [...numbers].map((number) => partLabels.get(number)).filter(Boolean);
+        renderLayoutActions();
+      }
     }
-    if (drag.moved) {
-      const point = drawingPoint(event);
-      if (drag.type === "move") previewConstrainedMove(drag, point[0] - drag.start[0], point[1] - drag.start[1]);
-      else if (drag.type === "rotate") previewFreeRotation(drag, point);
-      else drawMarquee(drag.start, point, event.clientX < drag.clientX);
-    }
+    if (!drag.moved) return;
+    if (drag.type === "move") scheduleManualMove(drag, event);
+    else if (drag.type === "rotate") previewFreeRotation(drag, { point: drawingPoint(event), free: event.altKey });
+    else drawMarquee(drag.start, drawingPoint(event), event.clientX < drag.clientX);
   }
 });
 
 svg.addEventListener("pointerup", (event) => {
+  if (measurePointer?.id === event.pointerId) {
+    finishMeasurement(event);
+    return;
+  }
   const gesture = drag;
   if (gesture?.pointerId !== event.pointerId) return;
+  const partNumber = !gesture.moved && gesture.type === "move" ? placed[gesture.index]?.partNumber : null;
+  lastPartClick = partNumber ? { number: partNumber, paths: placed,
+    samePart: lastPartClick?.paths === placed && lastPartClick.number === partNumber } : null;
   if (!drawingLocked() && gesture.moved && (gesture.type === "move" || gesture.type === "rotate")) {
-    const point = drawingPoint(event);
-    if (gesture.type === "move") previewConstrainedMove(gesture, point[0] - gesture.start[0], point[1] - gesture.start[1]);
-    else previewFreeRotation(gesture, point);
+    if (gesture.type === "move") previewManualMove(gesture, manualMoveInput(gesture, event));
+    else previewFreeRotation(gesture, { point: drawingPoint(event), free: event.altKey });
   }
-  cancelCanvasGesture();
+  const committing = !drawingLocked() && (gesture.type === "rotate" ? Boolean(gesture.angle) : gesture.offset?.some(Boolean));
+  cancelCanvasGesture({ refreshActions: !committing });
   if (gesture.type === "pan") {
     scheduleWorkspaceSave();
     return;
   }
   if (drawingLocked()) return;
   if (gesture.type === "rotate") {
-    if (!gesture.angle) return;
-    const { pivot, handle } = freeRotation;
-    const transform = rotationTransform(gesture.angle * Math.PI / 180, pivot);
-    editSelection((path) => mapPath(path, transform), "поворот", (selectionAngle + gesture.angle) % 360);
-    freeRotation = { pivot, handle: transform(handle) };
-    renderFreeRotation();
+    if (gesture.angle) rotateSelectionBy(gesture.angle, freeRotation.pivot);
     return;
   }
   const next = gesture.additive ? new Set(selection) : new Set();
@@ -3660,18 +4942,50 @@ svg.addEventListener("pointerup", (event) => {
 
 svg.addEventListener("lostpointercapture", (event) => {
   if (drag?.pointerId === event.pointerId) cancelCanvasGesture();
+  if (measurePointer?.id === event.pointerId) {
+    clearMeasurement();
+    renderMeasurement();
+  }
+});
+svg.addEventListener("pointerleave", () => {
+  if (!measureMode || measurePointer) return;
+  if (measurementFrame !== null) {
+    cancelAnimationFrame(measurementFrame);
+    measurementFrame = null;
+  }
+  measurementHover = null;
+  measurementCursor = null;
+  if (measurement) measurement.end = null;
+  renderMeasurement();
 });
 document.addEventListener("keydown", (event) => {
-  if (event.defaultPrevented || event.altKey || event.shiftKey || event.repeat || drawingLocked()) return;
+  if (!event.repeat) updateMeasurementModifiers(event);
+  if (event.defaultPrevented || event.altKey || event.repeat || event.isComposing || drawingLocked()) return;
   const target = event.target;
-  if (!(target instanceof Element) || !target.closest(".drawing, #contour-dialog")
-      || target.closest("input, select, textarea, [contenteditable]")) return;
-  if (event.key === "Delete" && !event.ctrlKey && !event.metaKey && selection.size) {
+  if (event.key === "Escape" && measureMode && !document.querySelector("dialog[open]")) {
     event.preventDefault();
-    $("delete-button").click();
-  } else if (event.key.toLowerCase() === "z" && (event.ctrlKey || event.metaKey) && drawingUndo.length) {
+    dismissMeasurement();
+    return;
+  }
+  if (!(target instanceof Element) || target.closest("input, select, textarea, [contenteditable]")) return;
+  const modified = event.ctrlKey || event.metaKey;
+  if (!modified && !event.shiftKey && (event.code === "KeyL" || event.key.toLowerCase() === "l")
+      && !$("measure-tool").disabled && !document.querySelector("dialog[open]")) {
     event.preventDefault();
-    undoDrawingEdit();
+    setMeasureMode(!measureMode);
+    svg.focus({ preventScroll: true });
+    return;
+  }
+  if (!target.closest(".drawing, #contour-dialog")) return;
+  const key = event.code === "KeyZ" ? "z" : event.code === "KeyY" ? "y" : event.key.toLowerCase();
+  if (event.key === "Delete" && !modified && !event.shiftKey && !measureMode && selection.size) {
+    event.preventDefault();
+    deleteSelection();
+    if (contourDialog.open) contourDialog.close();
+    svg.focus({ preventScroll: true });
+  } else if (modified && (key === "z" || key === "y" && !event.shiftKey)) {
+    event.preventDefault();
+    stepEditHistory(key === "y" || event.shiftKey);
   }
 });
 svg.addEventListener("keydown", (event) => {
@@ -3685,18 +4999,20 @@ svg.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key === "Escape") {
-    if (drag) cancelCanvasGesture();
+    if (measureMode) dismissMeasurement();
+    else if (drag) cancelCanvasGesture();
     else if (freeRotation) endFreeRotation();
     else setSelection(new Set());
+    event.preventDefault();
     return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
     event.preventDefault();
-    setTool(false);
+    setMeasureMode(false);
     selectAllContours();
     return;
   }
-  if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  if (measureMode || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
   event.preventDefault();
   const seen = new Set();
   const parts = [];
@@ -3741,9 +5057,12 @@ document.addEventListener("drop", (event) => {
 });
 
 
-new ResizeObserver(resizeCamera).observe(svg);
+new ResizeObserver(() => {
+  if (svg.clientWidth !== cameraViewport?.width || svg.clientHeight !== cameraViewport?.height) {
+    resizeCamera({ keepView: Boolean(source) });
+  }
+}).observe(svg);
 renderLive();
 void readConfiguration();
 void restoreWorkspace();
-setInterval(renderRunElapsed, 1000);
 scheduleLiveRead(0);

@@ -9,7 +9,7 @@ try {
 } catch {
     $running = $null
 }
-if ($running.mode -eq 'controller' -and $running.apiVersion -eq 19 -and $running.machine.directRoll -and $running.machine.continuousRoll -and $running.machine.stopDuringExternalRun -and $running.machine.liveCutProgress -and $running.machine.coordinateMove -and $running.machine.optimizedNesting -and $running.machine.ip) {
+if ($running.mode -eq 'controller' -and $running.apiVersion -eq 21 -and $running.demoAvailable -and $running.machine.directRoll -and $running.machine.continuousRoll -and $running.machine.stopDuringExternalRun -and $running.machine.liveCutProgress -and $running.machine.coordinateMove -and $running.machine.optimizedNesting -and $running.machine.ip) {
     Start-Process $url
     exit 0
 }
