@@ -1,13 +1,45 @@
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import Mock
+from urllib.request import Request
 from zipfile import ZipFile
 
-from app_update import AppUpdates, REQUIRED, Release, UpdateError, extract_update, latest_update
+from app_update import AppUpdates, GitHubRedirect, METADATA_URL, REQUIRED, Release, UpdateError, download_release, extract_update, fetch_latest, latest_update
 
 
 class AppUpdateTests(unittest.TestCase):
+    def test_public_requests_use_https_without_a_token_and_limit_download_size(self):
+        opener = Mock()
+        opener.open.return_value = BytesIO(b'{"tag_name":"v1.6.0"}')
+        self.assertEqual(fetch_latest(opener)["tag_name"], "v1.6.0")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, METADATA_URL)
+        self.assertIsNone(request.get_header("Authorization"))
+        release = Release("1.6.0", "plotter-companion-v1.6.0-windows-x64.zip", 4, "0" * 64)
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "update.zip"
+            opener.open.return_value = BytesIO(b"abcd")
+            download_release(opener, release, destination)
+            self.assertEqual(destination.read_bytes(), b"abcd")
+            self.assertIsNone(opener.open.call_args.args[0].get_header("Authorization"))
+            for data in (b"abc", b"abcde"):
+                opener.open.return_value = BytesIO(data)
+                with self.assertRaises(UpdateError):
+                    download_release(opener, release, Path(directory) / f"size-{len(data)}.zip")
+
+    def test_download_redirects_only_to_expected_https_hosts(self):
+        redirect = GitHubRedirect()
+        source = Request("https://github.com/a/b/releases/download/v1.6.0/test.zip")
+        for url in ("https://unexpected.invalid/test", "http://release-assets.githubusercontent.com/test",
+                    "https://github.com@unexpected.invalid/test"):
+            with self.assertRaises(UpdateError):
+                redirect.redirect_request(source, None, 302, "", {}, url)
+        target = "https://release-assets.githubusercontent.com/test"
+        self.assertEqual(redirect.redirect_request(source, None, 302, "", {}, target).full_url, target)
+
     def test_only_new_stable_releases_with_verified_companion_asset_are_offered(self):
         release = {"tag_name": "v1.10.0", "draft": False, "prerelease": False, "assets": [
             {"name": "plotter-companion-v1.10.0-windows-x64.zip", "digest": "sha256:" + "a" * 64,

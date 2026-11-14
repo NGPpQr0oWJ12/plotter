@@ -1,4 +1,4 @@
-"""Download and stage signed-in GitHub releases for the Windows operator panel."""
+"""Download and stage public GitHub releases for the Windows operator panel."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,11 +13,17 @@ import subprocess
 from tempfile import mkdtemp
 from threading import Lock, Thread
 from time import monotonic
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zipfile import BadZipFile, ZipFile
 
 
 VERSION_PATTERN = re.compile(r"(?:0|[1-9]\d{0,5})\.(?:0|[1-9]\d{0,5})\.(?:0|[1-9]\d{0,5})", re.ASCII)
 REPOSITORY = "NGPpQr0oWJ12/plotter"
+METADATA_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+DOWNLOAD_HOSTS = frozenset({"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"})
+MAX_METADATA = 512 * 1024
 MAX_ARCHIVE = 160 * 1024 * 1024
 MAX_EXPANDED = 480 * 1024 * 1024
 WINDOWS_NAME = re.compile(r"[A-Za-z0-9_.+@ -]+", re.ASCII)
@@ -55,6 +61,51 @@ class Release:
     name: str
     size: int
     digest: str
+
+
+class GitHubRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        url = urlsplit(newurl)
+        if (url.scheme != "https" or url.netloc not in DOWNLOAD_HOSTS
+                or urlsplit(req.full_url).netloc not in DOWNLOAD_HOSTS):
+            raise UpdateError("GitHub перенаправил загрузку на неожиданный адрес.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_latest(opener):
+    request = Request(METADATA_URL, headers={"Accept": "application/vnd.github+json",
+                                             "User-Agent": "Xiao-Plotter-Updater"})
+    try:
+        with opener.open(request, timeout=15) as response:
+            contents = response.read(MAX_METADATA + 1)
+    except HTTPError as error:
+        with error:
+            if error.code == 429 or error.headers.get("X-RateLimit-Remaining") == "0":
+                raise UpdateError("GitHub временно ограничил проверки. Повторим позже.") from error
+        raise UpdateError("Не удалось проверить релизы GitHub. Проверьте подключение к интернету.") from error
+    if len(contents) > MAX_METADATA:
+        raise UpdateError("Ответ GitHub о релизе слишком велик.")
+    return json.loads(contents)
+
+
+def download_release(opener, release, destination):
+    url = f"https://github.com/{REPOSITORY}/releases/download/v{release.version}/{release.name}"
+    request = Request(url, headers={"User-Agent": "Xiao-Plotter-Updater"})
+    deadline = monotonic() + 300
+    remaining = release.size
+    with opener.open(request, timeout=20) as response, destination.open("xb") as output:
+        while True:
+            if monotonic() > deadline:
+                raise UpdateError("Истекло время скачивания обновления.")
+            chunk = response.read(min(remaining + 1, 1024 * 1024))
+            if len(chunk) > remaining:
+                raise UpdateError("Размер архива обновления отличается от указанного в GitHub.")
+            if not chunk:
+                break
+            output.write(chunk)
+            remaining -= len(chunk)
+    if remaining:
+        raise UpdateError("Скачивание архива обновления прервалось.")
 
 
 def latest_update(metadata, current):
@@ -136,28 +187,10 @@ class AppUpdates:
         self._checking = False
         self._restarted_at = 0
 
-    @staticmethod
-    def github(*args, timeout):
-        executable = shutil.which("gh.exe")
-        if not executable:
-            candidates = [
-                Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "GitHub CLI" / "gh.exe",
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "GitHub CLI" / "gh.exe",
-            ]
-            executable = next((str(candidate) for candidate in candidates if candidate.is_file()), None)
-        if not executable:
-            raise UpdateError("Для обновлений установите GitHub CLI и войдите в GitHub.")
-        environment = dict(os.environ, GH_PROMPT_DISABLED="1")
-        completed = subprocess.run([executable, *args], env=environment, capture_output=True,
-                                   creationflags=subprocess.CREATE_NO_WINDOW, timeout=timeout, check=False)
-        if completed.returncode:
-            raise UpdateError("GitHub недоступен. Проверьте интернет и вход в GitHub CLI с доступом к Plotter.")
-        return completed.stdout
-
     def _refresh(self):
         try:
-            data = self.github("api", "--hostname", "github.com", f"repos/{REPOSITORY}/releases/latest", timeout=15)
-            available, message = latest_update(json.loads(data), self.version), None
+            data = fetch_latest(build_opener(GitHubRedirect()))
+            available, message = latest_update(data, self.version), None
         except UpdateError as error:
             available, message = None, str(error)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):
@@ -167,7 +200,7 @@ class AppUpdates:
             if self._state == "idle":
                 self._message = message
             self._checking = False
-            self._check_after = monotonic() + (60 if message else 300)
+            self._check_after = monotonic() + (1800 if message else 900)
 
     def status(self):
         with self._lock:
@@ -226,8 +259,7 @@ class AppUpdates:
             root = Path(mkdtemp(prefix="update-", dir=updates_dir))
             try:
                 archive = root / "update.zip"
-                self.github("release", "download", f"v{release.version}", "--repo", f"github.com/{REPOSITORY}",
-                            "--pattern", release.name, "--output", str(archive), timeout=300)
+                download_release(build_opener(GitHubRedirect()), release, archive)
                 candidate = root / "payload"
                 extract_update(archive, candidate, release)
                 archive.unlink()
@@ -252,6 +284,10 @@ class AppUpdates:
         except UpdateError as error:
             with self._lock:
                 self._state, self._message = "failed", str(error)
+        except HTTPError as error:
+            error.close()
+            with self._lock:
+                self._state, self._message = "failed", "Не удалось скачать обновление с GitHub."
         except (OSError, ValueError, KeyError, BadZipFile, RuntimeError, subprocess.SubprocessError):
             with self._lock:
                 self._state, self._message = "failed", "Не удалось подготовить обновление. Попробуйте ещё раз."
