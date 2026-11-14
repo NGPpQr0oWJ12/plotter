@@ -65,7 +65,7 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $payload 'VERSION'), $version, [Text.Encoding]::ASCII)
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'CHANGELOG.md') -Destination $payload
-    $serverOptions = & (Join-Path $runtime 'python.exe') -B (Join-Path $payload 'server.py') --help | Out-String
+    $serverOptions = & (Join-Path $runtime 'python.exe') -X utf8 -B (Join-Path $payload 'server.py') --help | Out-String
     if ($LASTEXITCODE -ne 0 -or $serverOptions -notmatch '--central-ca') {
         throw 'Bundled runtime did not load companion support for an application-local CA.'
     }
