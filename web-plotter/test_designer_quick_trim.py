@@ -13,6 +13,129 @@ def quick_trim(entities, stroke, tolerance=0.25):
 
 
 class QuickTrimTests(unittest.TestCase):
+    def test_click_on_tiny_corner_loop_keeps_closed_outline_identity_and_notch(self):
+        points = [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]
+        for closed in (True, False):
+            with self.subTest(closed=closed):
+                outline = {"id": "outline", "type": "polyline", "points": points if closed else [*points, points[0]],
+                           "closed": closed, "layer": "Крой", "groupPath": ["detail"], "joined": True}
+                notch = line("notch", [5, 0], [5, 2], notch=True, parentId="outline")
+                outside = line("outside", [40, 0], [40, 20])
+                result = edit_design([outline, notch, outside], "trim-quick", {
+                    "stroke": [[20.002, -0.0025]], "tolerance": 0.00032, "groupPath": ["detail"],
+                })
+                self.assertTrue(result["changed"])
+                self.assertEqual(result["warnings"], [])
+                self.assertEqual(result["selectedIds"], [outline["id"]])
+                self.assertEqual(result["entities"], [
+                    {**outline, "closed": True, "points": [[0, 0], [20, 0], [20, 20], [0, 20]]}, notch, outside,
+                ])
+
+    def test_click_on_either_overrun_tail_is_also_eligible(self):
+        outline = {"id": "outline", "type": "polyline", "closed": True,
+                   "points": [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]}
+        for point in ([20.002, 0], [20, -0.003]):
+            with self.subTest(point=point):
+                result = quick_trim([outline], [point], tolerance=0.00032)
+                self.assertTrue(result["changed"])
+                self.assertEqual(result["entities"], [{**outline, "layer": "0", "points": [[0, 0], [20, 0], [20, 20], [0, 20]]}])
+
+    def test_click_on_ordinary_side_or_large_loop_keeps_original_eraser_behavior(self):
+        outline = {"id": "outline", "type": "polyline", "closed": True,
+                   "points": [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]}
+        large = {**outline, "points": [[0, 0], [20.4, 0], [20, -0.5], [20, 20], [0, 20]]}
+        for source, point in ((outline, [20, 0.003]), (large, [20.2, -0.25])):
+            with self.subTest(point=point):
+                result = quick_trim([source], [point], tolerance=0.00032)
+                self.assertTrue(result["changed"])
+                self.assertTrue(all(piece["id"] != source["id"] and not piece.get("closed") for piece in result["entities"]))
+
+    def test_protected_or_ambiguous_tiny_loop_is_left_unchanged(self):
+        outline = {"id": "outline", "type": "polyline", "closed": True, "joined": True,
+                   "points": [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]}
+        notch = line("protected", [20.004, 0], [22, 0], notch=True, parentId="outline")
+        ambiguous = {**outline, "points": [*outline["points"][:4], [-0.004, 20], [0, 20.005]]}
+        for entities in ([outline, notch], [ambiguous]):
+            with self.subTest(entities=entities):
+                result = quick_trim(entities, [[20.002, -0.0025]], tolerance=0.00032)
+                self.assertFalse(result["changed"])
+                self.assertEqual(result["entities"], validate_design(entities))
+                self.assertIn("Контур сохранён", result["warnings"][0])
+
+    def test_click_on_line_chain_loop_keeps_native_sides_and_identity(self):
+        incoming = line("incoming", [20.004, 0], [0, 0], groupPath=["detail"])
+        connector = line("connector", [20, -0.005], [20.004, 0], groupPath=["detail"])
+        outgoing = line("outgoing", [20, 20], [20, -0.005], groupPath=["detail"])
+        top = line("top", [20, 20], [0, 20], groupPath=["detail"])
+        left = line("left", [0, 0], [0, 20], groupPath=["detail"])
+        notch = line("notch", [12, 0], [12, 2], notch=True, parentId="incoming")
+        entities = [incoming, connector, outgoing, top, left, notch]
+        result = edit_design(entities, "trim-quick", {
+            "stroke": [[20.002, -0.0025]], "tolerance": 0.00032, "groupPath": ["detail"],
+        })
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["warnings"], [])
+        self.assertCountEqual(result["selectedIds"], ["incoming", "outgoing"])
+        self.assertEqual(result["entities"], [{**incoming, "start": [20, 0]}, {**outgoing, "end": [20, 0]}, top, left, notch])
+
+    def test_unjoined_rectangle_click_and_collinear_drag_remove_only_one_side(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                 "closed": True, "joined": False}
+        for stroke in ([[8, 0.1]], [[-1, 0], [21, 0]]):
+            with self.subTest(stroke=stroke):
+                result = quick_trim([shape], stroke)
+                piece, = result["entities"]
+                self.assertTrue(result["changed"])
+                self.assertFalse(piece["closed"])
+                self.assertFalse(piece["joined"])
+                self.assertEqual(piece["points"], [[20, 0], [20, 10], [0, 10], [0, 0]])
+
+    def test_unjoined_rectangle_drag_removes_both_crossed_sides(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                 "closed": True}
+        result = quick_trim([shape], [[8, -1], [8, 11]])
+        left, right = sorted(result["entities"], key=lambda piece: piece["start"][0])
+        self.assertEqual((left["start"], left["end"]), ([0, 10], [0, 0]))
+        self.assertEqual((right["start"], right["end"]), ([20, 0], [20, 10]))
+
+    def test_unjoined_rectangle_stroke_leaving_through_corner_keeps_neighbor(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                 "closed": True}
+        result = quick_trim([shape], [[20, 8], [20, 0], [24, -4]])
+        piece, = result["entities"]
+        self.assertEqual(piece["points"], [[20, 10], [0, 10], [0, 0], [20, 0]])
+
+    def test_joined_rectangle_remains_one_eraser_target_without_intersections(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                 "closed": True, "joined": True}
+        self.assertEqual(quick_trim([shape], [[8, 0.1]])["entities"], [])
+
+    def test_unjoined_rectangle_erases_to_intersection_and_keeps_other_groups(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                 "closed": True, "layer": "profile", "groupPath": ["group"]}
+        cutter = line("cut", [10, -5], [10, 5], groupPath=["group"])
+        outside = line("outside", [15, -5], [15, 5])
+        result = edit_design([shape, cutter, outside], "trim-quick", {
+            "stroke": [[8, 0.1]], "tolerance": 0.25, "groupPath": ["group"],
+        })
+        piece, actual_cutter, actual_outside = result["entities"]
+        self.assertEqual(piece["points"], [[10, 0], [20, 0], [20, 10], [0, 10], [0, 0]])
+        self.assertEqual(piece["groupPath"], ["group"])
+        self.assertEqual([actual_cutter, actual_outside], validate_design([cutter, outside]))
+        result = quick_trim([shape, cutter], [[-1, 0], [21, 0]])
+        piece = next(piece for piece in result["entities"] if piece["layer"] == "profile")
+        self.assertEqual(piece["points"], [[20, 0], [20, 10], [0, 10], [0, 0]])
+
+    def test_unjoined_two_bulge_contour_keeps_the_other_arc(self):
+        shape = {"id": "outline", "type": "polyline", "points": [[-10, 0], [10, 0]],
+                 "closed": True, "bulges": [1, 1]}
+        result = quick_trim([shape], [[0, -10]])
+        piece, = result["entities"]
+        self.assertFalse(piece["closed"])
+        self.assertAlmostEqual(piece["bulges"][0], 1)
+        self.assertAlmostEqual(piece["points"][0][0], 10)
+        self.assertAlmostEqual(piece["points"][1][0], -10)
+
     def test_click_selects_nearest_bounded_part_without_selecting_cutters(self):
         target = line("target", [0, 0], [20, 0])
         left = line("left", [5, -3], [5, 3])
@@ -75,12 +198,13 @@ class QuickTrimTests(unittest.TestCase):
 
     def test_exact_crossing_prefers_its_partition_over_grazing_an_adjacent_one(self):
         outline = {"id": "outline", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
-                   "closed": True}
+                   "closed": True, "joined": True}
         cutter = line("cut", [10, -5], [10, 15])
         after = quick_trim([outline, cutter], [[9.9, -1], [9.9, 1]])
         self.assertGreaterEqual(len(after["entities"]), 1)
         right = after["entities"][0]
         self.assertEqual(right["points"], [[10, 0], [20, 0], [20, 10], [10, 10]])
+        self.assertTrue(right["joined"])
 
     def test_adjacent_near_miss_after_crossing_keeps_the_other_interval(self):
         target = line("target", [0, 0], [20, 0])
@@ -121,7 +245,7 @@ class QuickTrimTests(unittest.TestCase):
 
     def test_closed_polyline_wrap_keeps_corners_and_only_surviving_notches(self):
         shape = {"id": "box", "type": "polyline", "points": [[0, 0], [20, 0], [20, 10], [0, 10]],
-                 "closed": True, "layer": "profile"}
+                 "closed": True, "layer": "profile", "joined": True}
         cutter = line("cut", [7, -5], [7, 15])
         removed_notch = line("n-removed", [0, 5], [2, 5], notch=True, parentId="box")
         kept_notch = line("n-kept", [20, 6], [18, 6], notch=True, parentId="box")

@@ -1,13 +1,14 @@
 from codecs import BOM_UTF8
-from io import BytesIO
+from io import BytesIO, StringIO
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from ezdxf import recover
+import ezdxf
+from ezdxf import recover, units
 
-from cad import CadImportError
-from designer_cad import CadDesignError, import_design, prepare_design, validate_design
+from cad import CadImportError, import_drawing
+from designer_cad import CadDesignError, IMPORT_AUDIT, IMPORT_DOUBLED_LINE, edit_design, import_design, prepare_design, validate_design
 
 
 def drawing(*entities, header=(), eof=True):
@@ -21,6 +22,10 @@ def drawing(*entities, header=(), eof=True):
 
 
 LINE = [(0, "LINE"), (8, "0"), (10, 0), (20, 0), (11, 2), (21, 1)]
+
+
+def segment(start, end):
+    return [(0, "LINE"), (8, "0"), (10, start[0]), (20, start[1]), (11, end[0]), (21, end[1])]
 
 
 def units_header(value):
@@ -37,6 +42,122 @@ def polyline(points, closed=False):
 
 
 class DesignerImportRecoveryTests(unittest.TestCase):
+    def test_cad_dxf_import_repairs_tiny_corner_on_closed_native_polyline_or_line_chain(self):
+        points = [(100, 0), (-.0015, 0), (.0002, .001), (-.1, -100), (100, -100)]
+        crossing_x = .0002 + .001 * (-.1 - .0002) / (100 + .001)
+        for kind in ("closed polyline", "repeated seam", "line cycle"):
+            with self.subTest(kind=kind):
+                if kind == "line cycle":
+                    entities = [segment(start, end) for start, end in zip(points, points[1:] + points[:1])]
+                else:
+                    vertices = points if kind == "closed polyline" else [*points, points[0]]
+                    entities = [polyline([(x, y, 0) for x, y in vertices], closed=kind == "closed polyline")]
+                result = import_design(drawing(*entities, header=units_header(4)), "small-loop.dxf")
+                self.assertIn("Удалено малых петель в углах — 1.", result["repairSummary"])
+                self.assertNotIn("diagnostics", result)
+                if kind == "line cycle":
+                    self.assertEqual([shape["id"] for shape in result["entities"]], ["dxf-1", "dxf-3", "dxf-4", "dxf-5"])
+                    self.assertTrue(all(shape["type"] == "line" for shape in result["entities"]))
+                    self.assertEqual(result["entities"][0]["end"], result["entities"][1]["start"])
+                    corner = result["entities"][0]["end"]
+                else:
+                    outline, = result["entities"]
+                    self.assertEqual(outline["id"], "dxf-1")
+                    self.assertTrue(outline["closed"])
+                    self.assertEqual(len(outline["points"]), 4)
+                    corner = outline["points"][1]
+                self.assertAlmostEqual(corner[0], crossing_x, places=12)
+                self.assertAlmostEqual(corner[1], 0, places=12)
+
+    def test_cad_dxf_import_preserves_large_protected_and_genuinely_open_corner_geometry(self):
+        corners = [(0, 0, 0), (20.04, 0, 0), (20, -.05, 0), (20, 20, 0), (0, 20, 0)]
+        large = [corners[0], (20.11, 0, 0), *corners[2:]]
+        attachment = [(0, "ARC"), (8, "0"), (10, 20.04), (20, 1), (40, 1), (50, 270), (51, 315)]
+        crossing = segment((20.03, -.02), (20.03, .02))
+        tangent = [(0, "CIRCLE"), (8, "0"), (10, 20.03), (20, .005), (40, .005)]
+        open_seam = [corners[2], *corners[3:], *corners[:2]]
+        for shape, closed, neighbors in ((large, True, []), (corners, True, [attachment]),
+                                         (corners, True, [crossing]), (corners, True, [tangent]),
+                                         (open_seam, False, [])):
+            with self.subTest(shape=shape, closed=closed, neighbors=neighbors):
+                data = drawing(polyline(shape, closed=closed), *neighbors, header=units_header(4))
+                result = import_design(data, "kept-loop.dxf")
+                self.assertNotIn("Удалено малых петель", result.get("repairSummary", ""))
+                self.assertEqual(result["entities"][0]["points"], [[x, y] for x, y, _ in shape])
+                self.assertEqual(result["entities"][0]["closed"], closed)
+                self.assertTrue(any(issue["kind"] == "intersection" for issue in result["diagnostics"]))
+
+        joined = segment((19.98, -.02), (20.02, .02))
+        data = drawing(polyline(corners, closed=True), joined, header=units_header(4))
+        result = import_design(data, "preserved-junction.dxf")
+        self.assertIn("Удалено малых петель в углах — 1.", result["repairSummary"])
+        self.assertEqual(result["entities"][0]["points"][1], [20, 0])
+
+    def test_cad_dxf_import_automatically_repairs_safe_conflicts_and_keeps_warnings_and_notches(self):
+        corners = [(0, 0), (20, 0), (20, 20), (0, 20)]
+        native = [segment(start, end) for start, end in zip(corners, corners[1:] + corners[:1])]
+        duplicate = segment((20, 0), (0, 0))
+        branch = segment((0, 0), (-20, -20))
+        notch = polyline([(0, 0, 0), (2, 2, 0)], closed=True)
+        crossed = polyline([(60, 0, 0), (80, 20, 0), (60, 20, 0), (80, 0, 0)], closed=True)
+        text = [(0, "TEXT"), (10, 3), (20, 3), (40, 1), (1, "note")]
+        data = drawing(*native, duplicate, branch, notch, crossed, text, header=units_header(4))
+
+        result = import_design(data, "outline.dxf")
+
+        self.assertEqual([entity["id"] for entity in result["entities"]],
+                         ["dxf-1", "dxf-2", "dxf-3", "dxf-4", "dxf-7", "dxf-8"])
+        self.assertEqual([entity["start"] for entity in result["entities"][:4]], [list(point) for point in corners])
+        self.assertEqual(result["entities"][4]["importIssues"], [IMPORT_DOUBLED_LINE])
+        self.assertEqual(result["entities"][4]["points"], [[0, 0], [2, 2]])
+        self.assertEqual(result["warnings"], [
+            "Восстановлены повреждённые объекты: LWPOLYLINE (1). Проверьте выделенные контуры.",
+            "Особенности импорта: TEXT (1).",
+        ])
+        self.assertIn("Исправлено конфликтов — 2.", result["repairSummary"])
+        self.assertIn({"point": [70, 10], "kind": "intersection", "ids": ["dxf-8"]}, result["diagnostics"])
+        self.assertEqual(set(result["diagnosticIds"]), {entity["id"] for entity in result["entities"]})
+
+        cutter_result = import_drawing(data, "outline.dxf")
+        self.assertNotIn("repairSummary", cutter_result)
+        self.assertTrue(any([-20, -20] in path["points"] for path in cutter_result["paths"]))
+
+    def test_automatic_cleanup_keeps_exact_overlap_between_distinct_dxf_sources(self):
+        corners = [(0, 0), (20, 0), (20, 20), (0, 20)]
+        for kind in ("block", "group"):
+            with self.subTest(kind=kind):
+                document = ezdxf.new(units=units.MM)
+                model = document.modelspace()
+                target = document.blocks.new("Part") if kind == "block" else model
+                members = [target.add_line(start, end) for start, end in zip(corners, corners[1:] + corners[:1])]
+                if kind == "block":
+                    model.add_blockref("Part", (0, 0))
+                else:
+                    document.groups.new("Part").set_data(members)
+                separate = model.add_line((0, 0), (20, 0))
+                if kind == "group":
+                    document.groups.new("Overlay").set_data([separate])
+                stream = StringIO()
+                document.write(stream)
+
+                result = import_design(stream.getvalue().encode("ascii"), "separate.dxf")
+
+                self.assertEqual(len(result["entities"]), 5)
+                self.assertTrue(all("groupPath" not in entity for entity in result["entities"]))
+                self.assertNotIn("repairSummary", result)
+                self.assertNotIn("diagnostics", result)
+
+    def test_automatic_cleanup_failure_and_budget_keep_the_original_import(self):
+        data = drawing(LINE, LINE, header=units_header(4), eof=False)
+        for check in (patch("designer_cad.MAX_TRIM_EDGES", 1),
+                      patch("designer_cad._repair_conflicts", side_effect=CadDesignError("test verification failure"))):
+            with check:
+                result = import_design(data, "untouched.dxf")
+            self.assertEqual([entity["id"] for entity in result["entities"]], ["dxf-1", "dxf-2"])
+            self.assertTrue(any("Структура DXF восстановлена" in warning for warning in result["warnings"]))
+            self.assertIn("геометрия сохранена", result["repairSummary"].lower())
+            self.assertNotIn("diagnostics", result)
+
     def test_utf8_bom_preserves_the_layer_name_and_explicit_scale(self):
         line = [(code, "Контур" if code == 8 else value) for code, value in LINE]
         data = BOM_UTF8 + drawing(line, header=units_header(6))
@@ -88,6 +209,35 @@ class DesignerImportRecoveryTests(unittest.TestCase):
         self.assertTrue(shape["importDamaged"])
         self.assertEqual(validate_design([shape]), [shape])
         self.assertIn("Восстановлены повреждённые объекты: LWPOLYLINE (1)", result["warnings"][0])
+
+    def test_accepts_collapsed_doubled_dxf_edge_as_a_single_segment(self):
+        outline = polyline([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)], closed=True)
+        mark = polyline([(10, 0, 0), (10, 2, 0)], closed=True)
+        contour, segment = import_design(drawing(outline, mark, header=units_header(4)), "mark.dxf")["entities"]
+        self.assertEqual(segment["importIssues"], [IMPORT_DOUBLED_LINE])
+        self.assertFalse(segment["closed"])
+
+        result = edit_design([contour, segment], "repair-part", {"ids": [segment["id"]]})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], [segment["id"]])
+        self.assertEqual(result["entities"], [contour, {
+            "id": segment["id"], "layer": segment["layer"], "type": "line", "start": [10, 0], "end": [10, 2],
+        }])
+        self.assertEqual(prepare_design(result["entities"]), prepare_design([contour, segment]))
+
+    def test_accepting_doubled_dxf_edge_preserves_other_issues_and_group(self):
+        mark = polyline([(10, 0, 0), (10, 2, 0)], closed=True)
+        segment, = import_design(drawing(mark, header=units_header(4)), "mark.dxf")["entities"]
+        segment.update(reference=True, groupPath=["marks"], importIssues=[IMPORT_DOUBLED_LINE, IMPORT_AUDIT])
+        result = edit_design([segment], "repair-part", {"ids": [segment["id"]]})
+        line, = result["entities"]
+        self.assertEqual(line["type"], "line")
+        self.assertEqual(line["importIssues"], [IMPORT_AUDIT])
+        self.assertTrue(line["importDamaged"])
+        self.assertTrue(line["reference"])
+        self.assertEqual(line["groupPath"], ["marks"])
+        self.assertFalse(edit_design([line], "repair-part", {"ids": [line["id"]]})["changed"])
 
     def test_bad_vertex_and_bulge_split_into_unambiguous_open_segments(self):
         points = [(0, 0, 1), (20, 0, 0), ("nan", 10, 0), (30, 10, 0),
