@@ -13,7 +13,7 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage:
-  sudo bash deploy/release.sh stage VERSION SOURCE_TREE [COMPANION_INSTALLER]
+  sudo bash deploy/release.sh stage RELEASE SOURCE_TREE [COMPANION_INSTALLER [COMPANION_UPDATE]]
   sudo bash deploy/release.sh activate VERSION
   sudo bash deploy/release.sh rollback
 EOF
@@ -118,9 +118,12 @@ check_state() {
 }
 
 stage() (
-    local version=$1 source=$2 installer=${3:-} final=$root/releases/$1 preview= preview_started=0 ready=0
+    local version=$1 source=$2 installer=${3:-} update=${4:-} final=$root/releases/$1
+    local app_version preview= preview_started=0 ready=0
     valid_version "$version" || fail "Invalid version label."
     [[ -f $source/web-plotter/server.py && -f $source/web-plotter/requirements.txt ]] || fail "Source tree lacks web-plotter files."
+    app_version=$(tr -d '\r\n' < "$source/VERSION")
+    [[ $app_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid build version."
     [[ ! -e $final ]] || fail "Release directory already exists. Use a new version label."
     cleanup_stage() {
         if (( preview_started )); then systemctl stop plotter-preview.service >/dev/null 2>&1 || true; fi
@@ -132,10 +135,44 @@ stage() (
     install -d -m 0755 "$final/web-plotter/static"
     install -m 0644 "$source"/web-plotter/*.py "$source/web-plotter/requirements.txt" "$final/web-plotter/"
     install -m 0644 "$source/VERSION" "$final/VERSION"
+    if [[ -f $source/COMPANION_REVISION ]]; then
+        install -m 0644 "$source/COMPANION_REVISION" "$final/COMPANION_REVISION"
+    fi
     if [[ -n $installer ]]; then
-        [[ -s $installer && ${installer##*/} == "Plotter-Companion-Setup-$version-x64.exe" ]] ||
+        [[ -s $installer && ${installer##*/} == "Plotter-Companion-Setup-$app_version-x64.exe" ]] ||
             fail "Installer must be the Windows EXE for this version."
         install -m 0644 -- "$installer" "$final/${installer##*/}"
+    fi
+    if [[ -n $update ]]; then
+        local update_name="plotter-companion-v$app_version-windows-x64.zip"
+        [[ -s $update && ${update##*/} == "$update_name" && -f $final/COMPANION_REVISION ]] ||
+            fail "Update archive must match the companion build."
+        install -m 0644 -- "$update" "$final/$update_name"
+        python3 - "$final" "$update_name" "$app_version" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+from zipfile import ZipFile
+import json
+import sys
+
+directory, name, version = sys.argv[1:]
+root = Path(directory)
+package = root / name
+size = package.stat().st_size
+revision = int((root / "COMPANION_REVISION").read_text(encoding="ascii"))
+if not 0 < size <= 160 * 1024 * 1024 or not 0 < revision <= 2147483647:
+    raise SystemExit("Invalid companion update size or revision.")
+with ZipFile(package) as archive:
+    for entry, expected in (("VERSION", version), ("COMPANION_REVISION", str(revision))):
+        if archive.getinfo(entry).file_size > 32 or archive.read(entry).decode("ascii").strip() != expected:
+            raise SystemExit("Companion update metadata does not match the staged build.")
+digest = sha256()
+with package.open("rb") as source:
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(block)
+manifest = {"version": version, "revision": revision, "size": size, "digest": digest.hexdigest()}
+(root / "companion-update.json").write_text(json.dumps(manifest), encoding="ascii")
+PY
     fi
     if [[ -f $source/CHANGELOG.md ]]; then
         install -m 0644 "$source/CHANGELOG.md" "$final/CHANGELOG.md"
@@ -160,8 +197,14 @@ stage() (
     wait_http "http://127.0.0.1:$PREVIEW_PORT" || fail "Candidate failed isolated health checks."
     if [[ -n $installer ]]; then
         curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$PREVIEW_PORT/api/release-notes" |
-            python3 -c 'import json,sys; notes=json.load(sys.stdin); assert notes["version"] == sys.argv[1] and notes["companionDownload"] is True' "$version"
-        cmp -- "$installer" "$final/Plotter-Companion-Setup-$version-x64.exe"
+            python3 -c 'import json,sys; notes=json.load(sys.stdin); assert notes["version"] == sys.argv[1] and notes["companionDownload"] is True' "$app_version"
+        cmp -- "$installer" "$final/Plotter-Companion-Setup-$app_version-x64.exe"
+    fi
+    if [[ -n $update ]]; then
+        curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$PREVIEW_PORT/api/companion-update" |
+            cmp - "$final/companion-update.json"
+        curl -fsS --noproxy '*' --max-time 20 "http://127.0.0.1:$PREVIEW_PORT/api/companion-update.zip" |
+            cmp - "$final/$update_name"
     fi
     systemctl stop plotter-preview.service
     preview_started=0
@@ -257,7 +300,7 @@ switch_release() (
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then usage; exit 0; fi
 case ${1:-} in
-    stage) [[ $# == 3 || $# == 4 ]] || { usage >&2; exit 2; } ;;
+    stage) [[ $# -ge 3 && $# -le 5 ]] || { usage >&2; exit 2; } ;;
     activate) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
     rollback) [[ $# == 1 ]] || { usage >&2; exit 2; } ;;
     *) usage >&2; exit 2 ;;
@@ -283,7 +326,7 @@ exec 9>"$root/.release.lock"
 flock -n 9 || fail "Another Plotter release command is running."
 
 case $1 in
-    stage) stage "$2" "$(realpath -- "$3")" "${4:-}" ;;
+    stage) stage "$2" "$(realpath -- "$3")" "${4:-}" "${5:-}" ;;
     activate)
         valid_version "$2" || fail "Invalid version label."
         switch_release "$root/releases/$2"

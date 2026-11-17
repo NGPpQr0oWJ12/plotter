@@ -5,6 +5,7 @@ param(
     [string]$CentralCa,
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$ExpectedVersion,
+    [ValidateRange(0, 2147483647)][int]$ExpectedRevision = 0,
     [switch]$Graphical
 )
 
@@ -113,6 +114,17 @@ $versionPath = Join-Path $PSScriptRoot 'VERSION'
 $version = if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
     (Get-Content -LiteralPath $versionPath -Raw).Trim()
 }
+$revisionPath = Join-Path $PSScriptRoot 'COMPANION_REVISION'
+if (!(Test-Path -LiteralPath $revisionPath -PathType Leaf)) {
+    $revisionPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'COMPANION_REVISION'
+}
+$packageRevision = 0
+if (Test-Path -LiteralPath $revisionPath -PathType Leaf) {
+    $value = (Get-Content -LiteralPath $revisionPath -Raw -Encoding ASCII).Trim()
+    if ($value -notmatch '^[1-9][0-9]{0,9}$' -or ![int]::TryParse($value, [ref]$packageRevision)) {
+        throw 'Некорректный номер сборки помощника.'
+    }
+}
 $saved = $null
 if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
     $saved = Get-Content -LiteralPath $installStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -120,6 +132,7 @@ if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
 
 if ($update) {
     if ($Graphical -or $CentralUrl -or $ProfilePath -or $CentralCa -or $version -cne $ExpectedVersion -or
+        ($ExpectedRevision -and $packageRevision -ne $ExpectedRevision) -or
         !$saved.origin -or $saved.release -notmatch '^app-[a-f0-9]{32}$') {
         throw 'The update does not match the installed companion or the expected release.'
     }
@@ -235,6 +248,7 @@ foreach ($asset in @($versionPath, $updateWorker)) {
         throw 'The companion package is missing a version or update worker.'
     }
 }
+if ($packageRevision) { Copy-Item -LiteralPath $revisionPath -Destination $applicationPath }
 $changelog = Join-Path $PSScriptRoot 'CHANGELOG.md'
 if (!(Test-Path -LiteralPath $changelog -PathType Leaf)) {
     $changelog = Join-Path (Split-Path $PSScriptRoot -Parent) 'CHANGELOG.md'
@@ -305,11 +319,14 @@ try {
     if ($wasRunning) {
         $stopRequested = $true
         Stop-ScheduledTask -TaskName $taskName -TaskPath $taskPath
-        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $stopDeadline) {
             if (!(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)) { break }
             Start-Sleep -Milliseconds 250
         }
-        if ($attempt -eq 20) { throw 'Прежний помощник не освободил порт. Закройте его и повторите установку.' }
+        if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+            throw 'Прежний помощник не освободил порт. Закройте его и повторите установку.'
+        }
     }
     if ($saved.release -match '^app-[a-f0-9]{32}$') {
         $oldJournal = Join-Path $installRoot "$($saved.release)\cut-journal.json"
@@ -324,10 +341,12 @@ try {
     $ready = $false
     $statusRequest = @{ Uri = "http://127.0.0.1:$port/api/status"; MaximumRedirection = 0; TimeoutSec = 1 }
     if (!$installedCa) { $statusRequest.Headers = @{ Origin = $origin } }
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $readyDeadline) {
         try {
             $status = Invoke-RestMethod @statusRequest
-            if ($status.companionMode -eq $true -and (!$version -or $status.appVersion -ceq $version)) {
+            if ($status.companionMode -eq $true -and (!$version -or $status.appVersion -ceq $version) -and
+                (!$packageRevision -or $status.companionRevision -eq $packageRevision)) {
                 $ready = $true
                 break
             }

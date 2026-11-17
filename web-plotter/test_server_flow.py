@@ -4,6 +4,7 @@ import os
 import re
 import unittest
 from contextlib import closing
+from email.message import Message
 from http import HTTPStatus
 from http.client import HTTPConnection
 from pathlib import Path
@@ -173,7 +174,7 @@ class ServerFlowTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "central workspaces use Linux file locking")
     def test_central_release_advertises_and_streams_the_local_installer(self):
-        from server import APP_VERSION, COMPANION_INSTALLER
+        from server import APP_VERSION, COMPANION_INSTALLER, COMPANION_UPDATE
 
         directory = Path(self.directory.name)
         installer = directory / COMPANION_INSTALLER
@@ -203,8 +204,52 @@ class ServerFlowTests(unittest.TestCase):
                     self.assertIn(COMPANION_INSTALLER, response.getheader("Content-Disposition"))
                     self.assertEqual(int(response.getheader("Content-Length")), len(payload))
                     self.assertEqual(response.read(), payload)
+                    connection.request("GET", "/api/app-update")
+                    self.assertTrue(json.loads(connection.getresponse().read())["companionDownload"])
+                    connection.request("GET", "/api/companion-update")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, HTTPStatus.NOT_FOUND)
+                    response.read()
+
+                    manifest = {"version": APP_VERSION, "revision": 1, "size": 4, "digest": "a" * 64}
+                    (directory / "companion-update.json").write_text(json.dumps(manifest), encoding="ascii")
+                    (directory / COMPANION_UPDATE).write_bytes(b"PK12")
+                    connection.request("GET", "/api/companion-update")
+                    self.assertEqual(json.loads(connection.getresponse().read()), manifest)
+                    connection.request("GET", "/api/companion-update.zip")
+                    response = connection.getresponse()
+                    self.assertEqual(response.getheader("Content-Type"), "application/zip")
+                    self.assertEqual(response.read(), b"PK12")
             finally:
                 central.shutdown()
+                worker.join()
+
+    def test_local_companion_streams_installer_from_configured_central_server(self):
+        origin = "https://plotter.example.invalid"
+        directory = Path(self.directory.name)
+        with PlotterServer(0, directory / "companion.json", profile_path=EXAMPLE_PROFILE,
+                           companion_origin=origin) as companion:
+            companion.local_companion_ui = True
+            payload = io.BytesIO(b"MZ-setup")
+            payload.headers = Message()
+            payload.headers["Content-Length"] = "8"
+            filename = "Plotter-Companion-Setup-2.5.0-x64.exe"
+            payload.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+            worker = Thread(target=companion.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+            try:
+                with patch.object(companion.workspace.opener, "open", return_value=payload) as fetch:
+                    with closing(HTTPConnection("127.0.0.1", companion.server_port, timeout=5)) as connection:
+                        connection.request("GET", "/api/release-notes")
+                        self.assertTrue(json.loads(connection.getresponse().read())["companionDownload"])
+                        connection.request("GET", "/api/companion-installer")
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, HTTPStatus.OK)
+                        self.assertIn(filename, response.getheader("Content-Disposition"))
+                        self.assertEqual(response.read(), b"MZ-setup")
+                    fetch.assert_called_once_with(origin + "/api/companion-installer", timeout=20)
+            finally:
+                companion.shutdown()
                 worker.join()
 
     def test_notches_are_identified_and_persisted_without_changing_cut_paths(self):

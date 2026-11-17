@@ -57,6 +57,7 @@ let machineModeEpoch = 0;
 let appUpdate = null;
 let appUpdateTarget = null;
 let appUpdateSubmitting = false;
+let appUpdateError = "";
 let appUpdateRead = null;
 let appUpdateTimer;
 let appUpdateDeadline = 0;
@@ -374,64 +375,88 @@ function appUpdateInProgress() {
   return appUpdate?.state === "preparing" || appUpdate?.state === "restarting";
 }
 
+function appUpdateRevision(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function availableAppUpdate() {
+  if (appUpdate?.supported !== true || typeof appUpdate.availableVersion !== "string" || !appUpdate.availableVersion) return null;
+  const version = appUpdate.availableVersion;
+  const revision = appUpdateRevision(appUpdate.availableRevision);
+  return version !== appUpdate.version || revision > appUpdateRevision(appUpdate.revision) ? { version, revision } : null;
+}
+
+function showAppUpdateError(message) {
+  appUpdateError = message;
+  if (!$("release-notes-dialog").open) notifyError(message);
+}
+
+function updateCompanionDownload(available) {
+  if (typeof available === "boolean") updateControl($("release-notes-download"), "hidden", !available);
+}
+
 function renderAppUpdate() {
   const version = $("app-version");
   const release = $("release-notes-button");
   const button = $("app-update");
+  const status = $("app-update-status");
   const progress = appUpdateSubmitting || Boolean(appUpdateTarget) || appUpdateInProgress();
-  const message = appUpdate?.message || "";
-  const target = appUpdateTarget ?? appUpdate?.availableVersion;
-  const updateAvailable = appUpdate?.supported === true && Boolean(target) && target !== appUpdate.version;
+  const target = availableAppUpdate();
+  const targetLabel = target?.revision ? `${target.version} (сборка ${target.revision})` : target?.version;
+  const showUpdate = progress || Boolean(target);
   const progressLabel = appUpdate?.state === "restarting" ? "Перезапускаем…" : "Обновляем помощник…";
-  const availableMessage = updateAvailable ? `Доступно обновление помощника до версии ${target}.` : "";
-  const disabled = progress || !appUpdateSafe();
-  const tooltip = disabled && !progress
+  const availableMessage = targetLabel ? `Доступно обновление помощника до версии ${targetLabel}.` : "";
+  const blocked = target && !progress && !appUpdateSafe();
+  const blockedMessage = blocked
     ? workplaces?.hasPendingCadEdits?.() ? "Сохраните чертёж и дождитесь завершения работы в редакторе."
       : "Завершите текущую операцию перед обновлением."
     : "";
+  const message = [appUpdateError || appUpdate?.message, progress ? progressLabel : blockedMessage || availableMessage]
+    .filter(Boolean).join(" ");
   updateText(version, appUpdate?.version ?? "");
   updateControl(version, "hidden", !appUpdate?.version);
-  updateControl(version, "title", message);
-  updateText(release, updateAvailable ? (progress ? progressLabel : "Обновить") : "Релиз");
-  release.classList.toggle("release-update-available", updateAvailable);
-  updateControl(release, "title", availableMessage);
-  const actionLabel = updateAvailable ? `Обновить помощник до ${target}` : "Обновить помощник";
+  updateControl(version, "title", appUpdate?.revision ? `Сборка ${appUpdate.revision}` : "");
+  updateText(release, progress ? progressLabel : target ? "Обновить" : "Релиз");
+  release.classList.toggle("release-update-available", showUpdate);
+  updateControl(release, "title", progress ? progressLabel : availableMessage);
+  const actionLabel = targetLabel ? `Обновить помощник до ${targetLabel}` : "Обновить помощник";
   updateText(button, progress ? progressLabel : actionLabel);
-  updateControl(button, "hidden", !updateAvailable);
-  updateControl(button, "disabled", disabled);
-  updateControl(button, "title", [target ? `Версия ${target}` : "", message || tooltip].filter(Boolean).join(". "));
-  updateControl($("release-notes-actions"), "hidden", !updateAvailable && $("release-notes-download").hidden);
-  updateText($("app-update-status"), message || (progress ? progressLabel : availableMessage));
+  updateControl(button, "hidden", !showUpdate);
+  updateControl(button, "disabled", progress || !target || Boolean(blocked));
+  updateControl(button, "title", blockedMessage);
+  updateControl($("release-notes-actions"), "hidden", !showUpdate && $("release-notes-download").hidden);
+  updateText(status, message);
+  updateControl(status, "hidden", !message);
 }
 
 async function openReleaseNotes() {
   const dialog = $("release-notes-dialog");
   if (dialog.open) return;
+  releaseNotesRequest?.abort();
   const request = new AbortController();
   releaseNotesRequest = request;
   const title = $("release-notes-title");
   const status = $("release-notes-status");
   const list = $("release-notes-list");
   const content = $("release-notes-content");
-  const download = $("release-notes-download");
   const installed = appUpdate?.version;
   updateText(title, installed ? `Релиз ${installed}` : "Релиз");
   list.replaceChildren();
   list.hidden = true;
-  download.hidden = true;
-  renderAppUpdate();
   status.hidden = false;
   updateText(status, "Загружаем список изменений…");
   updateAttribute(content, "aria-busy", "true");
   dialog.showModal();
+  renderAppUpdate();
+  void readAppUpdate();
   try {
     const result = await getJson("/api/release-notes", { signal: AbortSignal.any([request.signal, AbortSignal.timeout(8000)]) });
     if (request.signal.aborted) return;
+    updateCompanionDownload(result?.companionDownload);
+    renderAppUpdate();
     if (typeof result?.version !== "string" || !Array.isArray(result.notes)) throw new Error();
     const notes = result.notes.filter((note) => typeof note === "string" && note.trim());
     updateText(title, `Релиз ${result.version}`);
-    download.hidden = result.companionDownload !== true;
-    renderAppUpdate();
     if (notes.length) {
       const items = notes.map((note) => {
         const item = document.createElement("li");
@@ -460,16 +485,18 @@ function readAppUpdate() {
     const wasRestarting = appUpdate?.state === "restarting";
     try {
       const status = await getJson("/api/app-update", { signal: AbortSignal.timeout(3500) });
+      updateCompanionDownload(status?.companionDownload);
       if (typeof status?.version !== "string") return;
       appUpdate = status;
-      if (appUpdateTarget && status.version === appUpdateTarget) {
+      if (appUpdateTarget && status.version === appUpdateTarget.version
+          && appUpdateRevision(status.revision) >= appUpdateTarget.revision) {
         if (workspaceChange === workspaceSaved && appUpdateSafe()) {
           location.reload();
           return;
         }
       } else if (appUpdateTarget && status.state === "failed") {
         appUpdateTarget = null;
-        notifyError(status.message || "Не удалось обновить программу.");
+        showAppUpdateError(status.message || "Не удалось обновить программу.");
       }
     } catch {
       // The server can be unavailable while Windows replaces it.
@@ -477,12 +504,12 @@ function readAppUpdate() {
       appUpdateRead = null;
       if (appUpdateTarget && Date.now() >= appUpdateDeadline) {
         appUpdateTarget = null;
-        notifyError("Не удалось подтвердить обновление. Проверьте, запущена ли программа.");
+        showAppUpdateError("Не удалось подтвердить обновление. Проверьте, запущена ли программа.");
       }
       if (wasRestarting !== (appUpdate?.state === "restarting")) renderControls();
       else renderAppUpdate();
       const discovering = appUpdate?.supported && !appUpdate.availableVersion && !appUpdateInProgress()
-        && appUpdateDiscoveryReads++ < 3;
+        && ($("release-notes-dialog").open || appUpdateDiscoveryReads++ < 3);
       scheduleAppUpdateRead(appUpdateTarget || appUpdateInProgress() || discovering ? 1500 : 60_000);
     }
   })();
@@ -490,10 +517,13 @@ function readAppUpdate() {
 }
 
 async function applyAppUpdate() {
-  if (!appUpdate?.supported || !appUpdate.availableVersion || $("app-update").disabled || !appUpdateSafe()) return;
-  const target = appUpdate.availableVersion;
+  const target = availableAppUpdate();
+  if (!target || appUpdateSubmitting || appUpdateTarget || appUpdateInProgress() || !appUpdateSafe()) {
+    renderAppUpdate();
+    return;
+  }
+  appUpdateError = "";
   appUpdateSubmitting = true;
-  $("release-notes-dialog").close();
   renderAppUpdate();
   try {
     if (workspaceChange !== workspaceSaved && (kitLayout() || !await persistWorkspace())) {
@@ -505,7 +535,7 @@ async function applyAppUpdate() {
     appUpdateTarget = target;
     appUpdateDeadline = Date.now() + 10 * 60_000;
     try {
-      await checkedFetch("/api/app-update", jsonRequest({ version: target }, AbortSignal.timeout(8000)));
+      await checkedFetch("/api/app-update", jsonRequest(target, AbortSignal.timeout(8000)));
     } catch (error) {
       // The process may restart before its accepted response reaches the browser.
       if (error.status !== undefined) throw error;
@@ -513,7 +543,7 @@ async function applyAppUpdate() {
     }
   } catch (error) {
     appUpdateTarget = null;
-    notifyError(messageFrom(error));
+    showAppUpdateError(messageFrom(error));
   } finally {
     appUpdateSubmitting = false;
     renderAppUpdate();
@@ -4242,6 +4272,7 @@ $("kit-layout-save").addEventListener("click", () => void saveKitLayout());
 $("app-update").addEventListener("click", () => void applyAppUpdate());
 $("release-notes-button").addEventListener("click", () => void openReleaseNotes());
 $("release-notes-dialog").addEventListener("close", () => {
+  if ($("release-notes-dialog").open) return;
   releaseNotesRequest?.abort();
   releaseNotesRequest = null;
   $("release-notes-button").focus({ preventScroll: true });

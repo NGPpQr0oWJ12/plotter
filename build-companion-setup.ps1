@@ -21,6 +21,10 @@ if (!$OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot 'dist' }
 $output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
 $source = Join-Path $PSScriptRoot 'web-plotter'
 $version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()
+$revision = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'COMPANION_REVISION') -Raw -Encoding ASCII).Trim()
+if ($revision -notmatch '^[1-9][0-9]{0,9}$' -or [long]$revision -gt [int]::MaxValue) {
+    throw 'Invalid companion build revision.'
+}
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $python = Get-Command 'python.exe' -ErrorAction Stop
 $pythonVersion = '3.13.17'
@@ -64,6 +68,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $payload $script), $installerScript, [Text.UTF8Encoding]::new($true))
     }
     [IO.File]::WriteAllText((Join-Path $payload 'VERSION'), $version, [Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText((Join-Path $payload 'COMPANION_REVISION'), $revision, [Text.Encoding]::ASCII)
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'CHANGELOG.md') -Destination $payload
     $serverOptions = & (Join-Path $runtime 'python.exe') -X utf8 -B (Join-Path $payload 'server.py') --help | Out-String
     if ($LASTEXITCODE -ne 0 -or $serverOptions -notmatch '--central-ca') {

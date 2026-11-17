@@ -29,7 +29,7 @@ import webbrowser
 import ezdxf
 from ezdxf.lldxf.validator import is_valid_layer_name
 
-from app_update import AppUpdates, UpdateError, read_release_notes, read_version
+from app_update import MAX_ARCHIVE, AppUpdates, UpdateError, read_release_notes, read_version
 from auto_run import AutoRunReadback
 from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_contours
 from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
@@ -49,6 +49,7 @@ from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 ROOT = Path(__file__).resolve().parent
 APP_VERSION = read_version(ROOT)
 COMPANION_INSTALLER = f"Plotter-Companion-Setup-{APP_VERSION}-x64.exe"
+COMPANION_UPDATE = f"plotter-companion-v{APP_VERSION}-windows-x64.zip"
 PROFILE = ROOT.parent / "research" / "machine-profile.json"
 LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
@@ -1159,7 +1160,8 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
             candidate = (Path(os.environ["LOCALAPPDATA"]) / "Plotter" / "Companion").resolve()
             if ROOT.parent == candidate and re.fullmatch(r"app-[a-f0-9]{32}", ROOT.name):
                 install_root = candidate
-        self.app_updates = AppUpdates(ROOT, APP_VERSION, install_root)
+        central_source = (workspace.opener, self.companion_origin) if install_root else None
+        self.app_updates = AppUpdates(ROOT, APP_VERSION, install_root, central_source=central_source)
         ThreadingHTTPServer.__init__(self, (LOCAL_ADDRESS, port), Handler)
         self.hosts = {f"{host}:{self.server_port}" for host in (LOCAL_ADDRESS, "localhost")}
         if self.public_origin:
@@ -1336,25 +1338,16 @@ class Handler(BaseHTTPRequestHandler):
             name, content_type = MIME[path]
             self.respond((ROOT / "static" / name).read_bytes(), content_type)
         elif path == "/api/status":
-            self.json_response(self.plotter.status())
+            self.json_response({**self.plotter.status(), "companionRevision": self.server.app_updates.revision})
         elif path == "/api/app-update":
-            self.json_response(self.server.app_updates.status())
+            self.json_response({**self.server.app_updates.status(), "companionDownload": self.companion_download_available()})
         elif path == "/api/release-notes":
-            installer = self.server.companion_installer
             self.json_response({"version": APP_VERSION, "notes": read_release_notes(ROOT, APP_VERSION),
-                                "companionDownload": bool(installer and installer.is_file())})
+                                "companionDownload": self.companion_download_available()})
         elif path == "/api/companion-installer":
-            installer = self.server.companion_installer
-            if installer is None:
-                raise RequestError("Установщик помощника недоступен.", HTTPStatus.NOT_FOUND)
-            try:
-                source = installer.open("rb")
-            except (FileNotFoundError, IsADirectoryError) as error:
-                raise RequestError("Установщик помощника недоступен.", HTTPStatus.NOT_FOUND) from error
-            with source:
-                size = os.fstat(source.fileno()).st_size
-                self.response_headers(size, "application/octet-stream", HTTPStatus.OK, COMPANION_INSTALLER, COMPANION_INSTALLER)
-                shutil.copyfileobj(source, self.wfile, 256 * 1024)
+            self.download_companion_installer()
+        elif path in ("/api/companion-update", "/api/companion-update.zip"):
+            self.get_companion_update(path)
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
@@ -1366,10 +1359,65 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise RequestError("Страница не найдена.", HTTPStatus.NOT_FOUND)
 
+    def companion_download_available(self):
+        installer = self.server.companion_installer
+        return self.server.local_companion_ui or bool(installer and installer.is_file())
+
+    def send_companion_file(self, path, content_type, filename=None):
+        try:
+            source = path.open("rb")
+        except (FileNotFoundError, IsADirectoryError) as error:
+            raise RequestError("Файл помощника недоступен.", HTTPStatus.NOT_FOUND) from error
+        with source:
+            size = os.fstat(source.fileno()).st_size
+            self.response_headers(size, content_type, HTTPStatus.OK, filename, filename or "plotter.json")
+            shutil.copyfileobj(source, self.wfile, 256 * 1024)
+
+    def download_companion_installer(self):
+        installer = self.server.companion_installer
+        if installer:
+            self.send_companion_file(installer, "application/octet-stream", COMPANION_INSTALLER)
+            return
+        if not self.server.local_companion_ui:
+            raise RequestError("Установщик помощника недоступен.", HTTPStatus.NOT_FOUND)
+
+        workspace = self.server.workspace
+        try:
+            source = workspace.opener.open(workspace.origin + "/api/companion-installer", timeout=20)
+        except HTTPError as error:
+            with error:
+                if error.code == 404:
+                    raise RequestError("Установщик ещё не размещён на центральном сервере.", HTTPStatus.NOT_FOUND) from error
+            raise RequestError("Центральный сервер не выдал установщик.", HTTPStatus.BAD_GATEWAY) from error
+        except OSError as error:
+            raise RequestError("Нет связи с центральным сервером. Повторите скачивание.", HTTPStatus.BAD_GATEWAY) from error
+        with source:
+            size = source.headers.get("Content-Length", "")
+            if not re.fullmatch(r"[0-9]{1,10}", size) or not 0 < int(size) <= MAX_ARCHIVE:
+                raise RequestError("Центральный сервер вернул неверный размер установщика.", HTTPStatus.BAD_GATEWAY)
+            filename = source.headers.get_filename()
+            if not isinstance(filename, str) or not re.fullmatch(r"Plotter-Companion-Setup-[0-9.]+-x64\.exe", filename):
+                filename = "Plotter-Companion-Setup-x64.exe"
+            self.response_headers(int(size), "application/octet-stream", HTTPStatus.OK, filename, filename)
+            shutil.copyfileobj(source, self.wfile, 256 * 1024)
+
+    def get_companion_update(self, path):
+        installer = self.server.companion_installer
+        if installer is None:
+            raise RequestError("Обновление помощника недоступно.", HTTPStatus.NOT_FOUND)
+        manifest = installer.parent / "companion-update.json"
+        payload = installer.parent / COMPANION_UPDATE
+        if not manifest.is_file() or not payload.is_file():
+            raise RequestError("Обновление помощника недоступно.", HTTPStatus.NOT_FOUND)
+        if path == "/api/companion-update":
+            self.send_companion_file(manifest, "application/json; charset=utf-8")
+        else:
+            self.send_companion_file(payload, "application/zip", COMPANION_UPDATE)
+
     def post(self, path, query):
         if path == "/api/app-update":
             data = self.json_body(4096)
-            self.server.app_updates.start(data.get("version"), self.server.verify_update_idle)
+            self.server.app_updates.start(data.get("version"), self.server.verify_update_idle, revision=data.get("revision"))
             self.json_response(self.server.app_updates.status(), HTTPStatus.ACCEPTED)
         elif path in ("/api/import", "/api/cad/import"):
             name = parse_qs(query, max_num_fields=4).get("filename", [""])[0]

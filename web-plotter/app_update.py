@@ -1,4 +1,4 @@
-"""Download and stage public GitHub releases for the Windows operator panel."""
+"""Download and stage trusted releases for the Windows operator panel."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +27,11 @@ DOWNLOAD_HOSTS = frozenset({"github.com", "release-assets.githubusercontent.com"
 MAX_METADATA = 512 * 1024
 MAX_ARCHIVE = 160 * 1024 * 1024
 MAX_EXPANDED = 480 * 1024 * 1024
+MAX_COMPANION_REVISION = 2_147_483_647
+REVISION_FILE = "COMPANION_REVISION"
+CENTRAL_MANIFEST = "/api/companion-update"
+CENTRAL_ARCHIVE = "/api/companion-update.zip"
+MAX_CENTRAL_MANIFEST = 4096
 WINDOWS_NAME = re.compile(r"[A-Za-z0-9_.+@ -]+", re.ASCII)
 WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)), *(f"LPT{i}" for i in range(10))}
 REQUIRED = {
@@ -54,6 +59,26 @@ def read_version(root):
         if release_version(value):
             return value
     return None
+
+
+def parse_companion_revision(contents):
+    try:
+        value = contents.decode("ascii").strip()
+    except UnicodeError as error:
+        raise UpdateError("Некорректная ревизия помощника.") from error
+    if len(contents) > 16 or not re.fullmatch(r"0|[1-9][0-9]{0,9}", value) or int(value) > MAX_COMPANION_REVISION:
+        raise UpdateError("Некорректная ревизия помощника.")
+    return int(value)
+
+
+def read_companion_revision(root):
+    for path in (root / REVISION_FILE, root.parent / REVISION_FILE):
+        try:
+            with path.open("rb") as marker:
+                return parse_companion_revision(marker.read(17))
+        except FileNotFoundError:
+            continue
+    return 0
 
 
 def read_release_notes(root, version):
@@ -87,6 +112,12 @@ class Release:
     name: str
     size: int
     digest: str
+    revision: int = 0
+    central: bool = False
+
+    @property
+    def build(self):
+        return release_version(self.version), self.revision
 
 
 class GitHubRedirect(HTTPRedirectHandler):
@@ -130,8 +161,32 @@ def find_companion_update(opener, current):
     return newest
 
 
-def download_release(opener, release, destination):
-    url = f"https://github.com/{REPOSITORY}/releases/download/v{release.version}/{release.name}"
+def fetch_central_update(opener, origin):
+    request = Request(origin + CENTRAL_MANIFEST, headers={"Accept": "application/json", "User-Agent": "Xiao-Plotter-Updater"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            contents = response.read(MAX_CENTRAL_MANIFEST + 1)
+    except HTTPError as error:
+        with error:
+            if error.code == 404:
+                return None
+        raise UpdateError("Не удалось проверить обновление на центральной панели.") from error
+    if len(contents) > MAX_CENTRAL_MANIFEST:
+        raise UpdateError("Ответ центральной панели об обновлении слишком велик.")
+    metadata = json.loads(contents)
+    if isinstance(metadata, dict):
+        version, revision = metadata.get("version"), metadata.get("revision")
+        size, digest = metadata.get("size"), metadata.get("digest")
+        if (release_version(version) and type(revision) is int and 0 <= revision <= MAX_COMPANION_REVISION
+                and type(size) is int and 0 < size <= MAX_ARCHIVE
+                and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest)):
+            return Release(version, "companion-update.zip", size, digest, revision, central=True)
+    raise UpdateError("Центральная панель вернула некорректные сведения об обновлении.")
+
+
+def download_release(opener, release, destination, *, central_origin=None):
+    url = (central_origin + CENTRAL_ARCHIVE if central_origin is not None else
+           f"https://github.com/{REPOSITORY}/releases/download/v{release.version}/{release.name}")
     request = Request(url, headers={"User-Agent": "Xiao-Plotter-Updater"})
     deadline = monotonic() + 300
     remaining = release.size
@@ -141,7 +196,7 @@ def download_release(opener, release, destination):
                 raise UpdateError("Истекло время скачивания обновления.")
             chunk = response.read(min(remaining + 1, 1024 * 1024))
             if len(chunk) > remaining:
-                raise UpdateError("Размер архива обновления отличается от указанного в GitHub.")
+                raise UpdateError("Размер архива обновления отличается от заявленного.")
             if not chunk:
                 break
             output.write(chunk)
@@ -207,19 +262,30 @@ def extract_update(path, target, release):
         version_entry = files["version"]
         if version_entry.file_size > 32 or archive.read(version_entry).decode("ascii").strip() != release.version:
             raise UpdateError("Версия в архиве отличается от версии релиза.")
+        revision_entry = files.get(REVISION_FILE.casefold())
+        revision = 0
+        if revision_entry is not None:
+            if revision_entry.filename != REVISION_FILE or revision_entry.file_size > 16:
+                raise UpdateError("Некорректная ревизия в архиве помощника.")
+            revision = parse_companion_revision(archive.read(revision_entry))
+        if (release.central or release.revision) and revision != release.revision:
+            raise UpdateError("Ревизия в архиве отличается от ревизии обновления.")
         for entry in files.values():
             destination = target.joinpath(*entry.filename.split("/"))
             destination.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(entry) as source, destination.open("xb") as output:
                 shutil.copyfileobj(source, output)
+        return revision
 
 
 class AppUpdates:
-    def __init__(self, app_root, version, install_root=None):
+    def __init__(self, app_root, version, install_root=None, central_source=None):
         self.worker = app_root / "apply-companion-update.ps1"
         self.version = version
+        self.central_source = central_source
         self.install_root = install_root
         self.supported = bool(install_root and version and self.worker.is_file())
+        self.revision = 0
         self._lock = Lock()
         self._requests = 0
         self._state = "idle"
@@ -228,10 +294,25 @@ class AppUpdates:
         self._check_after = 0
         self._checking = False
         self._restarted_at = 0
+        try:
+            self.revision = read_companion_revision(app_root)
+        except (UpdateError, OSError):
+            self.supported = False
+            self._message = "Не удалось прочитать ревизию установленного помощника. Переустановите помощник."
 
     def _refresh(self):
+        central = None
+        if self.central_source:
+            try:
+                central = fetch_central_update(*self.central_source)
+            except (OSError, ValueError, TypeError):
+                pass
         try:
-            available, message = find_companion_update(build_opener(GitHubRedirect()), self.version), None
+            if central is not None:
+                available = central if central.build > (release_version(self.version), self.revision) else None
+            else:
+                available = find_companion_update(build_opener(GitHubRedirect()), self.version)
+            message = None
         except UpdateError as error:
             available, message = None, str(error)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):
@@ -252,10 +333,15 @@ class AppUpdates:
                     if result_path.stat().st_size > 4096:
                         raise ValueError("Invalid update state")
                     result = json.loads(result_path.read_text(encoding="utf-8-sig"))
-                    if state != "preparing" and result.get("state") == "failed":
+                    version = release_version(result.get("version"))
+                    revision = result.get("revision", 0)
+                    build = (version, revision) if version and type(revision) is int and 0 <= revision <= MAX_COMPANION_REVISION else None
+                    current = release_version(self.version), self.revision
+                    if (state != "preparing" and result.get("state") == "failed"
+                            and (build > current if build else state == "restarting" and "version" not in result)):
                         state = self._state = "failed"
                         message = self._message = str(result.get("message") or "Обновление не завершилось.")[:500]
-                    if result.get("state") == "done" and result.get("version") == self.version:
+                    if result.get("state") == "done" and build == current:
                         state = "done"
                 except (OSError, ValueError, AttributeError):
                     pass
@@ -265,8 +351,9 @@ class AppUpdates:
                 if state not in ("preparing", "restarting") and not self._checking and monotonic() >= self._check_after:
                     self._checking = True
                     Thread(target=self._refresh, daemon=True).start()
-            return {"version": self.version, "supported": self.supported,
+            return {"version": self.version, "revision": self.revision, "supported": self.supported,
                     "availableVersion": self._available.version if self._available else None,
+                    "availableRevision": self._available.revision if self._available else None,
                     "state": state, "message": message}
 
     @contextmanager
@@ -281,13 +368,14 @@ class AppUpdates:
             with self._lock:
                 self._requests -= 1
 
-    def start(self, version, verify_idle):
+    def start(self, version, verify_idle, revision=None):
         with self._lock:
             if not self.supported:
                 raise UpdateError("Обновление доступно в установленной панели станка.")
             if self._state in ("preparing", "restarting"):
                 raise UpdateError("Обновление уже выполняется.")
-            if not self._available or version != self._available.version:
+            if (not self._available or version != self._available.version
+                    or (revision is not None and (type(revision) is not int or revision != self._available.revision))):
                 raise UpdateError("Версия обновления изменилась. Повторите проверку.")
             (self.install_root / "update-result.json").unlink(missing_ok=True)
             self._state, self._message = "preparing", None
@@ -300,9 +388,13 @@ class AppUpdates:
             root = Path(mkdtemp(prefix="update-", dir=updates_dir))
             try:
                 archive = root / "update.zip"
-                download_release(build_opener(GitHubRedirect()), release, archive)
+                if release.central:
+                    opener, origin = self.central_source
+                    download_release(opener, release, archive, central_origin=origin)
+                else:
+                    download_release(build_opener(GitHubRedirect()), release, archive)
                 candidate = root / "payload"
-                extract_update(archive, candidate, release)
+                revision = extract_update(archive, candidate, release)
                 archive.unlink()
                 with self._lock:
                     if self._requests:
@@ -314,11 +406,16 @@ class AppUpdates:
                 try:
                     subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                     "-File", str(self.worker), "-CandidatePath", str(candidate),
-                                    "-InstallRoot", str(self.install_root), "-ExpectedVersion", release.version, "-Schedule"],
+                                    "-InstallRoot", str(self.install_root), "-ExpectedVersion", release.version,
+                                    "-ExpectedRevision", str(revision), "-Schedule"],
                                    creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, timeout=25, check=True)
                 except subprocess.TimeoutExpired:
                     # Windows may have started the separate task before the scheduler call timed out.
                     return
+                except subprocess.CalledProcessError as error:
+                    raise UpdateError(f"Windows не запустила задачу обновления помощника (код {error.returncode}).") from error
+                except OSError as error:
+                    raise UpdateError("Не удалось запустить PowerShell для обновления помощника.") from error
             except Exception:
                 shutil.rmtree(root, ignore_errors=True)
                 raise
@@ -328,7 +425,8 @@ class AppUpdates:
         except HTTPError as error:
             error.close()
             with self._lock:
-                self._state, self._message = "failed", "Не удалось скачать обновление с GitHub."
+                source = "центральной панели" if release.central else "GitHub"
+                self._state, self._message = "failed", f"Не удалось скачать обновление с {source}."
         except (OSError, ValueError, KeyError, BadZipFile, RuntimeError, subprocess.SubprocessError):
             with self._lock:
                 self._state, self._message = "failed", "Не удалось подготовить обновление. Попробуйте ещё раз."
