@@ -1,11 +1,13 @@
 from collections import Counter
 from itertools import pairwise
+import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
 import ezdxf
 from ezdxf import units
+from shapely import LineString, Polygon
 
 from cad import CadImportError, import_drawing, repair_closed_contours
 
@@ -96,6 +98,74 @@ class CadImportTests(unittest.TestCase):
             {"points": [[20, -5], [20, 0]], "closed": False, "layer": "0"},
             {"points": [[0, 0], [20, 0], [20, 10], [0, 10]], "closed": True, "layer": "0"},
         ])
+
+    def test_import_reduces_straight_runs_and_preserves_a_notch_junction_and_open_gap(self):
+        doc = ezdxf.new(units=units.MM)
+        model = doc.modelspace()
+        model.add_lwpolyline([(x, 0) for x in range(21)] + [(20, 10), (0, 10)], close=True)
+        model.add_line((10, 0), (10, 2))
+        model.add_lwpolyline([(50 + x, 0) for x in range(21)] + [(70, 10), (50, 10), (50, 0.01)])
+
+        drawing = self.import_document(doc)
+
+        self.assertEqual(drawing["closedCount"], 0)
+        self.assertEqual(drawing["paths"], [
+            {"points": [[0, 0], [10, 0], [20, 0], [20, 10], [0, 10]], "closed": True, "layer": "0"},
+            {"points": [[10, 0], [10, 2]], "closed": False, "layer": "0"},
+            {"points": [[50, 0], [70, 0], [70, 10], [50, 10], [50, 0.01]], "closed": False, "layer": "0"},
+        ])
+
+    def test_import_keeps_small_noncollinear_vertices_and_direction_reversals(self):
+        doc = ezdxf.new(units=units.MM)
+        model = doc.modelspace()
+        shallow_turn = [[0, 0], [1, 0.000001], [2, 0]]
+        retrace = [[30, 0], [31, 0], [32, 0], [31, 0], [30, 0], [30, 1]]
+        model.add_lwpolyline(shallow_turn)
+        model.add_lwpolyline(retrace)
+
+        drawing = self.import_document(doc)
+
+        self.assertEqual([contour["points"] for contour in drawing["paths"]], [shallow_turn, retrace])
+
+    def test_import_reduces_sampled_curves_with_bounded_deviation_and_preserves_native_curves(self):
+        doc = ezdxf.new(units=units.MM)
+        model = doc.modelspace()
+        sampled = [(round(10 * math.cos(angle), 6), round(10 * math.sin(angle), 6))
+                   for angle in map(math.radians, range(0, 360, 2))]
+        open_arc = [(x + 50, y) for x, y in sampled[:46]]
+        model.add_lwpolyline(sampled, close=True)
+        model.add_polyline2d(open_arc)
+        model.add_circle((100, 0), 10)
+        model.add_arc((200, 0), 10, 0, 90)
+        model.add_lwpolyline([(310, 0, math.tan(math.pi / 8)), (300, 10, 0)], format="xyb")
+        model.add_spline([(400, 0), (404, 10), (408, -5), (412, 0)])
+
+        closed, opened, *native = self.import_document(doc)["paths"]
+
+        self.assertTrue(closed["closed"])
+        self.assertLess(len(closed["points"]), len(sampled) // 2)
+        outline = Polygon(closed["points"])
+        self.assertTrue(outline.is_valid)
+        self.assertEqual(outline.bounds, (-10, -10, 10, 10))
+        self.assertLessEqual(Polygon(sampled).exterior.hausdorff_distance(outline.exterior), 0.02)
+        self.assertFalse(opened["closed"])
+        self.assertLess(len(opened["points"]), len(open_arc))
+        self.assertEqual([opened["points"][0], opened["points"][-1]], [list(open_arc[0]), list(open_arc[-1])])
+        self.assertLessEqual(LineString(open_arc).hausdorff_distance(LineString(opened["points"])), 0.02)
+        self.assertEqual([len(contour["points"]) for contour in native], [48, 49, 17, 31])
+
+    def test_import_skips_sampled_curve_approximation_near_another_path(self):
+        doc = ezdxf.new(units=units.MM)
+        model = doc.modelspace()
+        sampled = [[round(10 * math.cos(angle), 6), round(10 * math.sin(angle), 6)]
+                   for angle in map(math.radians, range(0, 91, 2))]
+        model.add_lwpolyline(sampled)
+        model.add_line((10.05, 0), (20, 0))
+
+        outline, neighbor = self.import_document(doc)["paths"]
+
+        self.assertEqual(outline["points"], sampled)
+        self.assertEqual(neighbor["points"], [[10.05, 0], [20, 0]])
 
     def test_saved_outline_repair_preserves_geometry_metadata_and_exclusions(self):
         paths = [

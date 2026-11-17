@@ -623,6 +623,9 @@ def import_design(data, filename):
     result = {"filename": filename, "units": "mm", "entities": entities, "warnings": warnings}
     if extension == ".dxf":
         result.update(_import_conflict_cleanup(entities, document, drawing.source_scopes))
+        result["entities"], removed = _simplify_dense_outlines(result["entities"])
+        if removed:
+            warnings.append(f"Удалено лишних вершин — {removed}.")
     return result
 
 
@@ -1673,7 +1676,7 @@ def _quick_trim(entities, options):
     return result, shapes, warnings, bool(removed)
 
 
-def _join_shapes(entities, tolerance):
+def _join_shapes(entities, tolerance, *, bridges=None):
     if len(entities) < 2:
         raise CadDesignError("Выберите не менее двух открытых объектов.")
     if len({entity.get("reference", False) for entity in entities}) > 1:
@@ -1728,8 +1731,11 @@ def _join_shapes(entities, tolerance):
             source_points = source_points[::-1]
             source_bulges = [-value for value in reversed(source_bulges[:-1])] + [0]
         if points:
-            points.pop()
-            bulges.pop()
+            if bridges is not None and math.dist(points[-1], source_points[0]) > POINT_EPSILON_MM:
+                bridges.append(_QuickTrimEdge(points[-1], source_points[0]))
+            else:
+                points.pop()
+                bulges.pop()
         points.extend(source_points)
         bulges.extend(source_bulges)
         seen.add(index)
@@ -1738,8 +1744,11 @@ def _join_shapes(entities, tolerance):
         raise CadDesignError("Между выбранными объектами есть разрыв. Сведите их или выберите соседние фрагменты.")
     closed = current == first
     if closed:
-        points.pop()
-        bulges.pop()
+        if bridges is not None and math.dist(points[-1], points[0]) > POINT_EPSILON_MM:
+            bridges.append(_QuickTrimEdge(points[-1], points[0]))
+        else:
+            points.pop()
+            bulges.pop()
     result = _new_shape(entities[0], "polyline", points=points, closed=closed, joined=True)
     if any(entity.get("importDamaged") for entity in entities):
         result["importDamaged"] = True
@@ -1929,7 +1938,7 @@ OUTLINE_SIMPLIFY_TOLERANCE_MM = 0.02
 OUTLINE_CORNER_COSINE = math.cos(math.radians(30))
 
 
-def _simplify_outline(entity, tolerance, *, preserve_last=False, junctions=None):
+def _simplify_outline(entity, tolerance, *, preserve_last=False, preserve_extrema=False, junctions=None):
     if entity["type"] != "polyline":
         return entity
     points = entity["points"]
@@ -1945,8 +1954,13 @@ def _simplify_outline(entity, tolerance, *, preserve_last=False, junctions=None)
 
     # Preserve the authored start, end, and sharp turns while simplifying each intervening run.
     anchors = [0]
+    extrema = set()
+    if preserve_extrema:
+        for axis in (0, 1):
+            coordinate = lambda index: points[index][axis]
+            extrema.update((min(range(len(points)), key=coordinate), max(range(len(points)), key=coordinate)))
     for index, (before, point, after) in enumerate(zip(path, path[1:], path[2:]), 1):
-        if index in curved_edges or index - 1 in curved_edges:
+        if index in extrema or index in curved_edges or index - 1 in curved_edges:
             anchors.append(index)
             continue
         incoming = [point[axis] - before[axis] for axis in (0, 1)]
@@ -2002,9 +2016,42 @@ def _simplify_outline(entity, tolerance, *, preserve_last=False, junctions=None)
         nearby.update(junctions.query(candidate, predicate="dwithin", distance=tolerance))
         if any(abs(line.distance(point) - candidate.distance(point)) > POINT_EPSILON_MM
                for point in junctions.geometries.take(sorted(nearby))):
-            return _simplify_outline(entity, 0, preserve_last=preserve_last)
+            return _simplify_outline(entity, 0, preserve_last=preserve_last, preserve_extrema=preserve_extrema)
 
     return result
+
+
+def _simplify_dense_outlines(entities, *, only_id=None):
+    dense = [index for index, entity in enumerate(entities)
+             if entity["type"] == "polyline" and len(entity["points"]) >= 24 and not entity.get("notch")
+             and (only_id is None or entity["id"] == only_id)]
+    if not dense:
+        return entities, 0
+    geometry = []
+    remaining = MAX_TRIM_EDGES
+    try:
+        for entity in entities:
+            if entity["type"] == "point":
+                geometry.append(Point(entity["point"]))
+                continue
+            path = _path(entity, remaining)
+            remaining -= len(path["points"])
+            geometry.append(_line_geometry(path))
+    except CadDesignError:
+        return entities, 0
+
+    tree = STRtree(geometry)
+    distance = 2 * (OUTLINE_SIMPLIFY_TOLERANCE_MM + CURVE_TOLERANCE_MM)
+    result = list(entities)
+    removed = 0
+    for index in dense:
+        near_other = any(other != index for other in tree.query(geometry[index], predicate="dwithin", distance=distance))
+        original = entities[index]
+        tolerance = 0 if near_other else OUTLINE_SIMPLIFY_TOLERANCE_MM
+        reduced = _simplify_outline(original, tolerance, preserve_extrema=True, preserve_last=only_id is not None)
+        result[index] = reduced
+        removed += len(original["points"]) - len(reduced["points"])
+    return result, removed
 
 
 def _outline_junctions(entities, *, include_arcs=False):
@@ -2045,6 +2092,7 @@ def _simplify_selected(entities, by_id, options):
 
 
 MAX_CORNER_OVERRUN_MM = 0.1
+MAX_CONFIRMED_GAP_MM = 1.0
 
 
 def _closed_corner_trial(entity):
@@ -2364,7 +2412,69 @@ def _self_conflict_diagnostics(entity):
     return diagnostics
 
 
-def _repair_outline(entity, neighbors=()):
+def _gap_bridges_clear(bridges, outlines):
+    spans = [(bridge, bridge.geometry) for bridge in bridges]
+    remaining = MAX_TRIM_EDGES
+    checks = MAX_TRIM_CHECKS
+    for outline in outlines:
+        edges = _checked_repair_edges(outline, remaining)
+        remaining -= len(edges)
+        checks -= len(edges) * len(spans)
+        if checks < 0:
+            return False
+        sampled = outline["type"] in ("ellipse", "spline")
+        for edge in edges:
+            edge_geometry = edge.geometry
+            for bridge, geometry in spans:
+                if sampled and geometry.distance(edge_geometry) <= CURVE_TOLERANCE_MM:
+                    return False
+                if not geometry.intersects(edge_geometry):
+                    continue
+                if any(kind == "overlap" or min(math.dist(point, bridge.start), math.dist(point, bridge.end)) > POINT_EPSILON_MM
+                       for kind, point in _diagnostic_contacts(bridge, edge, geometry, edge_geometry)):
+                    return False
+    return True
+
+
+def _confirm_bridges(trial, bridges, outlines, confirmed_point):
+    widest = max(bridges, key=lambda bridge: bridge.length)
+    start, end = widest.end, widest.start
+    point = [(a + b) / 2 for a, b in zip(start, end)]
+    boundary = _line_geometry(_path(trial))
+    polygon = Polygon(boundary)
+    fixable = (boundary.is_simple and polygon.is_valid and polygon.area > POINT_EPSILON_MM ** 2
+               and _gap_bridges_clear(bridges, outlines))
+    if fixable and confirmed_point is not None and math.dist(confirmed_point, point) <= POINT_EPSILON_MM:
+        return trial
+    message = f"Контур разомкнут. Между концами {widest.length:.3f} мм."
+    feedback = ""
+    if len(bridges) > 1:
+        feedback = f"Соединений для замыкания — {len(bridges)}. Показан самый широкий разрыв."
+    if not fixable:
+        feedback = "Проверьте стыки вручную. Безопасное замыкание не найдено."
+    issue = {"kind": "gap", "point": point, "endpoints": [start, end], "distance": widest.length, "fixable": fixable}
+    if feedback:
+        issue["feedback"] = feedback
+    raise _RepairConflict(message, [issue])
+
+
+def _add_closing_bridge(shape, bridges):
+    start, end = shape["points"][0], shape["points"][-1]
+    gap = math.dist(start, end)
+    if gap > MAX_CONFIRMED_GAP_MM:
+        raise CadDesignError(f"Контур разомкнут. Между концами {gap:.3f} мм. "
+                             f"Сведите концы вручную. Допуск замыкания — {MAX_CONFIRMED_GAP_MM:g} мм.")
+    if start == end:
+        return _closed_corner_trial(shape)
+    if gap > POINT_EPSILON_MM:
+        bridges.append(_QuickTrimEdge(end, start))
+    trial = {**shape, "closed": True}
+    if "bulges" in trial:
+        trial["bulges"] = [*trial["bulges"][:-1], 0.0]
+    return trial
+
+
+def _repair_outline(entity, neighbors=(), *, confirmed_point=None):
     shape = dict(entity)
     changed = False
     removed_overlap = False
@@ -2412,9 +2522,12 @@ def _repair_outline(entity, neighbors=()):
             raise CadDesignError("Открытый фрагмент. Выберите все рёбра внешнего контура для соединения.")
         repaired = repair_closed_contours([path], bridge_small_gaps=True)
         if repaired.closed_count != 1 or len(repaired.paths) != 1 or not repaired.paths[0]["closed"]:
-            raise CadDesignError(f"Контур разомкнут. Между концами {gap:.3f} мм. "
-                                 f"Автозамыкание допускается до {MANUAL_CLOSURE_TOLERANCE_MM:g} мм без пересечения рёбер.")
-        if gap <= POINT_EPSILON_MM:
+            bridges = []
+            trial = _add_closing_bridge(shape, bridges)
+            if not bridges:
+                raise CadDesignError("Не удалось безопасно замкнуть контур. Проверьте стык вручную.")
+            shape = _confirm_bridges(trial, bridges, (shape, *neighbors), confirmed_point)
+        elif gap <= POINT_EPSILON_MM:
             shape["points"] = shape["points"][:-1]
             if "bulges" in shape:
                 shape["bulges"] = shape["bulges"][:-1]
@@ -3109,7 +3222,31 @@ def _import_conflict_cleanup(entities, document, source_scopes):
     return result
 
 
-def _repair_selected(entities, by_id, options, diagnostics):
+def _join_repair_fragments(selected, neighbors, confirmed_point):
+    exact_diagnostics = []
+    try:
+        exact = _join_shapes(selected, POINT_EPSILON_MM)
+    except CadDesignError as error:
+        exact_diagnostics = getattr(error, "diagnostics", [])
+    else:
+        if _closed(exact):
+            return exact
+    try:
+        return _join_shapes(selected, MANUAL_CLOSURE_TOLERANCE_MM)
+    except CadDesignError as error:
+        diagnostics = exact_diagnostics or getattr(error, "diagnostics", [])
+        if diagnostics:
+            raise _RepairConflict(str(error), diagnostics) from error
+    bridges = []
+    trial = _join_shapes(selected, MAX_CONFIRMED_GAP_MM, bridges=bridges)
+    if not _closed(trial):
+        trial = _add_closing_bridge(trial, bridges)
+    if not bridges:
+        raise CadDesignError("Не удалось безопасно соединить выбранные фрагменты.")
+    return _confirm_bridges(trial, bridges, (*selected, *neighbors), confirmed_point)
+
+
+def _repair_selected(entities, by_id, options, diagnostics, *, confirmed_point=None):
     ids = options.get("ids")
     if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_ENTITIES:
         raise CadDesignError("Выберите контур или несколько фрагментов одной детали.")
@@ -3121,43 +3258,29 @@ def _repair_selected(entities, by_id, options, diagnostics):
         shape, message = accepted
         return [shape if entity is selected[0] else entity for entity in entities], [shape], [message], True
 
-    sources = [selected[0]]
     if len(selected) > 1:
         if any(_closed(entity) for entity in selected) or len({entity["layer"] for entity in selected}) > 1:
             raise CadDesignError("Для соединения выберите открытые фрагменты одной детали на одном слое.")
         if any(entity["type"] in ("spline", "ellipse") for entity in selected):
             raise CadDesignError("Сплайн или эллипс нельзя соединить этим методом без изменения формы. Соедините вручную.")
-        sources = selected
-        exact_diagnostics = []
-        try:
-            exact = _join_shapes(selected, POINT_EPSILON_MM)
-        except CadDesignError as error:
-            exact = None
-            exact_diagnostics = getattr(error, "diagnostics", [])
-        if exact is not None and _closed(exact):
-            contour = exact
-        else:
-            try:
-                contour = _join_shapes(selected, MANUAL_CLOSURE_TOLERANCE_MM)
-            except CadDesignError as error:
-                diagnostics.extend(exact_diagnostics or getattr(error, "diagnostics", []))
-                _annotate_repair_conflicts(entities, selected, diagnostics)
-                return entities, selected, [str(error)], False
-    else:
-        contour = selected[0]
 
-    source_ids = {entity["id"] for entity in sources}
+    source_ids = set(ids)
+    neighbors = [entity for entity in entities if entity["id"] not in source_ids]
     try:
+        contour = _join_repair_fragments(selected, neighbors, confirmed_point) if len(selected) > 1 else selected[0]
         repaired, changed, removed_overlap = _repair_outline(
-            contour, (entity for entity in entities if entity["id"] not in source_ids),
+            contour, neighbors, confirmed_point=confirmed_point,
         )
     except CadDesignError as error:
         diagnostics.extend(getattr(error, "diagnostics", []))
         _annotate_repair_conflicts(entities, selected, diagnostics)
         return entities, selected, [str(error)], False
-    repaired["id"] = sources[0]["id"]
-    unresolved = _retain_import_issues(repaired, sources, {IMPORT_DUPLICATE_POINTS})
-    changed = changed or len(sources) > 1 or repaired != contour
+    repaired["id"] = selected[0]["id"]
+    unresolved = _retain_import_issues(repaired, selected, {IMPORT_DUPLICATE_POINTS})
+    if confirmed_point is not None and len(selected) == 1:
+        reduced, _ = _simplify_dense_outlines([repaired, *neighbors], only_id=repaired["id"])
+        repaired = reduced[0]
+    changed = changed or len(selected) > 1 or repaired != contour
     if not changed:
         message = "Контур замкнут. Проверьте отмеченные ошибки по исходному чертежу." if unresolved else "Контур уже замкнут и не самопересекается."
         return entities, selected, [message], False
@@ -3278,7 +3401,12 @@ def edit_design(entities, operation, options):
         elif operation == "repair-part":
             result, shapes, warnings, changed = _repair_selected(entities, by_id, options, diagnostics)
         elif operation == "repair-conflict":
-            result, shapes, warnings, changed = _repair_conflict(entities, by_id, options)
+            if options.get("kind") == "gap":
+                result, shapes, warnings, changed = _repair_selected(
+                    entities, by_id, options, diagnostics, confirmed_point=_point(options.get("point")),
+                )
+            else:
+                result, shapes, warnings, changed = _repair_conflict(entities, by_id, options)
         elif operation == "repair-conflicts":
             result, shapes, warnings, changed = _repair_conflicts(entities, by_id, options, diagnostics, diagnostic_ids)
         elif operation == "simplify":

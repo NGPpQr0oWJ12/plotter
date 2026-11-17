@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 import ezdxf
 from ezdxf import path, units
 from ezdxf.math import Matrix44, Vec2, intersection_line_line_2d
+from shapely import LineString, Polygon, STRtree
 
 
 MAX_FILE_BYTES = 25 * 1024 * 1024
@@ -21,7 +22,11 @@ MAX_ENTITIES = 50_000
 MAX_POINTS = 250_000
 MAX_ABS_COORDINATE_MM = 1_000_000_000
 CURVE_TOLERANCE_MM = 0.05
-POINT_EPSILON_MM = 0.000001
+SAMPLED_CURVE_TOLERANCE_MM = 0.02
+SAMPLED_CURVE_CORNER_COSINE = math.cos(math.radians(30))
+SAMPLED_CURVE_MIN_POINTS = 12
+POINT_DECIMALS = 6
+POINT_EPSILON_MM = 10 ** -POINT_DECIMALS
 LOOP_ENDPOINT_TOLERANCE_MM = 0.001
 MANUAL_CLOSURE_TOLERANCE_MM = 0.02
 PLANAR_EPSILON_MM = 0.001
@@ -295,6 +300,7 @@ class _DrawingGeometry:
         self.skipped = Counter()
         self.entity_count = 0
         self.point_count = 0
+        self.sampled_polylines = set()
 
     def paths(self, layout, transform, inherited_layer="0", ancestry=()):
         for entity in layout:
@@ -366,7 +372,7 @@ class _DrawingGeometry:
             self.point_count += 1
             if self.point_count > MAX_POINTS:
                 raise CadImportError("После построения кривых в чертеже более 250 000 точек.")
-            xy = [round(point.x, 6), round(point.y, 6)]
+            xy = [round(point.x, POINT_DECIMALS), round(point.y, POINT_DECIMALS)]
             if not points or math.dist(points[-1], xy) > POINT_EPSILON_MM:
                 points.append(xy)
 
@@ -376,7 +382,90 @@ class _DrawingGeometry:
         if len(points) < (3 if closed else 2):
             self.skipped["вырожденные контуры"] += 1
             return None
-        return {"points": points, "closed": closed, "layer": layer}
+        contour = {"points": points, "closed": closed, "layer": layer}
+        if len(points) >= SAMPLED_CURVE_MIN_POINTS and not vector.has_curves:
+            if entity_type == "LWPOLYLINE" or (entity_type == "POLYLINE" and not entity.dxf.flags & (
+                    entity.CURVE_FIT_VERTICES_ADDED | entity.SPLINE_FIT_VERTICES_ADDED)):
+                self.sampled_polylines.add(id(contour))
+        return contour
+
+
+def _remove_collinear_vertices(paths):
+    # Shared and repeated points can identify junctions or authored retraces.
+    uses = Counter(tuple(point) for contour in paths for point in contour["points"])
+    scale = 10 ** POINT_DECIMALS
+    for contour in paths:
+        points = contour["points"]
+        closed = contour["closed"]
+        minimum = 3 if closed else 2
+        if len(points) <= minimum:
+            continue
+
+        # Use the import coordinate grid for an exact collinearity check.
+        vertices = [(round(x * scale), round(y * scale)) for x, y in points]
+        if closed:
+            vertices.append(vertices[0])
+        reduced = [points[0]]
+        for index, ((ax, ay), (bx, by), (cx, cy)) in enumerate(zip(vertices, vertices[1:], vertices[2:]), 1):
+            incoming_x, incoming_y = bx - ax, by - ay
+            outgoing_x, outgoing_y = cx - bx, cy - by
+            if (uses[tuple(points[index])] != 1
+                    or incoming_x * outgoing_y != incoming_y * outgoing_x
+                    or incoming_x * outgoing_x + incoming_y * outgoing_y <= 0):
+                reduced.append(points[index])
+        if not closed:
+            reduced.append(points[-1])
+        if minimum <= len(reduced) < len(points):
+            contour["points"] = reduced
+
+
+def _reduce_sampled_curve(vertices):
+    anchors = [0]
+    for index, (before, point, after) in enumerate(zip(vertices, vertices[1:], vertices[2:]), 1):
+        incoming = (point[0] - before[0], point[1] - before[1])
+        outgoing = (after[0] - point[0], after[1] - point[1])
+        extremum = any(first != second and first * second <= 0 for first, second in zip(incoming, outgoing))
+        dot = incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
+        if extremum or dot <= SAMPLED_CURVE_CORNER_COSINE * math.hypot(*incoming) * math.hypot(*outgoing):
+            anchors.append(index)
+    anchors.append(len(vertices) - 1)
+
+    reduced = [vertices[0]]
+    for first, last in pairwise(anchors):
+        if last - first < 4:
+            reduced.extend(vertices[first + 1:last + 1])
+        else:
+            span = LineString(vertices[first:last + 1]).simplify(SAMPLED_CURVE_TOLERANCE_MM, preserve_topology=True)
+            reduced.extend([x, y] for x, y in span.coords[1:])
+    return reduced
+
+
+def _simplify_sampled_polylines(paths, original_polylines):
+    # Repairs may synthesize contours from multiple entities. Only direct polyline imports qualify.
+    candidates = [index for index, contour in enumerate(paths)
+                  if id(contour) in original_polylines and len(contour["points"]) >= SAMPLED_CURVE_MIN_POINTS]
+    if not candidates:
+        return
+    lines = [LineString([*contour["points"], contour["points"][0]] if contour["closed"] else contour["points"])
+             for contour in paths]
+    neighbors = STRtree(lines)
+    clearance = 2 * (SAMPLED_CURVE_TOLERANCE_MM + CURVE_TOLERANCE_MM)
+    for index in candidates:
+        line = lines[index]
+        if not line.is_simple or any(other != index for other in neighbors.query(
+                line, predicate="dwithin", distance=clearance)):
+            continue
+        contour = paths[index]
+        vertices = [*contour["points"], contour["points"][0]] if contour["closed"] else contour["points"]
+        reduced = _reduce_sampled_curve(vertices)
+        if len(reduced) >= len(vertices) or not LineString(reduced).is_simple:
+            continue
+        if contour["closed"]:
+            original, result = Polygon(line), Polygon(reduced)
+            if not original.is_valid or not result.is_valid or original.exterior.is_ccw != result.exterior.is_ccw:
+                continue
+            reduced.pop()
+        contour["points"] = reduced
 
 
 def import_drawing(data: bytes, filename: str) -> dict:
@@ -413,5 +502,8 @@ def import_drawing(data: bytes, filename: str) -> dict:
         ignored = ", ".join(f"{name} ({count})" for name, count in sorted(geometry.skipped.items()))
         warnings.append(f"Пропущены объекты {ignored}.")
     repaired = repair_closed_contours(paths)
+    if extension == ".dxf":
+        _remove_collinear_vertices(repaired.paths)
+        _simplify_sampled_polylines(repaired.paths, geometry.sampled_polylines)
     return {"filename": filename, "paths": repaired.paths, "warnings": warnings, "units": "mm",
             "closedCount": repaired.closed_count}

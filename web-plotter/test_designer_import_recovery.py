@@ -1,11 +1,13 @@
 from codecs import BOM_UTF8
 from io import BytesIO, StringIO
+import math
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import ezdxf
 from ezdxf import recover, units
+from shapely.geometry import LineString
 
 from cad import CadImportError, import_drawing
 from designer_cad import CadDesignError, IMPORT_AUDIT, IMPORT_DOUBLED_LINE, edit_design, import_design, prepare_design, validate_design
@@ -42,6 +44,24 @@ def polyline(points, closed=False):
 
 
 class DesignerImportRecoveryTests(unittest.TestCase):
+    def test_dxf_dense_outline_is_simplified_without_closing_the_gap_or_detaching_marks(self):
+        curve = [(index / 20, -math.sin(math.pi * index / 400)) for index in range(401)]
+        points = [*curve, (20, 20), (0, 20), (0, .796)]
+        outline = polyline([(x, y, 0) for x, y in points])
+        imported = import_design(drawing(outline, header=units_header(units.MM)), "curve.dxf")
+        reduced, = imported["entities"]
+        self.assertFalse(reduced["closed"])
+        self.assertAlmostEqual(math.dist(reduced["points"][0], reduced["points"][-1]), .796)
+        self.assertLess(len(reduced["points"]), 40)
+        self.assertEqual(LineString(points).bounds, LineString(reduced["points"]).bounds)
+        self.assertLessEqual(LineString(points).hausdorff_distance(LineString(reduced["points"])), .02)
+
+        contact = curve[100]
+        with_mark = drawing(outline, segment(contact, (5, -2)), header=units_header(units.MM))
+        protected, mark = import_design(with_mark, "marked.dxf")["entities"]
+        self.assertIn(list(contact), protected["points"])
+        self.assertEqual(mark["start"], list(contact))
+
     def test_cad_dxf_import_repairs_tiny_corner_on_closed_native_polyline_or_line_chain(self):
         points = [(100, 0), (-.0015, 0), (.0002, .001), (-.1, -100), (100, -100)]
         crossing_x = .0002 + .001 * (-.1 - .0002) / (100 + .001)

@@ -72,7 +72,6 @@
     <div class="topbar-actions">
       <span id="workplace-role" class="workplace-role"></span>
       <span id="workspace-save" class="workspace-save" role="status" hidden></span>
-      <button class="button topbar-secondary" id="app-update" type="button" aria-describedby="app-update-status" hidden disabled>Обновить помощник</button>
       <span id="app-update-status" class="visually-hidden" role="status"></span>
       <button class="button topbar-secondary" id="new-cut-button" type="button" hidden disabled>Новый раскрой</button>
       <button class="button topbar-secondary" id="workplace-exit" type="button">Выйти</button>
@@ -361,7 +360,8 @@
       <ul class="release-notes-list" id="release-notes-list" hidden></ul>
     </div>
     <footer class="dialog-actions" id="release-notes-actions" hidden>
-      <a class="button" href="/api/companion-installer" download>Скачать помощник</a>
+      <a class="button" id="release-notes-download" href="/api/companion-installer" download hidden>Скачать помощник</a>
+      <button class="button primary" id="app-update" type="button" aria-describedby="app-update-status" hidden disabled>Обновить помощник</button>
     </footer>
   </dialog>
 

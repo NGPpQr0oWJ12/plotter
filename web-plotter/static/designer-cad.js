@@ -21,6 +21,7 @@ const CAD_SNAP_COLOR = "#0869a7";
 const CAD_NOTCH_COLOR = "#e45a08";
 const REPAIR_DIAGNOSTICS = {
   branch: ["Развилка", "Снимите выделение с лишней ветви через Shift + щелчок и повторите восстановление."],
+  gap: ["Разрыв контура", "Проверьте отмеченные концы и исправьте контур вручную."],
   intersection: ["Самопересечение", "Поправьте вершины у пересечения. Малую петлю можно убрать щелчком ластика по выступу."],
   overlap: ["Наложенные рёбра", "Проверьте рёбра через Alt + щелчок. Оставьте одно из совпадающих рёбер и повторите восстановление."],
 };
@@ -1313,13 +1314,18 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function updateRepairDiagnostic() {
     const location = repairLocations[repairLocationIndex];
-    const [title, help] = REPAIR_DIAGNOSTICS[location.kind];
+    const [name, help] = REPAIR_DIAGNOSTICS[location.kind];
+    const gap = location.kind === "gap";
+    const title = gap ? `${name}: ${formatLength(location.distance)}` : name;
+    const fixHelp = gap ? "Команда соединит отмеченные концы и замкнёт контур."
+      : "Исправление уберёт лишние рёбра и сохранит замкнутый внешний контур.";
     views["repair-diagnostic-title"].textContent = repairLocations.length > 1
       ? `${title} · ${repairLocationIndex + 1} из ${repairLocations.length}` : title;
-    views["repair-diagnostic-help"].textContent = location.feedback
-      || (location.fixable === true ? "Исправление уберёт лишние рёбра и сохранит замкнутый внешний контур." : help);
+    views["repair-diagnostic-help"].textContent = location.feedback || (location.fixable === true ? fixHelp : help);
     actions["show-repair-location"].textContent = repairLocationFocused && repairLocations.length > 1
       ? "Следующее место" : "Показать место";
+    actions["fix-repair-location"].textContent = gap ? "Замкнуть разрыв" : "Исправить";
+    actions["fix-all-repair-locations"].hidden = gap;
   }
 
   function showRepairDiagnostics(locations, ids, bulkResult = null) {
@@ -1339,8 +1345,12 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (running || gesture || !repairLocations.length) return;
     if (repairLocationFocused) repairLocationIndex = (repairLocationIndex + 1) % repairLocations.length;
     repairLocationFocused = true;
-    center = repairLocations[repairLocationIndex].point;
-    scale = clampViewScale(Math.max(scale, 200), center);
+    const location = repairLocations[repairLocationIndex];
+    center = location.point;
+    const targetScale = location.kind === "gap" && location.distance > 0
+      ? Math.min(Math.max(scale, 48 / location.distance), Math.min(width, height) * .6 / location.distance)
+      : Math.max(scale, 200);
+    scale = clampViewScale(targetScale, center);
     updateRepairDiagnostic();
     update();
   }
@@ -2390,6 +2400,29 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       context.stroke();
     }
     for (const [index, location] of repairLocations.entries()) {
+      if (location.kind === "gap") {
+        context.save();
+        context.strokeStyle = "#fff";
+        context.lineWidth = 5;
+        pathLine(location.endpoints);
+        context.strokeStyle = "#b00020";
+        context.lineWidth = 2;
+        context.setLineDash([4, 3]);
+        pathLine(location.endpoints);
+        context.setLineDash([]);
+        context.beginPath();
+        const radius = index === repairLocationIndex ? 6 : 4;
+        for (const point of location.endpoints) {
+          const [x, y] = screen(point);
+          context.moveTo(x + radius, y);
+          context.arc(x, y, radius, 0, Math.PI * 2);
+        }
+        context.fillStyle = "#fff";
+        context.fill();
+        context.stroke();
+        context.restore();
+        continue;
+      }
       const [x, y] = screen(location.point);
       if (x < -10 || y < -10 || x > width + 10 || y > height + 10) continue;
       context.beginPath();

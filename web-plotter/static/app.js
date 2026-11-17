@@ -374,22 +374,29 @@ function appUpdateInProgress() {
 
 function renderAppUpdate() {
   const version = $("app-version");
+  const release = $("release-notes-button");
   const button = $("app-update");
   const progress = appUpdateSubmitting || Boolean(appUpdateTarget) || appUpdateInProgress();
   const message = appUpdate?.message || "";
-  const label = appUpdate?.state === "restarting" ? "Перезапускаем…"
-    : progress ? "Обновляем помощник…" : "Обновить помощник";
   const target = appUpdateTarget ?? appUpdate?.availableVersion;
+  const updateAvailable = appUpdate?.supported === true && Boolean(target) && target !== appUpdate.version;
+  const progressLabel = appUpdate?.state === "restarting" ? "Перезапускаем…" : "Обновляем помощник…";
+  const availableMessage = updateAvailable ? `Доступно обновление помощника до версии ${target}.` : "";
   const disabled = progress || !appUpdateSafe();
   const tooltip = disabled && !progress ? "Завершите работу со станком перед обновлением." : "";
   updateText(version, appUpdate?.version ?? "");
   updateControl(version, "hidden", !appUpdate?.version);
   updateControl(version, "title", message);
-  updateText(button, label);
-  updateControl(button, "hidden", !appUpdate?.supported || !target);
+  updateText(release, updateAvailable ? (progress ? progressLabel : "Обновить") : "Релиз");
+  release.classList.toggle("release-update-available", updateAvailable);
+  updateControl(release, "title", availableMessage);
+  const actionLabel = updateAvailable ? `Обновить помощник до ${target}` : "Обновить помощник";
+  updateText(button, progress ? progressLabel : actionLabel);
+  updateControl(button, "hidden", !updateAvailable);
   updateControl(button, "disabled", disabled);
   updateControl(button, "title", [target ? `Версия ${target}` : "", message || tooltip].filter(Boolean).join(". "));
-  updateText($("app-update-status"), message || (progress ? label : ""));
+  updateControl($("release-notes-actions"), "hidden", !updateAvailable && $("release-notes-download").hidden);
+  updateText($("app-update-status"), message || (progress ? progressLabel : availableMessage));
 }
 
 async function openReleaseNotes() {
@@ -401,12 +408,13 @@ async function openReleaseNotes() {
   const status = $("release-notes-status");
   const list = $("release-notes-list");
   const content = $("release-notes-content");
-  const actions = $("release-notes-actions");
+  const download = $("release-notes-download");
   const installed = appUpdate?.version;
   updateText(title, installed ? `Релиз ${installed}` : "Релиз");
   list.replaceChildren();
   list.hidden = true;
-  actions.hidden = true;
+  download.hidden = true;
+  renderAppUpdate();
   status.hidden = false;
   updateText(status, "Загружаем список изменений…");
   updateAttribute(content, "aria-busy", "true");
@@ -417,7 +425,8 @@ async function openReleaseNotes() {
     if (typeof result?.version !== "string" || !Array.isArray(result.notes)) throw new Error();
     const notes = result.notes.filter((note) => typeof note === "string" && note.trim());
     updateText(title, `Релиз ${result.version}`);
-    actions.hidden = result.companionDownload !== true;
+    download.hidden = result.companionDownload !== true;
+    renderAppUpdate();
     if (notes.length) {
       const items = notes.map((note) => {
         const item = document.createElement("li");
@@ -467,8 +476,8 @@ function readAppUpdate() {
       }
       if (wasRestarting !== (appUpdate?.state === "restarting")) renderControls();
       else renderAppUpdate();
-      const discovering = appUpdate?.supported && !appUpdate.availableVersion && !appUpdate.message
-        && appUpdate.state === "idle" && appUpdateDiscoveryReads++ < 3;
+      const discovering = appUpdate?.supported && !appUpdate.availableVersion && !appUpdateInProgress()
+        && appUpdateDiscoveryReads++ < 3;
       scheduleAppUpdateRead(appUpdateTarget || appUpdateInProgress() || discovering ? 1500 : 60_000);
     }
   })();
@@ -479,6 +488,7 @@ async function applyAppUpdate() {
   if (!appUpdate?.supported || !appUpdate.availableVersion || $("app-update").disabled || !appUpdateSafe()) return;
   const target = appUpdate.availableVersion;
   appUpdateSubmitting = true;
+  $("release-notes-dialog").close();
   renderAppUpdate();
   try {
     if (workspaceChange !== workspaceSaved && !await persistWorkspace()) {

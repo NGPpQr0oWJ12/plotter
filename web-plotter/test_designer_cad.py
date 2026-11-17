@@ -88,6 +88,56 @@ class DesignerCadTests(unittest.TestCase):
                 else:
                     self.assertNotIn("diagnostics", result)
 
+    def test_confirmed_dxf_gap_keeps_endpoints_and_reduces_cut_trajectory(self):
+        curve = [[index / 20, -math.sin(math.pi * index / 400)] for index in range(401)]
+        points = [*curve, [20, 20], [0, 20], [0, .796]]
+        shape = {**square(), "closed": False, "points": points}
+        options = {"ids": [shape["id"]]}
+        preview = edit_design([shape], "repair-part", options)
+        issue, = preview["diagnostics"]
+        self.assertFalse(preview["changed"])
+        self.assertEqual(issue["endpoints"], [points[0], points[-1]])
+        self.assertAlmostEqual(issue["distance"], .796)
+        self.assertTrue(issue["fixable"])
+
+        result = edit_design([shape], "repair-conflict", {**options, "kind": "gap", "point": issue["point"]})
+        repaired, = result["entities"]
+        path, = prepare_design([repaired])["paths"]
+        self.assertTrue(result["changed"] and path["closed"])
+        self.assertEqual([path["points"][0], path["points"][-1]], [points[0], points[-1]])
+        self.assertLess(len(path["points"]), 40)
+        boundary = LineString([*path["points"], path["points"][0]])
+        self.assertLessEqual(boundary.hausdorff_distance(LineString([*points, points[0]])), .02)
+
+    def test_gap_confirmation_refuses_crossing_geometry_and_stale_location(self):
+        shape = {**square(), "closed": False, "points": [*square()["points"], [0, .796]]}
+        crossing = line("crossing", [-1, .4], [1, .4])
+        options = {"ids": [shape["id"]], "kind": "gap", "point": [0, .398]}
+        preview = edit_design([shape, crossing], "repair-part", options)
+        self.assertFalse(preview["diagnostics"][0]["fixable"])
+        for entities, point in (([shape, crossing], [0, .398]), ([shape], [1, .398])):
+            with self.subTest(entities=entities):
+                result = edit_design(entities, "repair-conflict", {**options, "point": point})
+                self.assertFalse(result["changed"])
+                self.assertEqual(result["entities"], entities)
+
+    def test_confirmed_bridges_join_fragments_across_two_gaps(self):
+        fragments = [
+            {**square(), "closed": False, "points": [[.6, 0], [20, 0], [20, 8]]},
+            {**square(), "id": "top", "closed": False, "points": [[20, 8.796], [20, 20], [0, 20], [0, 0]]},
+        ]
+        options = {"ids": [entity["id"] for entity in fragments]}
+        preview = edit_design(fragments, "repair-part", options)
+        issue, = preview["diagnostics"]
+        self.assertFalse(preview["changed"])
+        self.assertTrue(issue["fixable"])
+        self.assertAlmostEqual(issue["distance"], .796)
+        result = edit_design(fragments, "repair-conflict", {**options, "kind": "gap", "point": issue["point"]})
+        repaired, = result["entities"]
+        self.assertTrue(result["changed"] and repaired["closed"])
+        restored = LineString([*repaired["points"], repaired["points"][0]])
+        self.assertTrue(restored.equals(LineString([*square()["points"], square()["points"][0]])))
+
     def test_repair_reports_exact_and_tolerance_based_branch_endpoint(self):
         for offset in (0, 0.008):
             with self.subTest(offset=offset):
