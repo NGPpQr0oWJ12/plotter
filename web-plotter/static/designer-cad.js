@@ -760,7 +760,7 @@ const markup = `
         ${iconButton("offset", "Припуск", "tool")}
         ${iconButton("erase", "Ластик", "tool")}
         <div class="cad-group-actions">
-          <button type="button" class="button cad-icon-button cad-group-button" data-action="join" aria-label="Соединить в группу" title="Соединить в группу. При выборе ребра в группу войдёт весь его объект.">${cadIcon("join")}</button>
+          <button type="button" class="button cad-icon-button cad-group-button" data-action="join" aria-label="Соединить в группу" title="Создать группу из выделения. При выборе ребра в группу войдёт весь его объект.">${cadIcon("join")}</button>
           <button type="button" class="button cad-icon-button cad-group-button" data-action="ungroup" aria-label="Разъединить" title="Разъединить выбранные группы на текущем уровне" hidden>${cadIcon("ungroup")}</button>
         </div>
         ${iconButton("close-outline", "Замкнуть контур", "action", "Объединить выделенные объекты в один замкнутый контур. При выборе ребра используется весь его объект.")}
@@ -884,6 +884,10 @@ function errorMessage(error) {
   return error?.message || String(error);
 }
 
+function isClosedContour(entity) {
+  return entity.closed === true || entity.type === "circle" || entity.type === "ellipse" && Math.abs(entity.sweep) === 360;
+}
+
 function angleTransform(center, degrees) {
   const cos = Math.cos(degrees * DEG);
   const sin = Math.sin(degrees * DEG);
@@ -967,6 +971,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   const previous = [];
   const future = [];
   const geometryCache = new WeakMap();
+  const existingPart = draft?.kind === "part";
   const initial = { entities: draft?.entities || [], warnings: (draft?.warnings || []).filter(warning => warning !== LEGACY_DEFAULT_UNITS_WARNING) };
   let current = initial;
   let byId = new Map(current.entities.map(entity => [entity.id, entity]));
@@ -1034,6 +1039,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions.import.hidden = actions.part.hidden = true;
     actions.save.textContent = "Сохранить в раскрой";
     actions.save.classList.add("primary");
+  } else if (existingPart) {
+    actions.save.textContent = "Сохранить изменения";
+    actions.save.classList.add("primary");
+    actions.part.textContent = "Сохранить как новую деталь";
+    actions.part.classList.remove("primary");
   }
 
   function geometry(entity) {
@@ -1188,9 +1198,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     return current.entities.filter(entity => !entity.parentId && inActiveGroup(entity) && groupAt(entity) === group);
   }
 
+  function canCreateGroup({ objects, groups }) {
+    return objects.size > 0 || groups.size > 1;
+  }
+
   function groupSelected() {
     const units = selectionUnits([...selected, ...selectedEdges.keys()], true);
-    if (units.count < 2) return;
+    if (!canCreateGroup(units)) return;
     const members = current.entities.filter(entity => !entity.parentId && (units.objects.has(entity.id)
       || inActiveGroup(entity) && units.groups.has(groupAt(entity))));
     if (members.some(entity => groupPath(entity).length >= MAX_GROUP_DEPTH)) {
@@ -1545,13 +1559,18 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         || (key === "scale" && !selectedEdges.size && !items.some(entity => entity.type !== "point"));
     }
     actions["erase-selection"].disabled = running || active || !settings;
-    actions.join.disabled = tool !== "select" || running || active || groupable.count < 2;
+    const canGroup = canCreateGroup(groupable);
+    actions.join.disabled = tool !== "select" || running || active || !canGroup;
     const outlines = selectedOutlines();
-    const oneOpenPolyline = outlines.length === 1 && outlines[0].type === "polyline" && !outlines[0].closed;
-    actions["close-outline"].disabled = tool !== "select" || running || active || !outlines.every(editableInGroup)
-      || (outlines.length < 2 && !oneOpenPolyline);
+    const single = outlines.length === 1 ? outlines[0] : null;
+    const alreadyClosed = single && isClosedContour(single);
+    const closeOutline = actions["close-outline"];
+    closeOutline.disabled = tool !== "select" || running || active || !outlines.every(editableInGroup)
+      || (outlines.length < 2 && !alreadyClosed && single?.type !== "polyline");
+    closeOutline.title = alreadyClosed ? "Проверить замыкание и пересечения выделенного контура."
+      : "Объединить выделенные объекты в один замкнутый контур. При выборе ребра используется весь его объект.";
     const canUngroup = tool === "select" && units.groups.size > 0;
-    actions.join.hidden = canUngroup && groupable.count < 2;
+    actions.join.hidden = canUngroup && !canGroup;
     actions.ungroup.hidden = !canUngroup;
     actions.ungroup.disabled = running || active || !canUngroup;
     views["group-status"].hidden = !activeGroup.length;
@@ -1561,7 +1580,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions.redo.disabled = running || active || !future.length;
     actions.import.disabled = running || active;
     actions.save.disabled = running || active;
-    actions.part.disabled = running || active || !items.some(entity => !entity.reference && !entity.notch);
+    actions.part.disabled = running || active || !outlines.some(entity => !entity.reference);
     views["notch-preview"].hidden = !notchPreview;
     views.measurements.hidden = tool !== "measure" || !measurements.length;
     views.erase.hidden = tool !== "erase" || !settings;
@@ -1591,6 +1610,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       const [entity] = selection;
       const polyline = entity.type === "polyline" && !edgeCount;
       views.selection.textContent = onlyGroup ? "" : [edgeCount ? "Ребро полилинии" : ENTITY_NAMES[entity.type] || entity.type, entity.layer,
+        !edgeCount && isClosedContour(entity) ? "Замкнутый контур" : "",
         polyline ? `Сегменты: ${entity.points.length - Number(!entity.closed)}` : "",
         polyline && (entity.joined || entity.points.length > 32) ? "Alt+щелчок — выбрать ребро" : "",
         entity.reference ? "вспомогательный" : "", entity.importDamaged ? "Проверьте после импорта" : ""].filter(Boolean).join(" · ");
@@ -3594,7 +3614,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const originals = new Set(contours.length ? contours.map(item => item.id) : [entity.id]);
     const family = familyIds(originals);
     const source = current.entities.filter(item => family.has(item.id));
-    const closed = entity.type === "circle" || entity.closed === true || entity.type === "ellipse" && Math.abs(entity.sweep) === 360;
+    const closed = isClosedContour(entity);
     const winding = closed ? path.reduce((sum, item, index) =>
       sum + cross(sub(item, anchor), sub(path[(index + 1) % path.length], anchor)), 0) : 0;
     const normalSign = closed && winding >= 0 ? -1 : 1;
@@ -4247,11 +4267,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       saved = current;
       savedName = name;
       fields.name.value = name;
-      log(layoutPart ? "Деталь обновлена в раскладке." : "Чертёж сохранён.");
+      log(layoutPart ? "Деталь обновлена в раскладке." : existingPart ? "Изменения детали сохранены в реестре." : "Чертёж сохранён.");
       if (result?.closeEditor) await onBack();
     }),
     part: () => perform(async () => {
-      const included = familyIds(selected);
+      const included = familyIds([...selected, ...selectedEdges.keys()]);
       const entities = current.entities.filter(entity => included.has(entity.id)).map(entity => {
         if (!entity.parentId || included.has(entity.parentId)) return entity;
         const { parentId, ...unbound } = entity;

@@ -364,7 +364,8 @@ function jsonRequest(body, signal) {
 }
 
 function appUpdateSafe() {
-  return !busy() && !drawingLocked() && !drag && !runInProgress() && !controlActive() && !live.busy
+  return !busy() && !drawingLocked({ editing: false }) && !workplaces?.hasPendingCadEdits?.() && !drag
+    && !runInProgress() && !controlActive() && !live.busy
     && !live.stopAvailable && !needsMotionVerification() && !coordinateMoveBlocksControl()
     && !currentUpload && !uploadUncertain && !xiaoHandoff && activeRun?.state !== "transferring";
 }
@@ -384,7 +385,10 @@ function renderAppUpdate() {
   const progressLabel = appUpdate?.state === "restarting" ? "Перезапускаем…" : "Обновляем помощник…";
   const availableMessage = updateAvailable ? `Доступно обновление помощника до версии ${target}.` : "";
   const disabled = progress || !appUpdateSafe();
-  const tooltip = disabled && !progress ? "Завершите работу со станком перед обновлением." : "";
+  const tooltip = disabled && !progress
+    ? workplaces?.hasPendingCadEdits?.() ? "Сохраните чертёж и дождитесь завершения работы в редакторе."
+      : "Завершите текущую операцию перед обновлением."
+    : "";
   updateText(version, appUpdate?.version ?? "");
   updateControl(version, "hidden", !appUpdate?.version);
   updateControl(version, "title", message);
@@ -459,7 +463,7 @@ function readAppUpdate() {
       if (typeof status?.version !== "string") return;
       appUpdate = status;
       if (appUpdateTarget && status.version === appUpdateTarget) {
-        if (workspaceChange === workspaceSaved && !busy() && !drawingLocked() && !drag) {
+        if (workspaceChange === workspaceSaved && appUpdateSafe()) {
           location.reload();
           return;
         }
@@ -1403,8 +1407,9 @@ function translatePath(path, dx, dy) {
   return mapPath(path, ([x, y]) => [x + dx, y + dy]);
 }
 
-function drawingLocked() {
-  return layoutReadOnly() || restoringWorkspace || isLoading || nestRequest !== null || contourRepair !== null || appUpdate?.state === "restarting"
+function drawingLocked({ editing = true } = {}) {
+  return (editing && (layoutReadOnly() || restoringWorkspace)) || isLoading || nestRequest !== null
+    || contourRepair !== null || appUpdate?.state === "restarting"
     || ["upload", "cut", "advance-roll", "new-cut", "open-layout", "save-kit-layout"].includes(pendingCommand)
     || (!layoutPreparation() && runInProgress());
 }

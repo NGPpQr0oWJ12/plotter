@@ -571,7 +571,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       const content = el("div", field("Название детали", title), "workplace-form-grid");
       content.append(field("Папка", parent));
       modal.addEventListener("close", () => { if (modal.returnValue !== "saved") reject(new Error("Сохранение детали отменено.")); }, { once: true });
-      formDialog("Сохранить деталь", content, "Сохранить", async () => {
+      formDialog(record?.kind === "part" ? "Сохранить как новую деталь" : "Сохранить деталь", content, "Сохранить", async () => {
         const part = await post("/api/registry", { action: "save", kind: "part", parent: parent.value || null, name: title.value, entities });
         await refreshRegistry();
         resolve(part);
@@ -930,5 +930,5 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const initialRole = storedRole();
   if (initialRole) void execute(() => enterRole(initialRole))();
   else focusPicker();
-  return { openLayoutPart };
+  return { openLayoutPart, hasPendingCadEdits: () => Boolean(cad?.hasUnsavedChanges() || cad?.isBusy()) };
 }
