@@ -210,12 +210,14 @@ class RollRun:
     points: int = 0
     started_at: int | None = None
     baseline_event: int | None = None
+    material_advanced: bool = False
 
     def snapshot(self):
         next_page = self.page if self.state == "ready" else self.page + 1 if self.state == "advance" else None
         return {"planId": self.plan_id, "page": self.page, "pages": self.pages, "firstPage": self.first_page,
                 "state": self.state,
-                "completedPages": self.completed_pages, "feedAfterMm": self.feed_after_mm, "nextPage": next_page}
+                "completedPages": self.completed_pages, "feedAfterMm": self.feed_after_mm, "nextPage": next_page,
+                "materialAdvanced": self.material_advanced}
 
 
 @dataclass(frozen=True)
@@ -479,6 +481,7 @@ class PlotterState:
                 "directUpload": page_add is not None,
                 "directRoll": True,
                 "continuousRoll": True,
+                "automaticRollFeed": self.demo_mode,
                 "liveCutProgress": True,
                 "stopDuringExternalRun": True,
                 "arbitraryNestRotation": True,
@@ -957,10 +960,12 @@ class PlotterState:
                 raise RequestError("Подтвердите положение начала выбранного прохода на станке.", HTTPStatus.CONFLICT)
             if previous and previous.snapshot()["nextPage"] != page_number:
                 raise RequestError("Этот проход пока недоступен. Проверьте ход рулонного задания.", HTTPStatus.CONFLICT)
-            if preview["hasContinuations"] and data.get("advanceConfirmed") is not True:
+            auto_advanced = self.demo_mode and previous and previous.state == "advance" and previous.material_advanced
+            advance_confirmed = auto_advanced or data.get("advanceConfirmed") is True
+            if preview["hasContinuations"] and not advance_confirmed:
                 raise RequestError("Подтвердите положение начала прохода у нуля станка.")
             if previous and previous.state == "advance":
-                if data.get("advanceConfirmed") is not True:
+                if not advance_confirmed:
                     raise RequestError("Подтвердите протяжку ткани и положение рабочего нуля.")
                 self.verify_roll_advance()
             elif previous:
@@ -1032,8 +1037,33 @@ class PlotterState:
                 return self.controller.hold(*args)
         return self.controller.hold(*args)
 
+    def advance_roll_material(self, data, control_token):
+        if not self.demo_mode:
+            raise RequestError("Автопротяжка с заданным расстоянием доступна в деморежиме.", HTTPStatus.CONFLICT)
+        self.controller.require_control(control_token)
+        with request_lock(self.upload_lock, "Дождитесь завершения передачи задания."), self.workspace_lock:
+            roll = self.roll
+            if (roll is None or roll.state != "advance" or data.get("planId") != roll.plan_id
+                    or type(data.get("page")) is not int or data["page"] != roll.page + 1):
+                raise RequestError("Следующий проход ещё не готов к протяжке.", HTTPStatus.CONFLICT)
+            job, filename = self.current_drawing(data.get("cutId"), for_machine=True)
+            page_add = self.controller.upload_page_add()
+            current = drawing_key(job, filename, self.simulator.width, self.simulator.height, page_add, roll=True)
+            if current != roll.plan_id:
+                raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
+            if roll.material_advanced:
+                return {**self.cut_status(), "feedMm": roll.feed_after_mm}
+            if not 0 < roll.feed_after_mm <= self.roll_pass_length(page_add):
+                raise RequestError("Раскладка не содержит допустимого расстояния протяжки.", HTTPStatus.CONFLICT)
+            self.verify_roll_advance()
+            result = self.controller.advance_material(roll.feed_after_mm, control_token=control_token)
+            self.roll = replace(roll, material_advanced=True)
+            return {**self.cut_status(), **result}
+
     def operate_controller(self, data):
         action, token = data.get("action"), data.get("controlToken")
+        if action == "advance-roll":
+            return self.advance_roll_material(data, token)
         if action in ("cut", "range", "pause-cut", "resume-cut", "acknowledge-run"):
             self.controller.require_control(token)
         args = (action, data.get("token"), data.get("ready"), data.get("jobConfirmed"), data.get("recoverUpload"), token)
@@ -1479,7 +1509,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         store = self.server.production
         if path == "/api/registry":
-            self.json_response(store.registry(params.get("id")))
+            if params.get("mode") == "kit-layout":
+                try:
+                    width, amount = float(params.get("widthMm", "")), int(params.get("quantity", ""))
+                except ValueError as error:
+                    raise RequestError("Укажите ширину полотна и количество комплектов.") from error
+                self.json_response(store.kit_layout(params.get("id"), width, amount))
+            else:
+                self.json_response(store.registry(params.get("id")))
         elif path == "/api/orders":
             self.json_response(store.orders(params.get("id"), published_only=params.get("published") == "1"))
         else:
@@ -1505,14 +1542,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         store = self.server.production
         verify = self.server.verify_production_layout
-        if path == "/api/registry" and action in ("save", "collect"):
-            result = store.save_registry(data) if action == "save" else store.collect(data.get("members"))
+        if path == "/api/registry" and action in ("save", "move"):
+            result = store.save_registry(data)
+        elif path == "/api/registry" and action == "delete":
+            result = store.delete_registry(data)
+        elif path == "/api/registry" and action == "collect":
+            result = store.collect(data.get("members"))
+        elif path == "/api/registry" and action == "save-kit-layout":
+            result = store.save_kit_layout(data, verify)
         elif path == "/api/orders" and action == "save":
             result = store.save_order(data)
         elif path == "/api/orders" and action == "update-meta":
             result = store.update_order_metadata(data)
         elif path == "/api/orders" and action in ("save-cut", "remove-cut"):
-            result = store.save_cut(data)
+            result = store.save_cut(data, verify)
         elif path == "/api/orders" and action == "publish":
             result = store.publish_order(data, verify)
         elif path == "/api/orders" and action == "publish-cut":

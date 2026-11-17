@@ -73,6 +73,73 @@ class DesignerCadTests(unittest.TestCase):
         self.assertEqual(retained, {**notch, "parentId": "arc"})
         self.assertEqual(result["selectedIds"], ["arc"])
 
+    def test_close_outline_preserves_group_bulge_and_notch_ownership(self):
+        group = ["parent", "panel"]
+        arc = {"id": "arc", "type": "arc", "center": [10, 0], "radius": 10, "startAngle": 180, "sweep": 180,
+               "groupPath": group}
+        base = {**line("base", [20, 0], [0, 0]), "groupPath": group, "importIssues": [IMPORT_INVALID_VERTEX]}
+        notch = {**line("notch", [8, 0], [8, -2]), "notch": True, "parentId": "base"}
+        unrelated = {**line("unrelated", [50, 0], [60, 0]), "groupPath": ["other"]}
+
+        result = edit_design([arc, base, notch, unrelated], "close-outline", {"ids": ["arc", "base"]})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], ["arc"])
+        contour, child, other = result["entities"]
+        self.assertTrue(contour["closed"])
+        self.assertEqual(contour["groupPath"], group)
+        self.assertEqual(contour["importIssues"], [IMPORT_INVALID_VERTEX])
+        self.assertAlmostEqual(contour["bulges"][0], 1)
+        self.assertEqual(child, {**notch, "parentId": "arc"})
+        self.assertEqual(other, unrelated)
+
+    def test_close_outline_confirms_even_small_gaps_without_snapping_vertices(self):
+        edges = square_edges("piece")
+        edges[1]["start"] = [20, 0.01]
+        edges[3]["start"] = [0, 19.8]
+        ids = [edge["id"] for edge in edges]
+        result = edit_design(edges, "close-outline", {"ids": ids})
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["entities"], edges)
+        issue, = result["diagnostics"]
+        self.assertTrue(issue["fixable"])
+        self.assertEqual(issue["kind"], "gap")
+        self.assertEqual(issue["sourceOperation"], "close-outline")
+        self.assertAlmostEqual(issue["distance"], 0.2)
+        options = {"ids": ids, "kind": "gap", "sourceOperation": issue["sourceOperation"]}
+        retry = edit_design(edges, "repair-conflict", {**options, "point": [0, 10]})
+        self.assertFalse(retry["changed"])
+        self.assertEqual(retry["diagnostics"], result["diagnostics"])
+
+        confirmed = edit_design(edges, "repair-conflict", {**options, "point": issue["point"]})
+
+        self.assertTrue(confirmed["changed"])
+        contour, = confirmed["entities"]
+        self.assertTrue(contour["closed"])
+        self.assertEqual(set(map(tuple, contour["points"])),
+                         {tuple(edge[side]) for edge in edges for side in ("start", "end")})
+
+    def test_close_outline_no_ops_or_rejects_ineligible_contours(self):
+        contour = square()
+        open_loop = {**contour, "closed": False, "points": [*contour["points"], contour["points"][0]]}
+        result = edit_design([open_loop], "close-outline", {"ids": [contour["id"]]})
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["entities"], [contour])
+
+        crossed = {**contour, "points": [[0, 0], [20, 20], [0, 20], [20, 0]]}
+        branch = [*square_edges("piece"), line("branch", [0, 0], [-10, 0])]
+        unrelated_groups = square_edges("grouped")
+        unrelated_groups[0]["groupPath"] = ["other"]
+        for shapes in ([contour], [crossed], [line("short", [0, 0], [0.01, 0])], branch, unrelated_groups,
+                       [line("first", [0, 0], [0, 20]), line("second", [40, 0], [40, 20])]):
+            with self.subTest(ids=[shape["id"] for shape in shapes]):
+                rejected = edit_design(shapes, "close-outline", {"ids": [shape["id"] for shape in shapes]})
+                self.assertFalse(rejected["changed"])
+                self.assertEqual(rejected["entities"], shapes)
+                for diagnostic in rejected.get("diagnostics", ()):
+                    self.assertEqual(diagnostic["sourceOperation"], "close-outline")
+
     def test_repair_reports_large_gap_and_self_intersection_without_changes(self):
         open_contour = {**square(), "closed": False,
                         "points": [[0, 0], [20, 0], [20, 20], [0, 20], [0, 6]]}
@@ -673,6 +740,61 @@ class DesignerCadTests(unittest.TestCase):
         self.assertEqual((new["type"], new["center"], new["radius"]), ("circle", [2, 3], 3))
         with self.assertRaises(CadDesignError):
             edit_design([circle], "offset", {**options, "distance": -5})
+
+    def test_offset_connected_chain_has_one_contour_and_a_stable_anchor_sign(self):
+        group = ["piece"]
+        base = {**line("base", [0, 0], [10, 0]), "groupPath": group}
+        reversed_side = {**line("side", [10, 10], [10, 0]), "groupPath": group}
+        notch = {**line("mark", [4, 0], [4, -1]), "notch": True, "parentId": "base"}
+        entities = [base, reversed_side, notch]
+        ids = ["base", "side"]
+
+        self.assertEqual(edit_design(entities, "offset-anchor", {"ids": ids, "anchorId": "base"}),
+                         {"normalSign": 1, "closed": False})
+        self.assertEqual(edit_design(entities, "offset-anchor", {"ids": ids, "anchorId": "side"}),
+                         {"normalSign": -1, "closed": False})
+
+        result = edit_design(entities, "offset", {"ids": ids, "distance": 2, "keepOriginal": True})
+        offset_id, = result["selectedIds"]
+        self.assertEqual(result["originalIds"], ids)
+        self.assertEqual(result["entities"][:3], [{**entity, "reference": True} for entity in entities])
+        outline, new_notch = result["entities"][3:]
+        self.assertEqual(outline["id"], offset_id)
+        self.assertEqual(outline["groupPath"], group)
+        self.assertEqual(outline["points"], [[0, 2], [8, 2], [8, 10]])
+        self.assertFalse(outline["closed"])
+        self.assertEqual(new_notch["parentId"], offset_id)
+        self.assertNotIn("reference", new_notch)
+        self.assertEqual(len(prepare_design(result["entities"])["paths"]), 2)
+
+    def test_offset_closed_chain_anchor_points_outward_and_negative_is_inward(self):
+        edges = square_edges("edge")
+        edges[1]["start"], edges[1]["end"] = edges[1]["end"], edges[1]["start"]
+        ids = [edge["id"] for edge in edges]
+        for anchor, sign in ((ids[0], -1), (ids[1], 1)):
+            self.assertEqual(edit_design(edges, "offset-anchor", {"ids": ids, "anchorId": anchor}),
+                             {"normalSign": sign, "closed": True})
+        for distance, bounds in ((2, (-2, -2, 22, 22)), (-2, (2, 2, 18, 18))):
+            with self.subTest(distance=distance):
+                result = edit_design(edges, "offset", {"ids": ids, "distance": distance, "keepOriginal": False})
+                contour, = result["entities"]
+                self.assertTrue(contour["closed"])
+                self.assertEqual(LineString(contour["points"]).bounds, bounds)
+
+    def test_offset_chain_refuses_branches_gaps_and_mixed_groups(self):
+        base = line("base", [0, 0], [10, 0])
+        side = line("side", [10, 0], [10, 10])
+        branch = line("branch", [10, 0], [20, 0])
+        gap = {**side, "start": [10, 0.01]}
+        grouped = {**side, "groupPath": ["other"]}
+        crossed = [base, line("diagonal", [10, 0], [0, 10]), line("across", [0, 10], [0, -5])]
+        for entities in ([base, side, branch], [base, gap], [base, grouped], crossed):
+            with self.subTest(ids=[entity["id"] for entity in entities]):
+                options = {"ids": [entity["id"] for entity in entities], "anchorId": "base", "distance": 2}
+                with self.assertRaises(CadDesignError):
+                    edit_design(entities, "offset-anchor", options)
+                with self.assertRaises(CadDesignError):
+                    edit_design(entities, "offset", options)
 
     def test_offset_keeps_analytic_arc_and_directed_straight_line(self):
         arc = {"id": "arc", "type": "arc", "center": [2, 3], "radius": 5, "startAngle": 10, "sweep": -120}

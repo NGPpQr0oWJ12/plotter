@@ -64,6 +64,7 @@ class DemoController:
         self._lock = RLock()
         self._limits = {"x": (0, width), "y": (0, height), "z": (-20, 20), "w": (-360, 360)}
         self._position = dict.fromkeys(AXES, 0.0)
+        self._material_offset_mm = 0.0
         self._zero = (0.0, 0.0)
         self._updated = monotonic()
         self._control = None
@@ -329,6 +330,17 @@ class DemoController:
 
     def _xy(self):
         return self._position["x"], self._position["y"]
+
+    def advance_material(self, distance_mm, *, control_token):
+        with self._lock:
+            self.require_control(control_token)
+            self._motion_idle()
+            self._require_clearance()
+            maximum = self._limits["x"][1]
+            if type(distance_mm) not in (int, float) or not 0 < distance_mm <= maximum:
+                raise ControllerError(f"Укажите положительную длину протяжки до {maximum:g} мм.")
+            self._material_offset_mm += distance_mm
+            return {"feedMm": distance_mm, "materialOffsetMm": self._material_offset_mm}
 
     def _move_to(self, x, y):
         self._require_clearance()

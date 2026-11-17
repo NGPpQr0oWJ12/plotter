@@ -80,12 +80,26 @@
 .registry-tree, .registry-body { min-width: 0; padding: 10px; }
 .registry-tree { display: flex; flex-direction: column; align-items: stretch; gap: 3px; border-inline-end: 1px solid #bfbfbf; background: #f4f4f4; }
 .registry-tree .button { justify-content: flex-start; min-height: 43px; border-color: transparent; background: transparent; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.registry-folder-list { min-width: 0; margin: 0; padding: 0; list-style: none; }
+.registry-tree-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: center; padding-inline-start: var(--folder-indent, 0); }
+.registry-tree-row .button { min-width: 0; padding-inline: 6px; }
+.registry-tree .registry-folder-toggle { justify-content: center; width: 36px; min-height: 36px; padding: 0; }
+.registry-folder-toggle[aria-expanded="true"] .icon { transform: rotate(90deg); }
+.registry-location { margin: 2px 0 10px; font-weight: 700; overflow-wrap: anywhere; }
+.registry-body > .workplace-field { margin-bottom: 8px; }
 .registry-entry { display: flex; align-items: center; gap: 13px; font-size: 17px; }
-.registry-entry .registry-icon { width: 22px; height: 22px; }
+.registry-entry .registry-icon { width: 22px; height: 22px; color: var(--registry-type-color, #545454); }
+.registry-entry[data-kind="part"] { --registry-type-color: #174d76; --registry-type-bg: #e7f1fa; }
+.registry-entry[data-kind="kit"] { --registry-type-color: #643783; --registry-type-bg: #f0e8f8; }
+.registry-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; }
+.registry-kind { padding: 2px 7px; border-radius: 4px; background: var(--registry-type-bg, #ededed); color: var(--registry-type-color, #454545); font-size: 12px; font-weight: 700; }
+.registry-row-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.registry-row-actions .button { min-height: 38px; padding: 6px 10px; font-size: 13px; white-space: normal; }
+.registry-delete { color: #901f31; }
+.registry-delete:hover { background: #fff2f3; }
+.registry-property-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .registry-row small, .workplace-pick-row small { display: block; margin-top: 3px; color: #4b4b4b; font-size: 14px; }
-.registry-body > input, .workplace-picker > input { width: 100%; margin-bottom: 8px; }
-.workplace-picker > label { margin-bottom: 8px; }
-.registry-body > input, .workplace-picker > input, .workplace-field input:not([type="checkbox"]), .workplace-field select, .workplace-field textarea, .workplace-pick-row input[type="number"] { min-width: 0; max-width: 100%; min-height: 43px; padding: 7px 11px; border: 1px solid #aaa; border-radius: 4px; background: #fff; color: #171717; font: inherit; }
+.workplace-field input:not([type="checkbox"]), .workplace-field select, .workplace-field textarea, .workplace-pick-row input[type="number"] { min-width: 0; max-width: 100%; min-height: 43px; padding: 7px 11px; border: 1px solid #aaa; border-radius: 4px; background: #fff; color: #171717; font: inherit; }
 .workplace-date-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .workplace-field textarea { resize: vertical; }
 .workplace-field { display: grid; gap: 5px; font-size: 15px; }
@@ -93,7 +107,17 @@
 .workplace-dialog input[type="checkbox"] { accent-color: #171717; }
 .workplace-form-note { margin: 0; color: #4b4b4b; font-size: 14px; }
 .workplace-picker-results { max-height: 330px; overflow: auto; }
+.workplace-picker-browser { display: grid; gap: 8px; min-width: 0; }
 .workplace-pick-row { display: grid; grid-template-columns: auto 1fr 5em; align-items: center; gap: 9px; padding: 7px 0; overflow-wrap: anywhere; }
+.workplace-dialog:has(.registry-kit-picker) { width: min(820px, calc(100% - 24px)); }
+.registry-kit-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; border-top: 1px solid #ddd; padding-top: 12px; }
+.registry-kit-picker h3 { margin: 0; font-size: 16px; }
+.registry-kit-choice { grid-template-columns: auto minmax(0, 1fr); }
+.registry-picked { min-width: 0; padding: 10px; border: 1px solid #d7cae4; border-radius: 5px; background: #faf7fd; }
+.registry-picked > small { display: block; margin-top: 4px; }
+.registry-picked-list { max-height: 330px; overflow: auto; }
+.registry-picked-row { grid-template-columns: minmax(0, 1fr) 4.5em auto; }
+.registry-picked-row .button { min-height: 36px; padding-inline: 7px; font-size: 13px; }
 .workplace-empty { color: #4b4b4b; margin: 6px 0; padding: 12px; }
 .workplace-status, .workplace-dock-error, .workplace-dialog-error { margin: 0; color: #171717; font-weight: 650; }
 .workplace-status:not(:empty) { position: fixed; z-index: 5; bottom: 16px; inset-inline: 16px; padding: 11px; border: 1px solid #171717; border-radius: 4px; background: #171717; color: #fff; }
@@ -108,7 +132,7 @@ body:has(.workplace-page:not([hidden])) { display: grid; grid-template-rows: aut
 .workplace-dock { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .workplace-dock strong { margin-inline-end: auto; overflow-wrap: anywhere; }
 .workplace-dock-error { font-size: 14px; }
-#layout-workplace:is([data-mode="design"], [data-mode="preview"]) :is(.motion-panel, #launch-controls, #xiao-handoff) { display: none; }
+#layout-workplace:is([data-mode="design"], [data-mode="preview"], [data-mode="kit"]) :is(.motion-panel, #launch-controls, #xiao-handoff) { display: none; }
 @media (max-width: 1050px) {
   .workplace-card { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .workplace-card > button { justify-self: start; }
@@ -119,5 +143,6 @@ body:has(.workplace-page:not([hidden])) { display: grid; grid-template-rows: aut
   .role-choice .role-choice-icon { width: 34px; height: 34px; margin-bottom: 8px; }
   .registry-columns { grid-template-columns: minmax(0, 1fr); }
   .registry-tree { max-height: 200px; overflow: auto; border-inline-end: 0; border-bottom: 1px solid #bfbfbf; }
+  .registry-kit-picker { grid-template-columns: minmax(0, 1fr); }
   .workplace-page .cad-editor .cad-icon-button { min-height: 34px; }
 }

@@ -44,6 +44,106 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(WorkspaceConflict):
             self.store.save_registry({**self.model, "name": "Старая вкладка"})
 
+    def test_registry_move_preserves_content_and_delete_respects_history(self):
+        with self.assertRaises(WorkspaceConflict):
+            self.store.delete_registry(self.folder)
+        with self.assertRaises(WorkspaceConflict):
+            self.store.delete_registry(self.part)
+        with self.assertRaises(ValueError):
+            self.store.save_registry({"action": "move", "id": self.model["id"], "revision": self.model["revision"],
+                                      "parent": self.folder["id"]})
+
+        moved = self.store.save_registry({"action": "move", "id": self.kit["id"], "revision": self.kit["revision"],
+                                          "parent": self.folder["id"]})
+        self.assertEqual(moved["members"], self.kit["members"])
+        self.assertEqual(moved["name"], self.kit["name"])
+        self.assertEqual(moved["parent"], self.folder["id"])
+        with self.assertRaises(WorkspaceConflict):
+            self.store.delete_registry(self.kit)
+
+        cut_id = self.add_cut("Велюр")
+        with self.store.connect() as db:
+            before = self.store.find_workspace(db, cut_id, "design")
+        self.store.delete_order(self.order)
+        with self.assertRaises(WorkspaceConflict):
+            self.store.delete_registry(moved)
+        with self.store.connect() as db:
+            self.assertEqual(self.store.find_workspace(db, cut_id, "design"), before)
+
+        loose = self.store.save_registry({"kind": "folder", "name": "Пусто"})
+        model = self.store.save_registry({"action": "move", "id": self.model["id"], "revision": self.model["revision"],
+                                          "parent": loose["id"]})
+        self.assertTrue(model["model"])
+        leaf = self.store.save_registry({"kind": "folder", "name": "Удалить", "parent": self.model["id"]})
+        self.assertEqual(self.store.delete_registry(leaf), {"id": leaf["id"], "deleted": True})
+        with self.assertRaises(RecordNotFound):
+            self.store.registry(leaf["id"])
+
+    def test_saved_kit_layout_seeds_only_matching_new_materials_as_independent_copies(self):
+        old_cut = self.add_cut("До сохранения")
+        before = self.store.workspace(old_cut, "design")
+        draft = self.store.kit_layout(self.kit["id"], 1500, 2)
+        self.assertEqual((draft["revision"], draft["saved"], draft["valid"], draft["name"]),
+                         (0, False, False, self.kit["name"]))
+        for path in draft["workspace"]["paths"]:
+            path["points"] = [[60 * path["partNumber"] - y, x + 10] for x, y in path["points"]]
+            path["partAngle"] = 90
+        saved = self.store.save_kit_layout(draft, verify_arrangement)
+        self.assertEqual((saved["revision"], saved["valid"]), (1, True))
+        self.assertEqual(self.store.registry(self.kit["id"])["layouts"],
+                         [{"widthMm": 1500, "quantity": 2, "revision": 1, "valid": True}])
+        with self.assertRaises(WorkspaceConflict):
+            self.store.save_kit_layout(draft, verify_arrangement)
+        self.assertEqual(self.store.workspace(old_cut, "design"), before)
+
+        seeded_id = self.add_cut("Точное совпадение")
+        seeded = self.store.workspace(seeded_id, "design")
+        self.assertTrue(self.order["cuts"][-1]["prepared"])
+        self.assertEqual(seeded["workspace"]["paths"], saved["workspace"]["paths"])
+        self.assertEqual(seeded["workspace"]["source"]["filename"], f"cut-{seeded_id}.dxf")
+        for path in saved["workspace"]["paths"]:
+            path["points"] = [[x, y + 20] for x, y in path["points"]]
+        changed = self.store.save_kit_layout(saved, verify_arrangement)
+        self.assertEqual(changed["revision"], 2)
+        self.assertEqual(self.store.workspace(seeded_id, "design"), seeded)
+
+        for width, members in ((1400, [self.member(self.kit)]), (1500, [self.member(self.kit, 2)]),
+                               (1500, [self.member(self.kit), self.member(self.part)])):
+            self.order = self.store.save_cut({"action": "save-cut", "orderId": self.order["id"],
+                                              "orderRevision": self.order["revision"], "name": "Другой материал",
+                                              "widthMm": width, "members": members})
+            material = self.order["cuts"][-1]
+            self.assertFalse(material["prepared"])
+            default = self.store.workspace(material["id"], "design")["workspace"]
+            self.assertEqual(default["paths"][0]["points"], before["workspace"]["paths"][0]["points"])
+
+    def test_kit_layout_rejects_changed_geometry_and_invalidates_after_source_edit(self):
+        draft = self.store.kit_layout(self.kit["id"], 1500, 2)
+        for path in draft["workspace"]["paths"]:
+            path["points"] = [[x + 50 * path["partNumber"], y] for x, y in path["points"]]
+        first = draft["workspace"]["paths"][0]
+        first["points"][1][0] += 1
+        with self.assertRaises(ValueError):
+            self.store.save_kit_layout(draft, verify_arrangement)
+        first["points"][1][0] -= 1
+        saved = self.store.save_kit_layout(draft, verify_arrangement)
+        cut_id = self.add_cut("Сохранённый состав")
+        before = self.store.workspace(cut_id, "design")
+
+        part = self.store.save_registry({**self.part, "name": "Новое название"})
+        self.assertTrue(self.store.kit_layout(self.kit["id"], 1500, 2)["valid"])
+        changed = {**part["entities"][0], "points": [[0, 0], [45, 0], [45, 30], [0, 30]]}
+        self.store.save_registry({**part, "entities": [changed]})
+        with self.assertRaises(WorkspaceConflict):
+            self.store.save_kit_layout(saved, verify_arrangement)
+        stale = self.store.kit_layout(self.kit["id"], 1500, 2)
+        self.assertEqual((stale["saved"], stale["valid"], stale["revision"]), (True, False, 1))
+        self.assertFalse(self.store.registry(self.kit["id"])["layouts"][0]["valid"])
+        self.assertNotEqual(stale["workspace"]["source"]["filename"], saved["workspace"]["source"]["filename"])
+        self.add_cut("Новый размер детали")
+        self.assertFalse(self.order["cuts"][-1]["prepared"])
+        self.assertEqual(self.store.workspace(cut_id, "design"), before)
+
     def test_snapshots_operator_progress_demo_and_reopen(self):
         first, second = self.add_cut("Основная ткань"), self.add_cut("Подкладка")
         self.assertEqual(self.store.orders(published_only=True), {"orders": []})

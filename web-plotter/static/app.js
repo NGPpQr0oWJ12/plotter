@@ -45,7 +45,8 @@ let workplaces = null;
 let hardwareCutId = null;
 const layoutVisible = () => !$("layout-workplace").hidden;
 const layoutReadOnly = () => managedCut?.mode === "preview" || managedCut?.mode === "operator" && managedCut?.status === "done";
-const layoutPreparation = () => managedCut?.mode === "design" || managedCut?.mode === "preview";
+const kitLayout = () => managedCut?.mode === "kit";
+const layoutPreparation = () => kitLayout() || managedCut?.mode === "design" || managedCut?.mode === "preview";
 const systemRoutes = new Set(["/api/app-update", "/api/release-notes"]);
 let centralMode = false;
 let companionConnected = false;
@@ -491,7 +492,7 @@ async function applyAppUpdate() {
   $("release-notes-dialog").close();
   renderAppUpdate();
   try {
-    if (workspaceChange !== workspaceSaved && !await persistWorkspace()) {
+    if (workspaceChange !== workspaceSaved && (kitLayout() || !await persistWorkspace())) {
       throw new Error("Сохраните рабочую область перед обновлением.");
     }
     if (!appUpdateSafe() || workspaceChange !== workspaceSaved) {
@@ -691,7 +692,7 @@ function openCanvasSection(page) {
     updateCanvasSection();
   }
   if (section.page.number === page) resizeCamera();
-  scheduleWorkspaceSave();
+  scheduleWorkspaceSave({ viewOnly: true });
   return true;
 }
 
@@ -963,7 +964,7 @@ function resizeCamera({ keepView = false } = {}) {
 function fitCamera(mode = "work") {
   cameraMode = mode;
   resizeCamera();
-  scheduleWorkspaceSave();
+  scheduleWorkspaceSave({ viewOnly: true });
 }
 
 function hasRollLayout() {
@@ -989,7 +990,7 @@ function zoom(factor, px = 0.5, py = 0.5, deferPaint = false) {
   };
   if (deferPaint) scheduleCameraDraw();
   else drawCamera();
-  scheduleWorkspaceSave();
+  scheduleWorkspaceSave({ viewOnly: true });
 }
 
 function screenFraction(event) {
@@ -1404,7 +1405,8 @@ function translatePath(path, dx, dy) {
 
 function drawingLocked() {
   return layoutReadOnly() || restoringWorkspace || isLoading || nestRequest !== null || contourRepair !== null || appUpdate?.state === "restarting"
-    || ["upload", "cut", "new-cut", "open-layout"].includes(pendingCommand) || (!layoutPreparation() && runInProgress());
+    || ["upload", "cut", "advance-roll", "new-cut", "open-layout", "save-kit-layout"].includes(pendingCommand)
+    || (!layoutPreparation() && runInProgress());
 }
 
 function placementPreviewActive() {
@@ -1496,6 +1498,7 @@ function applyPlacement(id) {
   if (id === "offset-y") moveSelection(0, value - minY);
   if (id === "rotation") rotateSelectionBy(value - (selectedAngle() ?? 0));
   if (id === "size-width" || id === "size-height") {
+    if (kitLayout()) return;
     const current = id === "size-width" ? maxY - minY : maxX - minX;
     if (value < 0.001 || current < 0.001) {
       notifyError("Введите размер от 0,001 мм.");
@@ -1509,7 +1512,7 @@ function applyPlacement(id) {
 }
 
 function deleteSelection() {
-  if (!selection.size || drawingLocked() || !drawingPartsReady) return;
+  if (kitLayout() || !selection.size || drawingLocked() || !drawingPartsReady) return;
   cancelCanvasGesture();
   rememberDrawing("удаление");
   const remaining = [];
@@ -1526,7 +1529,7 @@ function deleteSelection() {
 }
 
 function toggleSelectionExcluded() {
-  if (!selection.size || drawingLocked() || !drawingPartsReady) return;
+  if (kitLayout() || !selection.size || drawingLocked() || !drawingPartsReady) return;
   const restore = [...selection].every((index) => excluded.has(index));
   rememberDrawing(restore ? "возврат контуров" : "исключение");
   excluded = new Set(excluded);
@@ -2184,7 +2187,7 @@ function matchesContourRepair(snapshot) {
 }
 
 function contourCheckAvailable() {
-  return !drawingLocked() && !busy() && !live.stopAvailable
+  return !kitLayout() && !drawingLocked() && !busy() && !live.stopAvailable
     && activeRun?.state !== "transferring" && !xiaoHandoff && placed.length > excluded.size;
 }
 
@@ -2299,12 +2302,12 @@ function defaultFabricWidthMm() {
 
 function applyNestingSettings() {
   const width = $("nest-width");
-  width.readOnly = managedCut?.mode === "design";
+  width.readOnly = kitLayout() || managedCut?.mode === "design";
   width.max = String(machine.height);
   width.placeholder = String(defaultFabricWidthMm());
   const savedWidth = nestingSettings?.widthMm;
   const oldDefault = nestingSettings?.widthExplicit == null && savedWidth === machine.height;
-  width.value = !oldDefault && savedWidth != null ? savedWidth : defaultFabricWidthMm();
+  width.value = kitLayout() ? managedCut.widthMm : !oldDefault && savedWidth != null ? savedWidth : defaultFabricWidthMm();
   $("nest-length").value = nestingSettings?.lengthMm ?? "";
   $("nest-gap").value = nestingSettings?.gapMm ?? 10;
   $("nest-margin").value = nestingSettings?.marginMm ?? 10;
@@ -2492,8 +2495,13 @@ function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
   };
 }
 
-function scheduleWorkspaceSave() {
+function scheduleWorkspaceSave({ viewOnly = false } = {}) {
   if (layoutReadOnly() || restoringWorkspace || pendingCommand === "new-cut" || !source) return;
+  if (kitLayout()) {
+    if (!viewOnly) workspaceChange++;
+    renderKitSave();
+    return;
+  }
   workspaceChange++;
   clearTimeout(saveTimer);
   if (workspaceRevision === null) return;
@@ -2501,6 +2509,12 @@ function scheduleWorkspaceSave() {
 }
 
 function writeWorkspace(workspace, partCorrection = false) {
+  if (kitLayout()) {
+    const { kitId: id, widthMm, quantity } = managedCut;
+    return getJson("/api/registry", jsonRequest({
+      action: "save-kit-layout", id, widthMm, quantity, revision: workspaceRevision, workspace,
+    }, AbortSignal.timeout(30_000)));
+  }
   return getJson(managedCut ? "/api/operator-workspace" : "/api/workspace", jsonRequest({
     revision: workspaceRevision, workspace,
     ...(managedCut ? { action: "save", cutId: managedCut.id, mode: managedCut.mode } : {}),
@@ -2518,7 +2532,9 @@ function persistWorkspace() {
       while (workspaceSaved !== workspaceChange) {
         const change = workspaceChange;
         const response = await writeWorkspace(workspaceSnapshot());
-        if (managedCut) {
+        if (kitLayout()) {
+          managedCut.saved = true;
+        } else if (managedCut) {
           if (managedCut.cutRevision !== response.cutRevision) resetCutPlan({ keepView: true });
           managedCut.cutRevision = response.cutRevision;
         }
@@ -2529,13 +2545,36 @@ function persistWorkspace() {
       return true;
     } catch (error) {
       if (error.status === 409) workspaceRevision = null;
-      setSaveError(error.status === 409 ? "Другая вкладка сохранила правки. Перезагрузите страницу." : "Не сохранено: " + messageFrom(error));
+      setSaveError(kitLayout() || error.status !== 409 ? "Не сохранено: " + messageFrom(error)
+        : "Другая вкладка сохранила правки. Перезагрузите страницу.");
       return false;
     } finally {
       savePromise = null;
     }
   })();
   return savePromise;
+}
+
+function renderKitSave() {
+  const button = $("kit-layout-save");
+  const visible = kitLayout() && layoutVisible();
+  updateControl(button, "hidden", !visible);
+  if (!visible) return;
+  const saving = pendingCommand === "save-kit-layout";
+  const saved = managedCut.saved && workspaceChange === workspaceSaved;
+  updateText(button, saving ? "Сохраняем…" : saved ? "Раскладка сохранена" : "Сохранить раскладку");
+  updateControl(button, "disabled", saved || busy() || drawingLocked() || workspaceRevision === null || !drawingPartsReady);
+}
+
+async function saveKitLayout() {
+  if (!kitLayout() || $("kit-layout-save").disabled || drag) return;
+  if (workspaceChange === workspaceSaved) workspaceChange++;
+  setPending("save-kit-layout");
+  try {
+    await persistWorkspace();
+  } finally {
+    setPending(null);
+  }
 }
 
 function applyWorkspace(response) {
@@ -2623,7 +2662,7 @@ function requestCutPlan() {
     const promise = (async () => {
     try {
       const plan = await getJson("/api/cut-plan", jsonRequest({
-        job: { ...buildJob(), ...(managedCut ? { cutContext: [managedCut.id, managedCut.cutRevision] } : {}) },
+        job: { ...buildJob(), ...(managedCut && !kitLayout() ? { cutContext: [managedCut.id, managedCut.cutRevision] } : {}) },
         filename: source.filename,
       }, AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])), !layoutPreparation());
       if (epoch !== cutPlanEpoch) return null;
@@ -2901,6 +2940,7 @@ async function toggleDemoMode() {
 }
 
 function operationAllowed(action, allowPending = false) {
+  if (kitLayout()) return false;
   if (action === "cancel-cut") {
     const observedStop = live.stopAvailable ?? runInProgress();
     const canStop = activeRun?.state !== "cancelling"
@@ -2936,6 +2976,8 @@ function uploadPageNumber(plan = cutPlan) {
 }
 
 function needsPagePositionConfirmation(page) {
+  if (demoMode && machine.automaticRollFeed === true && controllerRoll?.materialAdvanced
+      && controllerRoll.planId === cutPlan?.planId && controllerRoll.nextPage === page) return false;
   return Boolean(page && (cutPlan?.hasContinuations || controllerRoll?.state === "advance" || !controllerRoll && page > 1));
 }
 
@@ -2973,8 +3015,14 @@ function renderPagePicker(plan, roll, disabled) {
   updateCanvasSection();
 }
 
-function uploadAllowed() {
+function waitingForAutomaticAdvance() {
+  return demoMode && machine.automaticRollFeed === true && controllerRoll?.state === "advance"
+    && controllerRoll.planId === cutPlan?.planId && !controllerRoll.materialAdvanced;
+}
+
+function uploadAllowed({ forAdvance = false } = {}) {
   if (layoutPreparation() || layoutReadOnly()) return false;
+  if (waitingForAutomaticAdvance() && !forAdvance) return false;
   const autoRunOff = machine.autoRunReadback === true ? live.autoRunOff === true
     : needsManualAutoRunConfirmation() && live.autoRunOff !== false && $("manual-auto-run-off").checked;
   return machine.verifiedJobUpload === true && controlActive() && autoRunOff
@@ -3005,13 +3053,14 @@ function renderLayoutStatistics() {
 
 function renderSelectionControls(importing) {
   const editing = selectedBounds && !importing && drawingPartsReady;
-  for (const id of [...placementFields, "rotate-button", "exclude-button", "delete-button"]) {
+  for (const id of ["offset-x", "offset-y", "rotation", "rotate-button"]) {
     updateControl($(id), "disabled", !editing);
   }
-  if (editing) {
-    updateControl($("size-width"), "disabled", selectedBounds.maxY - selectedBounds.minY < 0.001);
-    updateControl($("size-height"), "disabled", selectedBounds.maxX - selectedBounds.minX < 0.001);
-  }
+  const editGeometry = editing && !kitLayout();
+  updateControl($("size-width"), "disabled", !editGeometry || selectedBounds.maxY - selectedBounds.minY < 0.001);
+  updateControl($("size-height"), "disabled", !editGeometry || selectedBounds.maxX - selectedBounds.minX < 0.001);
+  updateControl($("exclude-button"), "disabled", !editGeometry);
+  updateControl($("delete-button"), "disabled", !editGeometry);
   updateControl($("measure-tool"), "disabled", importing || !placed.length);
   renderHistoryControls(importing);
 }
@@ -3029,6 +3078,7 @@ function renderHistoryControls(importing = drawingLocked()) {
 
 function renderControls() {
   renderAppUpdate();
+  renderKitSave();
   const armed = controlActive();
   const locked = busy();
   const importing = drawingLocked();
@@ -3064,8 +3114,8 @@ function renderControls() {
   if (nestDialog.open || optimizeDialog.open) updateOptimizationControls();
 
   const armButton = $("arm-button");
-  updateControl(armButton, "disabled", armed ? Boolean(activeHold) || ["arm", "new-cut"].includes(pendingCommand)
-    : locked || !live.responded || live.busy || (!live.positionFresh && !inProgress));
+  updateControl(armButton, "disabled", kitLayout() || (armed ? Boolean(activeHold) || ["arm", "new-cut"].includes(pendingCommand)
+    : locked || !live.responded || live.busy || (!live.positionFresh && !inProgress)));
   updateText(armButton, pendingCommand === "arm" ? "Включаем…" : armed ? "Отключить управление" : "Включить управление");
   armButton.classList.toggle("armed", armed);
   updateAttribute(armButton, "aria-pressed", String(armed));
@@ -3109,6 +3159,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateControl($("simulation-button"), "disabled", (importing && !layoutReadOnly()) || partMoving || stopPending || Boolean(currentUpload) || Boolean(jobError)
     || planPending || !includedBounds || Boolean(cutPlan && !cutPlan.pages.length));
   const uploadButton = $("controller-upload-button");
+  const advanceButton = $("roll-advance-button");
   const roll = controllerRoll?.planId === displayedPlan?.planId ? controllerRoll : null;
   renderPagePicker(displayedPlan, roll, importing || partMoving || !cutPlan || locked || Boolean(currentUpload));
   const directRoll = cutPlan?.mode === "roll" && cutPlan.canUpload && machine.directRoll === true;
@@ -3131,9 +3182,13 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateText(uploadButton.querySelector("span"), transferring ? "Загрузка…" : "Старт");
   const canDownloadXiao = !jobError && cutPlan?.canPrepareXiao === true;
   const useXiao = canDownloadXiao && !currentUpload && !cutPlan.canUpload;
+  const showAdvance = waitingForAutomaticAdvance() && !jobActive && !layoutPreparation() && !layoutReadOnly();
+  updateControl(advanceButton, "hidden", !showAdvance);
+  updateControl(advanceButton, "disabled", !showAdvance || !uploadAllowed({ forAdvance: true }));
+  updateText(advanceButton, pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход");
   updateControl(uploadButton, "hidden", (!visibleUploadPage && !currentUpload && !transferring)
-    || jobActive || ["cut", "new-cut"].includes(pendingCommand));
-  updateControl($("job-prepare-actions"), "hidden", uploadButton.hidden);
+    || showAdvance || jobActive || ["cut", "new-cut"].includes(pendingCommand));
+  updateControl($("job-prepare-actions"), "hidden", uploadButton.hidden && advanceButton.hidden);
   const xiaoOpen = $("prepare-xiao-open");
   const xiaoDownload = $("prepare-xiao-download");
   const showXiaoOpen = !demoMode && machine.xiaoAvailable && displayedPlan?.canPrepareXiao && !displayedPlan.canUpload;
@@ -3164,6 +3219,8 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (roll?.state === "completed") status = `Раскрой завершён · ${roll.completedPages} из ${roll.pages - (roll.firstPage ?? 1) + 1} проходов`;
   else if (cutProgress?.state === "completed" && cutProgress.planId === cutPlan.planId) status = "Раскрой завершён";
   else if (roll?.state === "cancelled" || roll?.state === "unknown") status = `Сверьте проход ${roll.page} и положение ткани перед продолжением.`;
+  else if (waitingForAdvance && showAdvance) status = `Проход ${roll.page} завершён. Протяжка на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
+  else if (waitingForAdvance && roll.materialAdvanced) status = `Полотно подтянуто. Проход ${roll.nextPage} готов к запуску.`;
   else if (waitingForAdvance) status = `Проход ${roll.page} завершён. Следующий проход — ${roll.nextPage}.`;
   else if (useXiao && cutPlan.uploadIssue) status = cutPlan.uploadIssue;
   else if (useXiao && demoMode) status = "Раскладка доступна для скачивания в DXF.";
@@ -3795,6 +3852,25 @@ async function uploadControllerDrawing(intent) {
   }
 }
 
+async function advanceControllerRoll() {
+  if (!focused() || !waitingForAutomaticAdvance() || !uploadAllowed({ forAdvance: true })) return;
+  const { planId, nextPage: page } = controllerRoll;
+  const payload = { action: "advance-roll", planId, page, controlToken: control.token,
+    ...(managedCut ? { cutId: managedCut.id } : {}) };
+  setPending("advance-roll");
+  try {
+    const result = await getJson("/api/controller-operation", jsonRequest(payload, AbortSignal.timeout(8000)));
+    if (result.roll?.planId !== planId || result.roll.nextPage !== page || result.roll.materialAdvanced !== true) {
+      throw new Error("Протяжка не подтверждена.");
+    }
+    applyJobStatus(result);
+  } catch (error) {
+    setMachineError(messageFrom(error));
+  } finally {
+    setPending(null);
+  }
+}
+
 function canResetControllerRoll() {
   const button = $("roll-reset");
   return Boolean(controllerRoll && !button.hidden && !button.disabled && controlActive() && focused());
@@ -4026,7 +4102,7 @@ $("optimize-route").addEventListener("change", updateOptimizationControls);
 $("optimize-join").addEventListener("change", updateOptimizationControls);
 
 function previewContourJoin() {
-  if (!$("optimize-join").checked) return null;
+  if (kitLayout() || !$("optimize-join").checked) return null;
   if (contourJoinPreview?.epoch !== cutPlanEpoch) {
     contourJoinPreview = { epoch: cutPlanEpoch, result: joinTouchingContours(included()) };
   }
@@ -4073,6 +4149,7 @@ function updateOptimizationControls() {
   const locked = drawingLocked();
   const outdated = Number.isInteger(machine.apiVersion) && machine.apiVersion < 14;
   if (optimizeDialog.open) {
+    updateControl($("optimize-join"), "disabled", kitLayout());
     const join = locked ? null : previewContourJoin();
     const routeChanged = !outdated && $("optimize-route").checked !== routeApplied;
     const canApply = !locked && placed.length > excluded.size && (routeChanged || Boolean(join?.joined));
@@ -4125,6 +4202,7 @@ $("canvas-import").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", (event) => void loadDrawing(event.target.files[0]));
 $("toast-close").addEventListener("click", () => { $("toast").hidden = true; });
 $("new-cut-button").addEventListener("click", openNewCutDialog);
+$("kit-layout-save").addEventListener("click", () => void saveKitLayout());
 $("app-update").addEventListener("click", () => void applyAppUpdate());
 $("release-notes-button").addEventListener("click", () => void openReleaseNotes());
 $("release-notes-dialog").addEventListener("close", () => {
@@ -4158,6 +4236,7 @@ rollResetDialog.addEventListener("close", () => {
   if (rollResetDialog.returnValue === "confirm") void resetControllerRoll(intent);
 });
 $("controller-upload-button").addEventListener("click", requestControllerLaunch);
+$("roll-advance-button").addEventListener("click", advanceControllerRoll);
 $("upload-confirm-cancel").addEventListener("click", closeUploadConfirmation);
 uploadConfirmDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
@@ -4234,7 +4313,7 @@ window.addEventListener("pagehide", () => {
 });
 window.addEventListener("beforeunload", (event) => {
   if (workspaceChange !== workspaceSaved) {
-    void persistWorkspace();
+    if (!kitLayout()) void persistWorkspace();
     event.preventDefault();
     event.returnValue = "";
   }
@@ -5155,7 +5234,7 @@ svg.addEventListener("pointerup", (event) => {
   const committing = !drawingLocked() && (gesture.type === "rotate" ? Boolean(gesture.angle) : gesture.offset?.some(Boolean));
   cancelCanvasGesture({ refreshActions: !committing });
   if (gesture.type === "pan") {
-    scheduleWorkspaceSave();
+    scheduleWorkspaceSave({ viewOnly: true });
     return;
   }
   if (drawingLocked()) return;
@@ -5392,8 +5471,8 @@ async function openLayoutPart(part) {
         validateContext();
         const result = await getJson("/api/cad/paths", jsonRequest({ entities }, AbortSignal.timeout(30_000)));
         validateContext();
-        if (!result.paths.some(path => path.closed && !path.notch)) {
-          throw new Error(`${name}: нужен хотя бы один замкнутый контур. Проверьте стыки или нажмите «Восстановить деталь».`);
+        if (!result.paths.some(path => !path.notch)) {
+          throw new Error(`${name}: оставьте хотя бы один контур реза.`);
         }
         const indices = new Set(part.indices);
         const allExcluded = part.indices.every(index => excluded.has(index));
@@ -5455,8 +5534,20 @@ async function navigateLayout(next, { resume = false } = {}) {
   if (busy() || (!resume && layoutVisible() && !layoutPreparation() && runInProgress())) {
     throw new Error("Дождитесь завершения текущего действия на плоттере.");
   }
-  if (layoutVisible() && !await persistWorkspace() && workspaceChange !== workspaceSaved) {
-    throw new Error("Сохраните изменения текущей раскладки.");
+  if (layoutVisible()) {
+    if (kitLayout()) {
+      if (workspaceChange !== workspaceSaved) {
+        const { confirmAction } = await import("/confirm-action.js");
+        if (!await confirmAction({
+          title: "Закрыть раскладку комплекта?",
+          message: "Изменения раскладки будут потеряны.",
+          confirmLabel: "Закрыть без сохранения",
+          cancelLabel: "Продолжить редактирование",
+        })) return false;
+      }
+    } else if (!await persistWorkspace() && workspaceChange !== workspaceSaved) {
+      throw new Error("Сохраните изменения текущей раскладки.");
+    }
   }
   if (next && ["operator", "demo"].includes(next.mode) && demoMode !== (next.mode === "demo")) {
     await readConfiguration();
@@ -5473,13 +5564,21 @@ async function navigateLayout(next, { resume = false } = {}) {
     if (!next) {
       $("layout-workplace").hidden = true;
       $("workplace-page").hidden = false;
+      if (kitLayout()) {
+        managedCut = null;
+        applyWorkspace({ revision: null, workspace: null });
+        setSaveError();
+      }
       return;
     }
     let response;
     if (next.mode === "operator") await readConfiguration();
     const interactive = ["operator", "demo"].includes(next.mode);
     const oldHardwareCut = hardwareCutId;
-    if (interactive) {
+    if (next.mode === "kit") {
+      const query = new URLSearchParams({ id: next.kitId, mode: "kit-layout", widthMm: next.widthMm, quantity: next.quantity });
+      response = await getJson(`/api/registry?${query}`);
+    } else if (interactive) {
       response = await getJson(workspaceQuery(next.id, next.mode));
       if (response.status !== "done" || next.mode === "demo") {
         response = await getJson("/api/cut-context", jsonRequest({ action: "select", cutId: next.id }));
@@ -5503,7 +5602,9 @@ async function navigateLayout(next, { resume = false } = {}) {
     $("layout-workplace").dataset.mode = response.status === "done" && next.mode === "operator" ? "preview" : next.mode;
     $("layout-workplace").hidden = false;
     $("workplace-page").hidden = true;
-    managedCut = next.id ? { ...next, name: response.name, status: response.status, cutRevision: response.cutRevision } : null;
+    managedCut = next.mode === "kit"
+      ? { ...next, widthMm: response.widthMm, quantity: response.quantity, saved: response.saved && response.valid }
+      : next.id ? { ...next, name: response.name, status: response.status, cutRevision: response.cutRevision } : null;
     if (interactive && oldHardwareCut !== hardwareCutId) {
       clearCurrentUpload();
       activeRun = null;
@@ -5511,7 +5612,8 @@ async function navigateLayout(next, { resume = false } = {}) {
     }
     if (Object.hasOwn(response, "roll")) applyJobStatus(response);
     applyWorkspace(response);
-    setSaveError();
+    setSaveError(kitLayout() && response.saved && !response.valid
+      ? "Состав или чертежи комплекта изменились. Разложите детали заново." : "");
     requestAnimationFrame(() => resizeCamera({ keepView: true }));
     return { ...response, demo: next.mode === "demo" };
   } finally {
@@ -5568,6 +5670,7 @@ async function releaseRegisteredCut() {
 
 void import("/workplaces.js").then(({ mountWorkplaces }) => {
   workplaces = mountWorkplaces({ navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, onExit: disarmControl,
+    layoutWidths: () => ({ defaultWidthMm: defaultFabricWidthMm(), maxWidthMm: machine.height }),
     request: (url, options) => fetch(url, { cache: "no-store", ...options }).then(async response => {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Сервер вернул ошибку ${response.status}.`);

@@ -9,7 +9,7 @@ import ezdxf
 from ezdxf import units
 from shapely import LineString, Polygon
 
-from cad import CadImportError, import_drawing, repair_closed_contours
+from cad import CURVE_TOLERANCE_MM, CadImportError, import_drawing, repair_closed_contours
 
 
 class CadImportTests(unittest.TestCase):
@@ -127,7 +127,7 @@ class CadImportTests(unittest.TestCase):
 
         self.assertEqual([contour["points"] for contour in drawing["paths"]], [shallow_turn, retrace])
 
-    def test_import_reduces_sampled_curves_with_bounded_deviation_and_preserves_native_curves(self):
+    def test_import_reduces_sampled_curves_and_keeps_spline_sampling(self):
         doc = ezdxf.new(units=units.MM)
         model = doc.modelspace()
         sampled = [(round(10 * math.cos(angle), 6), round(10 * math.sin(angle), 6))
@@ -152,7 +152,23 @@ class CadImportTests(unittest.TestCase):
         self.assertLess(len(opened["points"]), len(open_arc))
         self.assertEqual([opened["points"][0], opened["points"][-1]], [list(open_arc[0]), list(open_arc[-1])])
         self.assertLessEqual(LineString(open_arc).hausdorff_distance(LineString(opened["points"])), 0.02)
-        self.assertEqual([len(contour["points"]) for contour in native], [48, 49, 17, 31])
+        for contour, previous in zip(native[:3], [48, 49, 17]):
+            self.assertLessEqual(len(contour["points"]), previous)
+        self.assertEqual(len(native[-1]["points"]), 31)
+
+    def test_import_shallow_arc_uses_fewer_chords_within_the_cut_tolerance(self):
+        doc = ezdxf.new(units=units.MM)
+        arc = doc.modelspace().add_arc((10, 20), radius=2500, start_angle=0, end_angle=3)
+        reference = LineString([(point.x, point.y) for point in arc.vertices(i / 100 for i in range(301))])
+
+        contour, = self.import_document(doc)["paths"]
+        points = contour["points"]
+
+        self.assertFalse(contour["closed"])
+        self.assertLessEqual(len(points) - 1, 24)
+        self.assertEqual(points[0], [2510, 20])
+        self.assertLess(math.dist(points[-1], reference.coords[-1]), 0.000001)
+        self.assertLessEqual(LineString(points).hausdorff_distance(reference), CURVE_TOLERANCE_MM)
 
     def test_import_skips_sampled_curve_approximation_near_another_path(self):
         doc = ezdxf.new(units=units.MM)

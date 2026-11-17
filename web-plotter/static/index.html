@@ -72,6 +72,7 @@
     <div class="topbar-actions">
       <span id="workplace-role" class="workplace-role"></span>
       <span id="workspace-save" class="workspace-save" role="status" hidden></span>
+      <button class="button topbar-secondary" id="kit-layout-save" type="button" hidden>Сохранить раскладку</button>
       <span id="app-update-status" class="visually-hidden" role="status"></span>
       <button class="button topbar-secondary" id="new-cut-button" type="button" hidden disabled>Новый раскрой</button>
       <button class="button topbar-secondary" id="workplace-exit" type="button">Выйти</button>
@@ -216,6 +217,7 @@
                 <input id="manual-auto-run-off" type="checkbox" autocomplete="off" checked><span>Проверить, что Auto Run выключен</span>
               </label>
               <div class="upload-row" id="job-prepare-actions" hidden>
+                <button class="button primary launch-start" id="roll-advance-button" type="button" hidden disabled>Подтянуть следующий проход</button>
                 <button class="button primary launch-start" id="controller-upload-button" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>Старт</span></button>
               </div>
               <input id="job-verified" type="checkbox" autocomplete="off" hidden checked>

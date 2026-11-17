@@ -368,7 +368,10 @@ class _DrawingGeometry:
             return None
 
         points = []
-        for point in vector.flattening(distance=CURVE_TOLERANCE_MM, segments=4):
+        # The conic conversion already splits arcs into short Bézier spans.
+        # Let the chord tolerance drive subdivision, while still sampling spline inflections.
+        minimum_segments = 4 if entity_type == "SPLINE" else 1
+        for point in vector.flattening(distance=CURVE_TOLERANCE_MM, segments=minimum_segments):
             self.point_count += 1
             if self.point_count > MAX_POINTS:
                 raise CadImportError("После построения кривых в чертеже более 250 000 точек.")

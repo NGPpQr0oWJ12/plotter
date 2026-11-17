@@ -11,6 +11,7 @@ function registryIcon(kind) {
     drawing: "M5 3h9l5 5v13H5ZM14 3v6h5m-11 8 3-5 4 5Z",
     part: "M4 7l4-3h9l3 4v12H4ZM4 14h3m10 0h3",
     kit: "m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5",
+    chevron: "m9 6 6 6-6 6",
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("icon", "registry-icon");
@@ -78,9 +79,20 @@ function orderDates(order) {
 }
 
 const ROLE_STORAGE_KEY = "plotter.workplace";
+const REGISTRY_FOLDERS_KEY = "plotter.registry.expandedFolders";
 const roleNames = { operator: "Оператор", designer: "Конструктор" };
 
-export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, openFile, getActiveCut, onExit }) {
+function storedFolders() {
+  try {
+    const values = JSON.parse(sessionStorage.getItem(REGISTRY_FOLDERS_KEY));
+    return new Set(Array.isArray(values) ? values.filter(value => typeof value === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, openFile,
+  getActiveCut, onExit, layoutWidths }) {
   const page = $("workplace-page");
   const dock = $("workplace-dock");
   const picker = $("role-picker");
@@ -93,11 +105,15 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const panel = el("div", "", "workplace-content");
   page.replaceChildren(panel, status);
   const modal = el("dialog", "", "plotter-dialog workplace-dialog");
+  modal.setAttribute("aria-labelledby", "workplace-dialog-title");
   document.body.append(modal);
   let entries = [];
+  let entriesById = new Map();
+  const expandedFolders = storedFolders();
   let tab = null;
   let designerView = "registry";
   let selectedFolder = null;
+  let registrySearch = "";
   let cad = null;
   let selectedOrder = null;
   let currentLayout = null;
@@ -108,21 +124,44 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
   });
   const get = (url, params = {}) => request(`${url}?${new URLSearchParams(params)}`);
-  const find = (id) => entries.find(entry => entry.id === id);
+  const find = (id) => entriesById.get(id);
   const folders = () => entries.filter(entry => entry.kind === "folder");
 
-  function pathOf(entry) {
-    const segments = [entry.name];
-    for (let parent = find(entry.parent); parent; parent = find(parent.parent)) segments.unshift(parent.name);
-    return segments.join(" / ");
+  function trailOf(entry) {
+    const trail = [];
+    const seen = new Set();
+    for (let current = entry; current && !seen.has(current.id); current = find(current.parent)) {
+      seen.add(current.id);
+      trail.push(current);
+    }
+    return trail.reverse();
   }
 
-  function folderSelect(value) {
-    return select([["", "Корень реестра"], ...folders().map(folder => [folder.id, pathOf(folder)])], value);
+  function pathOf(entry) {
+    return entry ? trailOf(entry).map(item => item.name).join(" / ") : "Корень реестра";
+  }
+
+  function rememberFolders() {
+    try { sessionStorage.setItem(REGISTRY_FOLDERS_KEY, JSON.stringify([...expandedFolders])); }
+    catch { /* Expanding folders still works without browser storage. */ }
+  }
+
+  function revealFolder(id) {
+    const trail = trailOf(find(id));
+    if (trail.every(folder => expandedFolders.has(folder.id))) return;
+    for (const folder of trail) expandedFolders.add(folder.id);
+    rememberFolders();
+  }
+
+  function folderSelect(value, moving) {
+    const valid = folders().filter(folder => moving?.kind !== "folder" || !trailOf(folder).some(item => item.id === moving.id));
+    return select([["", "Корень реестра"], ...valid.map(folder => [folder.id, pathOf(folder)])], value);
   }
 
   async function refreshRegistry() {
     entries = (await get("/api/registry")).entries;
+    entriesById = new Map(entries.map(entry => [entry.id, entry]));
+    if (selectedFolder && !find(selectedFolder)) selectedFolder = null;
   }
 
   function execute(action) {
@@ -145,6 +184,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   function formDialog(title, content, submit, save) {
     const heading = el("h2", title);
+    heading.id = "workplace-dialog-title";
     const header = el("header", heading, "drawing-dialog-heading");
     const form = el("form");
     const body = el("div", content, "drawing-dialog-body workplace-dialog-body");
@@ -181,65 +221,142 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     return heading;
   }
 
-  function itemPicker(kinds, previous = []) {
+  function itemPicker(kinds, previous = [], { kit = false } = {}) {
     const chosen = new Map(previous.map(item => [item.id, item.quantity]));
-    const section = el("div", "", "workplace-picker");
-    const search = input("search", "", { placeholder: "Поиск по названию и папкам", ariaLabel: "Поиск по реестру" });
+    const section = el("div", "", `workplace-picker${kit ? " registry-kit-picker" : ""}`);
+    const browser = el("div", "", "workplace-picker-browser");
+    const search = input("search", "", { placeholder: "Название или путь к папке" });
     const results = el("div", "", "workplace-picker-results");
     const count = el("small", "");
+    const selected = el("div", "", "registry-picked-list");
     const choices = entries.filter(entry => kinds.includes(entry.kind));
     const directory = folderSelect("");
     directory.options[0].textContent = "Все папки";
-    const inFolder = (entry) => {
-      if (!directory.value) return true;
-      for (let parent = find(entry.parent); parent; parent = find(parent.parent)) {
-        if (parent.id === directory.value) return true;
+    const inFolder = (entry) => !directory.value || trailOf(find(entry.parent)).some(parent => parent.id === directory.value);
+    function itemText(entry) {
+      const text = el("span", el("strong", entry.name));
+      text.append(el("small", `${labels[entry.kind]} · ${pathOf(find(entry.parent))}`));
+      return text;
+    }
+    function amountInput(entry, value, disabled = false) {
+      const amount = input("number", value, { min: 1, max: 50000, required: true, disabled,
+        ariaLabel: `Количество: ${entry.name}` });
+      amount.oninput = () => chosen.set(entry.id, amount.valueAsNumber);
+      return amount;
+    }
+    function drawChosen() {
+      count.textContent = `Выбрано: ${chosen.size}`;
+      if (!kit) return;
+      selected.replaceChildren();
+      for (const [id, quantity] of chosen) {
+        const entry = find(id) ?? { id, name: "Недоступная деталь", kind: "part" };
+        const row = el("div", itemText(entry), "workplace-pick-row registry-picked-row");
+        const remove = button("Убрать", () => {
+          chosen.delete(id);
+          drawChosen();
+          drawMatches().get(id)?.focus({ preventScroll: true });
+          if (!browser.contains(document.activeElement)) search.focus({ preventScroll: true });
+        });
+        remove.setAttribute("aria-label", `Убрать ${entry.name} из комплекта`);
+        row.append(amountInput(entry, quantity), remove);
+        selected.append(row);
       }
-      return false;
-    };
-    function redraw() {
+      if (!selected.children.length) selected.append(el("p", "Детали ещё не выбраны.", "workplace-empty"));
+    }
+    function drawMatches() {
       const needle = search.value.trim().toLocaleLowerCase();
+      const toggles = new Map();
       results.replaceChildren();
       for (const entry of choices) {
         if (!inFolder(entry) || !pathOf(entry).toLocaleLowerCase().includes(needle)) continue;
-        const row = el("label", "", "workplace-pick-row");
+        const row = el("label", "", `workplace-pick-row${kit ? " registry-kit-choice" : ""}`);
         const toggle = input("checkbox", "", { checked: chosen.has(entry.id) });
-        const amount = input("number", chosen.get(entry.id) ?? 1, { min: 1, max: 50000, required: true,
-          disabled: !toggle.checked, ariaLabel: `Количество: ${entry.name}` });
-        const text = el("span", el("strong", entry.name));
-        text.append(el("small", `${labels[entry.kind]} · ${entry.parent ? pathOf(find(entry.parent)) : "Корень"}`));
+        const amount = kit ? null : amountInput(entry, chosen.get(entry.id) ?? 1, !toggle.checked);
         toggle.onchange = () => {
-          amount.disabled = !toggle.checked;
-          if (toggle.checked) chosen.set(entry.id, amount.valueAsNumber);
+          if (amount) amount.disabled = !toggle.checked;
+          if (toggle.checked) chosen.set(entry.id, amount?.valueAsNumber ?? 1);
           else chosen.delete(entry.id);
-          count.textContent = `Выбрано: ${chosen.size}`;
+          drawChosen();
         };
-        amount.oninput = () => chosen.set(entry.id, amount.valueAsNumber);
-        row.append(toggle, text, amount);
+        row.append(toggle, itemText(entry));
+        if (amount) row.append(amount);
         results.append(row);
+        toggles.set(entry.id, toggle);
       }
       if (!results.children.length) results.append(el("p", "Подходящих записей нет.", "workplace-empty"));
-      count.textContent = `Выбрано: ${chosen.size}`;
+      return toggles;
     }
-    search.oninput = redraw;
-    directory.onchange = redraw;
-    section.append(field("Папка", directory), search, results, count);
-    redraw();
+    search.oninput = drawMatches;
+    directory.onchange = drawMatches;
+    if (kit) browser.append(el("h3", "Добавить детали"));
+    browser.append(field("Фильтр по папке", directory), field("Поиск по реестру", search), results);
+    section.append(browser);
+    if (kit) {
+      const composition = el("section", el("h3", "Детали в комплекте"), "registry-picked");
+      composition.append(count, selected);
+      section.append(composition);
+    } else section.append(count);
+    drawMatches();
+    drawChosen();
     return { section, values: () => Array.from(chosen, ([id, quantity]) => ({ id, quantity })) };
   }
 
   function recordDialog(kind, old, onSaved) {
+    let record = old;
     const name = input("text", old?.name ?? "", { required: true, maxLength: 255 });
-    const parent = folderSelect(old ? old.parent : selectedFolder);
+    const parent = folderSelect(old ? old.parent : selectedFolder, old);
     const model = input("checkbox", "", { checked: old?.model === true });
-    const picker = kind === "kit" ? itemPicker(["part"], old?.members) : null;
+    const picker = kind === "kit" ? itemPicker(["part"], old?.members, { kit: true }) : null;
     const fields = el("div", "", "workplace-form-grid");
-    fields.append(field("Название", name), field("Папка", parent));
+    fields.append(field("Название", name), field(kind === "folder" ? "Родительская папка" : "Папка записи", parent));
     if (kind === "folder") fields.append(field("Обозначить как изделие", model));
     if (picker) fields.append(picker.section);
+    if (old && kind !== "drawing") {
+      const actions = el("div", "", "registry-property-actions");
+      const remove = button("Удалить", execute(async () => {
+        if (modal.querySelector('[type="submit"]').disabled) return;
+        const restore = suspendDialog(remove);
+        modal.close();
+        try {
+          if (await confirmRegistryDeletion(record)) {
+            await removeRegistryRecord(record);
+            return;
+          }
+        } catch (error) {
+          restore();
+          throw error;
+        }
+        restore();
+      }));
+      remove.classList.add("registry-delete");
+      const move = button("Перенести в другую папку", () => {
+        if (modal.querySelector('[type="submit"]').disabled) return;
+        const restore = suspendDialog(move);
+        moveRegistryEntry(record, {
+          returnTo: restore,
+          onMoved: (moved) => {
+            record = { ...record, parent: moved.parent, revision: moved.revision };
+            parent.value = record.parent ?? "";
+          },
+        });
+      });
+      actions.append(move, remove);
+      if (picker) {
+        const open = button("Раскладка комплекта", execute(async () => {
+          if (modal.querySelector('[type="submit"]').disabled) return;
+          if (name.value !== record.name || (parent.value || null) !== record.parent
+            || JSON.stringify(picker.values()) !== JSON.stringify(record.members)) {
+            throw new Error("Сохраните свойства комплекта перед открытием раскладки.");
+          }
+          await kitLayoutDialog(record, suspendDialog(open));
+        }));
+        actions.prepend(open);
+      }
+      fields.append(actions);
+    }
     formDialog(old ? `Свойства · ${old.name}` : labels[kind], fields, "Сохранить", async () => {
       const result = await post("/api/registry", { action: "save", kind, name: name.value, parent: parent.value || null,
-        ...(old ? { id: old.id, revision: old.revision } : {}), ...(kind === "folder" ? { model: model.checked } : {}),
+        ...(record ? { id: record.id, revision: record.revision } : {}), ...(kind === "folder" ? { model: model.checked } : {}),
         ...(picker ? { members: picker.values() } : {}) });
       await refreshRegistry();
       onSaved?.(result);
@@ -247,51 +364,193 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     });
   }
 
+  function suspendDialog(opener) {
+    const contents = [...modal.childNodes];
+    return () => {
+      modal.replaceChildren(...contents);
+      if (!modal.open) modal.showModal();
+      opener.focus({ preventScroll: true });
+    };
+  }
+
+  function moveRegistryEntry(entry, { returnTo, onMoved } = {}) {
+    const destination = folderSelect(entry.parent, entry);
+    const path = el("p", `Текущая папка: ${pathOf(find(entry.parent))}`, "workplace-form-note");
+    const content = el("div", path, "workplace-form-grid");
+    content.append(field("Новая папка", destination));
+    formDialog(`Переместить «${entry.name}»`, content, "Переместить", async () => {
+      const parent = destination.value || null;
+      if (parent === entry.parent) throw new Error("Выберите другую папку.");
+      const moved = await post("/api/registry", { action: "move", id: entry.id, revision: entry.revision, parent });
+      onMoved?.(moved);
+      selectedFolder = parent;
+      registrySearch = "";
+      await render();
+      if (!returnTo) focusWorkplaceHeading();
+    });
+    if (returnTo) modal.addEventListener("close", returnTo, { once: true });
+  }
+
+  function confirmRegistryDeletion(entry) {
+    return confirmAction({
+      title: `Удалить «${entry.name}»?`,
+      message: entry.kind === "folder" ? "Удалить можно только пустую папку." : "Запись будет удалена из реестра.",
+      confirmLabel: "Удалить",
+    });
+  }
+
+  async function deleteRegistryEntry(entry) {
+    if (await confirmRegistryDeletion(entry)) await removeRegistryRecord(entry);
+  }
+
+  async function removeRegistryRecord(entry) {
+    await post("/api/registry", { action: "delete", id: entry.id, revision: entry.revision });
+    expandedFolders.delete(entry.id);
+    rememberFolders();
+    await render();
+    focusWorkplaceHeading();
+  }
+
+  async function kitLayoutDialog(entry, returnTo) {
+    const kit = returnTo ? entry : await get("/api/registry", { id: entry.id });
+    const layouts = kit.layouts ?? [];
+    const previous = layouts.find(layout => layout.valid && layout.quantity === 1)
+      ?? layouts.find(layout => layout.valid) ?? layouts[0];
+    const { defaultWidthMm, maxWidthMm } = layoutWidths?.() ?? {};
+    const width = input("number", previous?.widthMm ?? defaultWidthMm ?? "", {
+      min: 1, max: maxWidthMm ?? "", step: "any", required: true,
+    });
+    const quantity = input("number", previous?.quantity ?? 1, { min: 1, max: 50000, required: true });
+    const content = el("div", el("p", kit.name, "workplace-form-note"), "workplace-form-grid");
+    if (layouts.length > 1) {
+      const saved = select([["", "Выбрать раскладку"], ...layouts.map((layout, index) => [index,
+        `${layout.widthMm} мм · ${layout.quantity} компл.${layout.valid ? "" : " · состав изменён"}`])], layouts.indexOf(previous));
+      saved.onchange = () => {
+        if (!saved.value) return;
+        const layout = layouts[Number(saved.value)];
+        width.value = layout.widthMm;
+        quantity.value = layout.quantity;
+      };
+      width.oninput = quantity.oninput = () => {
+        const match = layouts.findIndex(layout => layout.widthMm === width.valueAsNumber && layout.quantity === quantity.valueAsNumber);
+        saved.value = match >= 0 ? String(match) : "";
+      };
+      content.append(field("Сохранённые раскладки", saved));
+    }
+    content.append(field("Рабочая ширина ткани, мм", width), field("Количество комплектов", quantity));
+    formDialog("Раскладка комплекта", content, "Открыть раскладку", () => showLayout({ kitId: kit.id, name: kit.name, mode: "kit",
+      widthMm: width.valueAsNumber, quantity: quantity.valueAsNumber }));
+    if (returnTo) modal.addEventListener("close", () => { if (modal.returnValue !== "saved") returnTo(); }, { once: true });
+  }
+
   function renderRegistry() {
-    const search = input("search", "", { placeholder: "Найти папку, деталь или комплект", ariaLabel: "Поиск по реестру" });
+    revealFolder(selectedFolder);
+    const search = input("search", registrySearch, { placeholder: "Название или путь к папке" });
     const table = el("div", "", "registry-list");
     const tree = el("nav", "", "registry-tree");
     tree.setAttribute("aria-label", "Папки реестра");
-    const content = el("section", search, "registry-body");
-    content.append(table);
+    const location = el("p", "", "registry-location");
+    const content = el("section", location, "registry-body");
+    content.append(field("Поиск по всему реестру", search), table);
     const columns = el("div", tree, "registry-columns");
     columns.append(content);
-    function draw() {
+    const childrenByParent = new Map();
+    for (const folder of folders()) {
+      if (!childrenByParent.has(folder.parent)) childrenByParent.set(folder.parent, []);
+      childrenByParent.get(folder.parent).push(folder);
+    }
+    const folderButtons = new Map();
+    function browseFolder(id, focusTree = false) {
+      selectedFolder = id;
+      revealFolder(id);
+      registrySearch = search.value = "";
+      drawTree();
+      drawMatches();
+      if (focusTree) folderButtons.get(id)?.focus({ preventScroll: true });
+    }
+    function drawTree() {
       tree.replaceChildren();
-      const folderButton = (entry, level) => {
-        const branch = button(entry ? entry.name : "Все папки", () => { selectedFolder = entry?.id ?? null; search.value = ""; draw(); });
-        branch.prepend(registryIcon("folder"));
-        branch.style.paddingInlineStart = `${14 + level * 16}px`;
-        branch.setAttribute("aria-pressed", String((entry?.id ?? null) === selectedFolder));
-        tree.append(branch);
-      };
-      folderButton(null, 0);
-      const walk = (parent, level) => {
-        for (const folder of folders().filter(item => item.parent === parent)) { folderButton(folder, level); walk(folder.id, level + 1); }
-      };
-      walk(null, 1);
+      folderButtons.clear();
+      function folderButton(entry) {
+        const id = entry?.id ?? null;
+        const row = button(entry?.name ?? "Корень реестра", () => browseFolder(id, true));
+        row.prepend(registryIcon("folder"));
+        row.setAttribute("aria-pressed", String(id === selectedFolder));
+        folderButtons.set(id, row);
+        return row;
+      }
+      function folderList(parent, depth) {
+        const list = el("ul", "", "registry-folder-list");
+        for (const folder of childrenByParent.get(parent) ?? []) {
+          const item = el("li");
+          const row = el("div", "", "registry-tree-row");
+          row.style.setProperty("--folder-indent", `${Math.min(depth, 6) * 12}px`);
+          const hasChildren = childrenByParent.has(folder.id);
+          const toggle = hasChildren ? button("", () => {
+            if (expandedFolders.has(folder.id)) expandedFolders.delete(folder.id);
+            else expandedFolders.add(folder.id);
+            updateDisclosure();
+            rememberFolders();
+          }) : el("span", "", "registry-folder-toggle-spacer");
+          const nested = hasChildren ? folderList(folder.id, depth + 1) : null;
+          function updateDisclosure() {
+            const expanded = expandedFolders.has(folder.id);
+            nested.hidden = !expanded;
+            toggle.setAttribute("aria-expanded", String(expanded));
+            toggle.setAttribute("aria-label", `${expanded ? "Свернуть" : "Развернуть"} ${folder.name}`);
+          }
+          if (nested) {
+            nested.id = `registry-branch-${folder.id}`;
+            toggle.classList.add("registry-folder-toggle");
+            toggle.setAttribute("aria-controls", nested.id);
+            toggle.append(registryIcon("chevron"));
+            updateDisclosure();
+          }
+          row.append(toggle, folderButton(folder));
+          item.append(row);
+          if (nested) item.append(nested);
+          list.append(item);
+        }
+        return list;
+      }
+      tree.append(folderButton(null), folderList(null, 0));
+    }
+    function drawMatches() {
       const needle = search.value.trim().toLocaleLowerCase();
+      location.textContent = `Папка: ${pathOf(find(selectedFolder))}`;
       table.replaceChildren();
       for (const entry of entries.filter(item => needle ? pathOf(item).toLocaleLowerCase().includes(needle) : item.parent === selectedFolder)) {
         const row = el("div", "", "registry-row");
-        const title = el("span", el("strong", entry.name));
-        title.append(el("small", `${entry.model ? "Изделие" : labels[entry.kind]}${needle && entry.parent ? ` · ${pathOf(find(entry.parent))}` : ""}`));
+        row.dataset.registryId = entry.id;
+        const title = el("div", el("strong", entry.name));
+        const metadata = el("div", el("span", entry.model ? "Изделие" : labels[entry.kind], "registry-kind"), "registry-row-meta");
+        if (needle) metadata.append(el("small", pathOf(find(entry.parent))));
+        title.append(metadata);
         const identity = el("div", registryIcon(entry.kind), "registry-entry");
+        identity.dataset.kind = entry.kind;
         identity.append(title);
-        row.append(identity);
-        if (entry.kind === "folder") row.append(button("Открыть", () => { selectedFolder = entry.id; search.value = ""; draw(); }));
-        if (["part", "drawing"].includes(entry.kind)) row.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id })))));
-        row.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id })))));
+        const tools = el("div", "", "registry-row-actions");
+        if (entry.kind === "folder") tools.append(button("Открыть", () => browseFolder(entry.id, true)));
+        if (["part", "drawing"].includes(entry.kind)) tools.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id })))));
+        if (entry.kind === "kit") tools.append(button("Раскладка комплекта", execute(() => kitLayoutDialog(entry)), { primary: true }));
+        tools.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id })))));
+        if (entry.kind !== "drawing") {
+          const remove = button("Удалить", execute(() => deleteRegistryEntry(entry)));
+          remove.classList.add("registry-delete");
+          tools.append(button("Переместить", () => moveRegistryEntry(entry)), remove);
+        }
+        row.append(identity, tools);
         table.append(row);
       }
       if (!table.children.length) table.append(el("p", needle ? "Совпадений нет" : "В этой папке пока нет записей", "workplace-empty"));
     }
-    search.oninput = draw;
-    panel.append(workHeading("Реестр лекал", selectedFolder ? pathOf(find(selectedFolder)) : "", [
+    search.oninput = () => { registrySearch = search.value; drawMatches(); };
+    panel.append(workHeading("Реестр лекал", "", [
       button("Папка", () => recordDialog("folder", null)), button("Комплект", () => recordDialog("kit", null)),
       button("Новый чертёж", () => openCad(null), { primary: true }),
     ]), columns);
-    draw();
+    drawTree();
+    drawMatches();
   }
 
   function openCad(document) {
@@ -384,6 +643,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const picker = itemPicker(["part", "kit"], old?.members);
     const content = el("div", field("Название ткани", title), "workplace-form-grid");
     content.append(field("Рабочая ширина полотна, мм", width), el("strong", "Состав на одно изделие"), picker.section);
+    if (!old) content.append(el("p", "Если выбран один комплект и ширина и количество совпадут, в наряд скопируется его сохранённая раскладка.", "workplace-form-note"));
     if (order.published) content.append(el("p", "Если изменить состав или ширину, подготовьте и отправьте эту раскладку оператору заново.", "workplace-form-note"));
     formDialog(old ? "Изменить пункт раскроя" : "Добавить ткань", content, "Сохранить", async () => {
       await post("/api/orders", { action: "save-cut", orderId: order.id, orderRevision: order.revision, id: old?.id,
@@ -394,19 +654,26 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   async function showLayout(next) {
     const result = await navigateLayout(next);
+    if (result === false) return;
     currentLayout = next;
-    const mode = result?.demo ? "demo" : next.mode;
-    const heading = el("strong", result?.name || "Самостоятельный раскрой");
+    const mode = next.kitId ? "kit" : result?.demo ? "demo" : next.mode;
+    const heading = el("strong", mode === "kit" ? `Раскладка комплекта · ${result?.name || next.name}`
+      : result?.name || "Самостоятельный раскрой");
     if (mode === "design" || mode === "preview") heading.append(` · ${mode === "design" ? "Подготовка" : "Предпросмотр"}`);
     if (mode === "demo") heading.append(" · Демо");
     const error = el("span", "", "workplace-dock-error");
     error.setAttribute("role", "alert");
-    dock.replaceChildren(button(next.id ? "К наряду" : "К нарядам", execute(async () => { await leaveLayout(); await render(); })), heading, error);
+    const back = button(mode === "kit" ? "К реестру" : next.id ? "К наряду" : "К нарядам", execute(async () => {
+      if (!await leaveLayout()) return;
+      await render();
+      focusWorkplaceHeading();
+    }));
+    dock.replaceChildren(back, heading, error);
     if (mode === "design") {
       dock.append(button("Предпросмотр", execute(() => showLayout({ ...next, mode: "preview", editable: true }))));
     } else if (mode === "preview") {
       if (next.editable) dock.append(button("Редактировать раскладку", execute(() => showLayout({ ...next, mode: "design" }))));
-    } else if (result?.status !== "done" || mode === "demo") {
+    } else if (mode !== "kit" && (result?.status !== "done" || mode === "demo")) {
       dock.append(button("Добавить файл", execute(async () => {
         await refreshRegistry();
         const picker = itemPicker(["part", "kit"]);
@@ -437,9 +704,10 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   }
 
   async function leaveLayout() {
-    if (!currentLayout) return;
-    await navigateLayout(null);
+    if (!currentLayout) return true;
+    if (await navigateLayout(null) === false) return false;
     currentLayout = null;
+    return true;
   }
 
   function renderOrder(order) {
@@ -636,11 +904,12 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const leaveRole = execute(async () => {
     if (cad?.isBusy()) return;
     if (!await confirmLeaveCad()) return;
-    await leaveLayout();
+    if (!await leaveLayout()) return;
     await onExit?.();
     cad?.destroy();
     cad = null;
     tab = selectedOrder = selectedFolder = null;
+    registrySearch = "";
     designerView = "registry";
     saveRole(null);
     page.classList.remove("is-cad");

@@ -90,6 +90,33 @@ class ServerFlowTests(unittest.TestCase):
         self.request("/api/workspace", data, HTTPStatus.CONFLICT)
         self.assertEqual(self.server.workspace.read(), saved)
 
+    def test_kit_layout_and_registry_move_through_production_api(self):
+        folder = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Комплекты"})
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Боковина", "entities": [
+            {"id": "piece", "layer": "0", "type": "polyline", "closed": True,
+             "points": [[0, 0], [40, 0], [40, 30], [0, 30]]},
+        ]})
+        kit = self.request("/api/registry", {"action": "save", "kind": "kit", "name": "Пара",
+                                             "members": [{"id": part["id"], "quantity": 2}]})
+        link = f"/api/registry?id={kit['id']}&mode=kit-layout&widthMm=1500&quantity=1"
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            client.request("GET", link)
+            response = client.getresponse()
+            layout = json.loads(response.read())
+            self.assertEqual(response.status, HTTPStatus.OK, layout)
+        self.assertEqual((layout["name"], layout["widthMm"], layout["quantity"], layout["revision"]),
+                         ("Пара", 1500, 1, 0))
+        for path in layout["workspace"]["paths"]:
+            path["points"] = [[x + path["partNumber"] * 50, y] for x, y in path["points"]]
+        saved = self.request("/api/registry", {**layout, "action": "save-kit-layout"})
+        self.assertTrue(saved["valid"])
+        moved = self.request("/api/registry", {"action": "move", "id": kit["id"], "revision": kit["revision"],
+                                               "parent": folder["id"]})
+        self.assertEqual(moved["members"], kit["members"])
+        self.request("/api/registry", {**part, "action": "delete"}, HTTPStatus.CONFLICT)
+        self.assertTrue(self.request("/api/registry", {**moved, "action": "delete"})["deleted"])
+        self.assertTrue(self.request("/api/registry", {**folder, "action": "delete"})["deleted"])
+
     def test_local_companion_serves_ui_and_only_allows_same_origin_mutations(self):
         with patch("server.Controller", return_value=self.controller), patch("server.ssl.create_default_context"), \
                 PlotterServer(0, Path(self.directory.name) / "companion.json", profile_path=EXAMPLE_PROFILE,
@@ -529,6 +556,64 @@ class ServerFlowTests(unittest.TestCase):
         self.assertIsNone(self.server.roll)
         self.assertEqual(self.server.cut_journal.snapshot(), [])
         self.assertFalse(self.server.cut_journal.path.exists())
+        self.assertEqual(self.controller.mock_calls, [])
+
+    def test_demo_advances_by_pass_origins_with_and_without_continuations(self):
+        width = self.server.simulator.width
+
+        def rectangle(left, right):
+            return {"layer": "Крой", "closed": True,
+                    "points": [[left, 50], [right, 50], [right, 70], [left, 70]]}
+
+        separate = [rectangle(10, width - 1000), rectangle(width - 120, 2 * width - 400),
+                    rectangle(2 * width - 195, 2 * width + 50)]
+        carried = [rectangle(40, 2 * width + 100)]
+        for paths, continuations in ((separate, False), (carried, True)):
+            with self.subTest(continuations=continuations):
+                self.server.demo.roll = None
+                self.server.demo.cut_progress = None
+                self.server.demo.controller = type(self.server.demo.controller)(width, self.server.simulator.height)
+                workspace = {**drawing(), "paths": paths, "excluded": []}
+                revision = self.server.workspace.read()["revision"]
+                self.save(workspace, revision)
+                clock = [100.0]
+
+                def demo(path, data, expected=HTTPStatus.OK):
+                    return self.request("/demo/api/" + path, data, expected)
+
+                with patch("demo_controller.monotonic", side_effect=lambda: clock[0]):
+                    plan = demo("cut-plan", {"job": {"paths": paths, "optimize": True},
+                                             "filename": workspace["source"]["filename"]})
+                    self.assertEqual((len(plan["pages"]), plan["hasContinuations"], plan["canUpload"]),
+                                     (3, continuations, True))
+                    self.assertEqual(plan["pages"][1]["feedAfterMm"], 2450 if continuations else 2425)
+                    token = demo("control-session", {"action": "arm", "ready": True})["controlToken"]
+                    options = {"planId": plan["planId"], "controlToken": token}
+                    upload = demo("controller-upload", {**options, "page": 1, "advanceConfirmed": True})
+                    total = 0
+                    for page in (1, 2):
+                        command = {**options, "action": "advance-roll", "page": page + 1, "feedMm": 10}
+                        demo("controller-operation", command, HTTPStatus.CONFLICT)
+                        demo("controller-operation", {**options, "action": "cut", "jobVerified": True,
+                                                      "jobReceipt": upload["jobReceipt"]})
+                        clock[0] += 35
+                        finished = demo("controller-live", {})
+                        self.assertEqual(finished["roll"]["state"], "advance")
+                        demo("controller-upload", {**options, "page": page + 1}, HTTPStatus.BAD_REQUEST)
+                        demo("controller-operation", {**command, "page": page}, HTTPStatus.CONFLICT)
+                        advance = demo("controller-operation", command)
+                        distance = plan["pages"][page]["startX"] - plan["pages"][page - 1]["startX"]
+                        total += distance
+                        self.assertEqual((advance["feedMm"], advance["materialOffsetMm"]), (distance, total))
+                        self.assertTrue(advance["roll"]["materialAdvanced"])
+                        self.assertTrue(demo("controller-operation", command)["roll"]["materialAdvanced"])
+                        upload = demo("controller-upload", {**options, "page": page + 1})
+                        self.assertEqual(upload["cutProgress"]["state"], "ready")
+                    self.assertEqual(self.server.demo.controller._material_offset_mm, total)
+
+    def test_advance_roll_is_rejected_before_real_controller_calls(self):
+        self.controller.reset_mock()
+        self.request("/api/controller-operation", {"action": "advance-roll", "page": 2}, HTTPStatus.CONFLICT)
         self.assertEqual(self.controller.mock_calls, [])
 
     def test_demo_disallows_xiao_handoff_and_keeps_real_status(self):

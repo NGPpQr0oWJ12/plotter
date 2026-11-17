@@ -1,6 +1,7 @@
 from collections import defaultdict
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -8,7 +9,7 @@ import re
 import sqlite3
 from uuid import uuid4
 
-from cad import MAX_ENTITIES, MAX_POINTS
+from cad import MAX_ENTITIES, MAX_POINTS, POINT_EPSILON_MM
 from designer_cad import prepare_design, validate_design
 from machine import PlotterError
 from nesting import validate_placed_parts
@@ -18,6 +19,13 @@ from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, validate_workspace
 SCHEMA_VERSION = 1
 MAX_QUANTITY = 50_000
 MOSCOW_TIME = timezone(timedelta(hours=3))
+KIT_LAYOUT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS kit_layouts (
+        kit_id TEXT NOT NULL REFERENCES registry(id) ON DELETE CASCADE,
+        width_mm REAL NOT NULL, quantity INTEGER NOT NULL, revision INTEGER NOT NULL,
+        basis TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kit_id, width_mm, quantity)
+    )
+"""
 
 
 class RecordNotFound(PlotterError):
@@ -122,6 +130,36 @@ def new_workspace(paths, filename, width=None):
     })
 
 
+def check_kit_geometry(source, draft):
+    expected, placed = defaultdict(list), defaultdict(list)
+    for path in source:
+        expected[path["partNumber"]].append(path)
+    for path in draft["paths"]:
+        placed[path.get("partNumber")].append(path)
+
+    message = "Раскладка должна содержать все исходные резы комплекта. Меняйте только положение и угол деталей."
+    if draft["excluded"] or placed.keys() != expected.keys():
+        raise ValueError(message)
+    for number, originals in expected.items():
+        actual = placed[number]
+        if len(actual) != len(originals):
+            raise ValueError(message)
+        angle = actual[0].get("partAngle", 0)
+        cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+        source_x, source_y = originals[0]["points"][0]
+        placed_x, placed_y = actual[0]["points"][0]
+        for before, after in zip(originals, actual):
+            if (after.get("partAngle", 0) != angle or before["closed"] != after["closed"]
+                    or before["layer"] != after["layer"] or bool(before.get("notch")) != bool(after.get("notch"))
+                    or len(before["points"]) != len(after["points"])):
+                raise ValueError(message)
+            for (x, y), (u, v) in zip(before["points"], after["points"]):
+                x, y = x - source_x, y - source_y
+                rotated = (x * cosine - y * sine, x * sine + y * cosine)
+                if math.dist(rotated, (u - placed_x, v - placed_y)) > 10 * POINT_EPSILON_MM:
+                    raise ValueError(message)
+
+
 class ProductionStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -138,6 +176,9 @@ class ProductionStore:
                 self.initialize(db)
             elif version != SCHEMA_VERSION:
                 raise ValueError("Версия базы реестра не поддерживается этой версией Plotter.")
+            # This additive table leaves version 1 registries readable by older releases.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kit_layouts'").fetchone() is None:
+                db.execute(KIT_LAYOUT_SCHEMA)
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.commit()
@@ -179,22 +220,35 @@ class ProductionStore:
     def registry(self, record_id=None):
         with self.connect() as db:
             if record_id is not None:
-                return self.registry_record(db, record_id)
+                entry = self.registry_record(db, record_id)
+                if entry["kind"] == "kit":
+                    slots = db.execute("SELECT width_mm, quantity, revision, basis FROM kit_layouts "
+                                       "WHERE kit_id=? ORDER BY width_mm, quantity", (entry["id"],)).fetchall()
+                    basis = self.kit_layout_basis(db, entry) if slots else None
+                    entry["layouts"] = [{"widthMm": slot["width_mm"], "quantity": slot["quantity"],
+                                         "revision": slot["revision"], "valid": slot["basis"] == basis} for slot in slots]
+                return entry
             rows = db.execute("SELECT id, kind, parent, name, revision, "
                               "CASE WHEN kind = 'folder' THEN data ELSE '{}' END AS data FROM registry")
             return {"entries": sorted(map(row_data, rows), key=lambda r: (r["name"].casefold(), r["id"]))}
 
     def save_registry(self, payload):
-        kind = payload.get("kind")
-        if kind not in ("folder", "drawing", "part", "kit"):
-            raise ValueError("Неверный тип записи реестра.")
         record_id = payload.get("id")
-        title, parent = name(payload.get("name")), payload.get("parent")
+        parent = payload.get("parent")
         with self.connect(write=True) as db:
             old = None
             if record_id is not None:
                 old = self.registry_record(db, record_id)
                 check_revision(payload.get("revision"), old["revision"])
+            if payload.get("action") == "move":
+                if old is None:
+                    raise ValueError("Выберите запись для перемещения.")
+                payload = {"kind": old["kind"], "name": old["name"], "model": old.get("model")}
+            kind = payload.get("kind")
+            if kind not in ("folder", "drawing", "part", "kit"):
+                raise ValueError("Неверный тип записи реестра.")
+            title = name(payload.get("name"))
+            if old is not None:
                 if old["kind"] != kind:
                     raise ValueError("Тип существующей записи изменить нельзя.")
             else:
@@ -233,6 +287,24 @@ class ProductionStore:
                 db.execute("UPDATE registry SET name=?, parent=?, revision=?, data=? WHERE id=?",
                            (title, parent, revision, encode(data), record_id))
             return self.registry_record(db, record_id)
+
+    def delete_registry(self, payload):
+        record_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            entry = self.registry_record(db, record_id)
+            check_revision(payload.get("revision"), entry["revision"])
+            if db.execute("SELECT 1 FROM registry WHERE parent=? LIMIT 1", (record_id,)).fetchone():
+                raise WorkspaceConflict("Сначала переместите или удалите содержимое папки.")
+            if entry["kind"] == "folder":
+                rows = db.execute("SELECT data FROM orders")
+                if any(json.loads(row["data"]).get("modelId") == record_id for row in rows):
+                    raise WorkspaceConflict("Изделие используется в нарядах.")
+            if entry["kind"] in ("part", "kit"):
+                rows = db.execute("SELECT data FROM registry WHERE kind='kit' UNION ALL SELECT data FROM cuts")
+                if any(member["id"] == record_id for row in rows for member in json.loads(row["data"]).get("members", ())):
+                    raise WorkspaceConflict("Запись используется в комплектах или нарядах.")
+            db.execute("DELETE FROM registry WHERE id=?", (record_id,))
+            return {"id": record_id, "deleted": True}
 
     def members(self, db, values, allowed):
         if not isinstance(values, list) or not 0 < len(values) <= MAX_ENTITIES:
@@ -273,6 +345,87 @@ class ProductionStore:
         with self.connect() as db:
             members = self.members(db, values, ("part", "kit"))
             return {"paths": self.expand_parts(db, members)}
+
+    def kit_layout_basis(self, db, kit):
+        digest = hashlib.sha256(encode(kit["members"]).encode("utf-8"))
+        for member in kit["members"]:
+            part = self.registry_record(db, member["id"])
+            digest.update(encode(part["paths"]).encode("utf-8"))
+        return digest.hexdigest()
+
+    def layout_kit(self, db, record_id):
+        kit = self.registry_record(db, record_id)
+        if kit["kind"] != "kit":
+            raise ValueError("Выберите комплект.")
+        return kit
+
+    @staticmethod
+    def kit_layout_slot(db, record_id, width, amount):
+        return db.execute("SELECT revision, basis, data FROM kit_layouts WHERE kit_id=? AND width_mm=? AND quantity=?",
+                          (record_id, width, amount)).fetchone()
+
+    @staticmethod
+    def kit_layout_result(kit, width, amount, revision, workspace, valid):
+        return {"id": kit["id"], "name": kit["name"], "widthMm": width, "quantity": amount,
+                "revision": revision, "workspace": workspace, "saved": revision > 0, "valid": valid}
+
+    @staticmethod
+    def kit_layout_filename(kit, basis, amount):
+        return f"kit-{kit['id']}-{basis}-{amount}.dxf"
+
+    def kit_layout(self, record_id, width, amount):
+        width, amount = width_mm(width), quantity(amount)
+        with self.connect() as db:
+            kit = self.layout_kit(db, record_id)
+            basis = self.kit_layout_basis(db, kit)
+            slot = self.kit_layout_slot(db, kit["id"], width, amount)
+            valid = slot is not None and slot["basis"] == basis
+            if valid:
+                draft = json.loads(slot["data"])
+            else:
+                paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
+                draft = new_workspace(paths, self.kit_layout_filename(kit, basis, amount), width)
+            return self.kit_layout_result(kit, width, amount, slot["revision"] if slot else 0, draft, valid)
+
+    def save_kit_layout(self, payload, verify_layout):
+        width, amount = width_mm(payload.get("widthMm")), quantity(payload.get("quantity"))
+        with self.connect(write=True) as db:
+            kit = self.layout_kit(db, payload.get("id"))
+            slot = self.kit_layout_slot(db, kit["id"], width, amount)
+            revision = slot["revision"] if slot else 0
+            check_revision(payload.get("revision"), revision)
+            basis = self.kit_layout_basis(db, kit)
+            draft = validate_workspace(payload.get("workspace"))
+            if not draft or draft["source"]["filename"] != self.kit_layout_filename(kit, basis, amount):
+                raise WorkspaceConflict("Состав комплекта изменился. Заново откройте раскладку.")
+            paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
+            check_kit_geometry(paths, draft)
+            verify_layout(draft, width)
+            revision += 1
+            db.execute("INSERT INTO kit_layouts VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(kit_id, width_mm, quantity) "
+                       "DO UPDATE SET revision=excluded.revision, basis=excluded.basis, data=excluded.data",
+                       (kit["id"], width, amount, revision, basis, encode(draft)))
+            return self.kit_layout_result(kit, width, amount, revision, draft, True)
+
+    def seed_kit_layout(self, db, members, multiplier, width, paths, filename, verify_layout):
+        if len(members) != 1:
+            return None
+        member = members[0]
+        kit = self.registry_record(db, member["id"])
+        if kit["kind"] != "kit":
+            return None
+        slot = self.kit_layout_slot(db, kit["id"], width, quantity(member["quantity"] * multiplier))
+        if not slot or slot["basis"] != self.kit_layout_basis(db, kit):
+            return None
+        try:
+            draft = validate_workspace(json.loads(slot["data"]))
+            if not draft:
+                return None
+            check_kit_geometry(paths, draft)
+            verify_layout(draft, width)
+        except ValueError:
+            return None
+        return {**draft, "source": {**draft["source"], "filename": filename}}
 
     @staticmethod
     def order_header(db, order_id):
@@ -379,7 +532,7 @@ class ProductionStore:
             db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?", (encode(data), order_id))
             return {"id": order_id, "deleted": True}
 
-    def save_cut(self, payload):
+    def save_cut(self, payload, verify_layout=None):
         with self.connect(write=True) as db:
             order = self.order_header(db, payload.get("orderId"))
             check_revision(payload.get("orderRevision"), order["revision"])
@@ -407,8 +560,12 @@ class ProductionStore:
                 else:
                     paths = self.expand_parts(db, members, order["quantity"])
                     data.update(prepared=False, released=False, partCount=paths[-1]["partNumber"])
+                    workspace = None
                     if old is None:
                         cut_id = uid()
+                        workspace = self.seed_kit_layout(db, members, order["quantity"], data["widthMm"], paths,
+                                                         f"cut-{cut_id}.dxf", verify_layout or verify_arrangement)
+                        data["prepared"] = workspace is not None
                         position = db.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM cuts WHERE order_id=?",
                                               (order["id"],)).fetchone()[0]
                         db.execute("INSERT INTO cuts VALUES (?, ?, ?, 1, 'pending', ?)",
@@ -417,7 +574,8 @@ class ProductionStore:
                         db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
                                    (encode(data), cut_id))
                         db.execute("DELETE FROM workspaces WHERE cut_id=? AND mode IN ('operator','demo')", (cut_id,))
-                    workspace = new_workspace(paths, f"cut-{cut_id}.dxf", data["widthMm"])
+                    if workspace is None:
+                        workspace = new_workspace(paths, f"cut-{cut_id}.dxf", data["widthMm"])
                     self.put_workspace(db, cut_id, "design", workspace, previous)
             db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
             return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"]), "cutId": cut_id}

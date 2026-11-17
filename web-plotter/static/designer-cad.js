@@ -657,7 +657,6 @@ const DIRECT_DISTANCE_LABELS = {
 };
 const RECTANGLE_SIDES = ["A", "B"];
 const TOOL_PARAMETERS = {
-  offset: ["Припуск", "Смещение, мм", "Предпросмотр", "5"],
   polygon: ["Правильный многоугольник", "Количество сторон", "Начать построение", "6"],
   notch: ["Надсечка", "Глубина, мм", "Выбрать кромку", "3"],
   "notch-series": ["Серия надсечек", "Глубина, мм", "Выбрать кромку", "3"],
@@ -701,6 +700,7 @@ const CAD_ICONS = {
   scale: '<path d="M13 4h7v7m0-7-8 8"/><rect x="4" y="12" width="8" height="8" rx="1"/>',
   mirror: '<path d="M12 3v18M9 5 3 18h6Zm6 0 6 13h-6Z"/>',
   join: '<path d="M12 9V5H5a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h7m0-2h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7v-4M8 12h8"/>',
+  "close-outline": '<path d="M8 5h9l3 4v10H4V9l4-4"/><circle cx="4" cy="9" r="1.5"/><circle cx="8" cy="5" r="1.5"/>',
   ungroup: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><path d="m10 14 4-4M12 7h3v3m-6 4v3h3"/>',
   offset: '<path d="M5 20V5h15M9 20V9h11m-5 6h5m-2-2 2 2-2 2"/>',
   notch: '<path d="M3 17h7l2-5 2 5h7m-9-9V4m-2 2 2 2 2-2"/>',
@@ -760,9 +760,10 @@ const markup = `
         ${iconButton("offset", "Припуск", "tool")}
         ${iconButton("erase", "Ластик", "tool")}
         <div class="cad-group-actions">
-          <button type="button" class="button cad-icon-button cad-group-button" data-action="join" aria-label="Соединить" title="Соединить в группу. При выборе ребра в группу войдёт весь его объект.">${cadIcon("join")}</button>
+          <button type="button" class="button cad-icon-button cad-group-button" data-action="join" aria-label="Соединить в группу" title="Соединить в группу. При выборе ребра в группу войдёт весь его объект.">${cadIcon("join")}</button>
           <button type="button" class="button cad-icon-button cad-group-button" data-action="ungroup" aria-label="Разъединить" title="Разъединить выбранные группы на текущем уровне" hidden>${cadIcon("ungroup")}</button>
         </div>
+        ${iconButton("close-outline", "Замкнуть контур", "action", "Объединить выделенные объекты в один замкнутый контур. При выборе ребра используется весь его объект.")}
       </div>
       <div class="cad-tool-group" role="group" aria-label="Надсечки">
         <span class="cad-tool-caption">Надсечки</span>
@@ -806,13 +807,10 @@ const markup = `
         <button class="button" type="button" data-action="cancel-notches">Отмена</button>
       </div>
       <div class="cad-preview-actions" data-view="offset-preview" hidden>
-        <label>Режущий контур
-          <select data-field="cut">
-            <option value="new">Контур с припуском</option>
-            <option value="original">Исходный контур</option>
-          </select>
-        </label>
-        <p data-view="preview-warning" hidden></p>
+        <label>Смещение, мм<input data-field="offset-distance" inputmode="decimal" maxlength="16"></label>
+        <button class="button" type="button" data-action="offset-side" title="Сменить сторону смещения"></button>
+        <span>Тип линии · Рез</span>
+        <p data-view="preview-warning" role="status" hidden></p>
         <button class="button primary" type="button" data-action="apply">Применить</button>
         <button class="button" type="button" data-action="cancel-preview">Отмена</button>
       </div>
@@ -1150,6 +1148,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     return current.entities.filter(entity => selected.has(entity.id));
   }
 
+  function selectedOutlines() {
+    return [...new Set([...selected, ...selectedEdges.keys()])].map(id => byId.get(id))
+      .filter(entity => entity && !entity.notch && entity.type !== "point");
+  }
+
   function groupPath(entity) {
     return (byId.get(entity.parentId) || entity).groupPath || [];
   }
@@ -1325,7 +1328,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions["show-repair-location"].textContent = repairLocationFocused && repairLocations.length > 1
       ? "Следующее место" : "Показать место";
     actions["fix-repair-location"].textContent = gap ? "Замкнуть разрыв" : "Исправить";
-    actions["fix-all-repair-locations"].hidden = gap;
+    actions["fix-all-repair-locations"].hidden = gap || location.sourceOperation === "close-outline";
   }
 
   function showRepairDiagnostics(locations, ids, bulkResult = null) {
@@ -1501,7 +1504,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function toolInstruction() {
-    if (running || offsetPreview || notchPreview) return "";
+    if (running || notchPreview) return "";
+    if (tool === "offset") return offsetPreview
+      ? "Ведите курсор в нужную сторону. Щёлкните для применения или введите миллиметры и нажмите Enter."
+      : "Щёлкните по контуру, от которого нужно построить припуск.";
     if (tool === "mirror") {
       if (mirrorMode === "edge") return "Отразить · Наведите на прямое ребро и щёлкните.";
       if (mirrorMode !== "points") return "Отразить · Наведите ось и щёлкните. Enter применяет показанное отражение.";
@@ -1529,7 +1535,6 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const groupable = selectionUnits([...selected, ...selectedEdges.keys()], true);
     const settings = count > 0;
     const transformSelection = settings || selectedEdges.size > 0;
-    const contours = items.filter(entity => editableInGroup(entity) && !entity.notch && entity.type !== "point").length;
     const first = items[0];
     const active = Boolean(gesture?.type === "grip" || gesture?.type === "scale" || offsetPreview || notchPreview);
     actions["fix-repair-location"].disabled = running || active || repairLocations[repairLocationIndex]?.fixable !== true;
@@ -1537,11 +1542,14 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     for (const [key, button] of Object.entries(buttons)) {
       button.setAttribute("aria-pressed", String(key === tool));
       button.disabled = running || active || (key in EDIT && !key.startsWith("notch") && !(OBJECT_TRANSFORMS.has(key) ? transformSelection : settings))
-        || (key === "offset" && (count !== 1 || !contours))
         || (key === "scale" && !selectedEdges.size && !items.some(entity => entity.type !== "point"));
     }
     actions["erase-selection"].disabled = running || active || !settings;
     actions.join.disabled = tool !== "select" || running || active || groupable.count < 2;
+    const outlines = selectedOutlines();
+    const oneOpenPolyline = outlines.length === 1 && outlines[0].type === "polyline" && !outlines[0].closed;
+    actions["close-outline"].disabled = tool !== "select" || running || active || !outlines.every(editableInGroup)
+      || (outlines.length < 2 && !oneOpenPolyline);
     const canUngroup = tool === "select" && units.groups.size > 0;
     actions.join.hidden = canUngroup && groupable.count < 2;
     actions.ungroup.hidden = !canUngroup;
@@ -1562,9 +1570,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     views.finish.hidden = !finishable || pending.length < 2;
     actions.finish.disabled = pending.length < 2;
     actions.close.disabled = pending.length < 3;
-    views["offset-preview"].hidden = !offsetPreview;
-    views["preview-warning"].hidden = !offsetPreview?.warnings.length;
-    views["preview-warning"].textContent = offsetPreview?.warnings.map(warning => warning?.message || String(warning)).join(" ") || "";
+    renderOffsetControls();
     views["mirror-controls"].hidden = tool !== "mirror";
     if (tool === "mirror") for (const mode of Object.keys(MIRROR_MODES)) {
       const button = actions[`mirror-${mode}`];
@@ -1625,6 +1631,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     closeContextMenu();
     clearPointerMove();
     cancelGesture();
+    clearOffset();
     if (tool === "measure") {
       measurements.length = 0;
       if (next === "measure") next = "select";
@@ -2244,15 +2251,15 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     drawGrid();
     const scalePreview = tool === "scale" && scaleBox && currentScalePreview();
     const shown = offsetPreview ? previewEntities() : notchPreview?.entities || gesture?.entities || current.entities;
+    const offsetResult = shown !== current.entities ? offsetPreview?.result : null;
     const isSelected = entity => selected.has(entity.id) || (groupAt(entity) && selected.has(entity.parentId));
     const hoveredGroup = hover && groupAt(hover);
     for (const entity of shown) {
       if (scalePreview && scaleIds.has(entity.id)) continue;
       if (!offsetPreview && !notchPreview && isSelected(entity)) continue;
-      const activePreview = offsetPreview && [offsetPreview.original, ...offsetPreview.ids].includes(entity.parentId || entity.id);
       if (!inActiveGroup(entity)) context.globalAlpha = .25;
-      drawEntity(entity, false, Boolean(hover?.id === entity.id || hoveredGroup && inActiveGroup(entity) && groupAt(entity) === hoveredGroup
-        || activePreview || notchPreview?.ids.includes(entity.id)));
+      drawEntity(entity, offsetResult?.ids.has(entity.parentId || entity.id), Boolean(hover?.id === entity.id || hoveredGroup && inActiveGroup(entity) && groupAt(entity) === hoveredGroup
+        || offsetPreview?.originals.has(entity.parentId || entity.id) || notchPreview?.ids.includes(entity.id)));
       context.globalAlpha = 1;
     }
     for (const entity of shown) {
@@ -2298,6 +2305,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     const previewPoint = typedDistancePoint() || cursor;
     drawDirectDistance();
+    if (tool === "offset") drawOffsetGuide();
     if (tool === "arc") drawArcPreview(previewPoint);
     else if (pending.length && previewPoint && DRAW[tool]) {
       const points = [...pending, previewPoint];
@@ -3525,10 +3533,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       });
       if (lifecycle.signal.aborted) return;
       const { entities, warnings = [], selectedIds = [], changed, diagnostics = [], diagnosticIds } = result;
-      if (operation === "offset") {
-        offsetPreview = { entities, original: options.id, ids: selectedIds, warnings };
-        fields.cut.value = "new";
-      } else if (operation === "notch-series") {
+      if (operation === "notch-series") {
         notchPreview = { entities, ids: selectedIds, warnings };
       } else if (operation === "trim-quick") {
         if (changed) commit(entities, { warnings: [...current.warnings, ...warnings], ids: [] });
@@ -3540,7 +3545,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         else if (!changed && repairLocations.length) showRepairDiagnostics(repairLocations, repairSourceIds, feedback);
         else log(feedback || "Проверка завершена.");
         canvas.focus({ preventScroll: true });
-      } else if (operation === "repair-part" || operation === "repair-conflict" || operation === "simplify") {
+      } else if (["repair-part", "repair-conflict", "close-outline", "simplify"].includes(operation)) {
         if (changed) commit(entities, { ids: selectedIds });
         const feedback = warnings.map(warning => warning?.message || String(warning)).join(" ");
         if (!changed && diagnostics.length) showRepairDiagnostics(diagnostics, options.ids);
@@ -3565,24 +3570,198 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     else log("Введите положительную глубину надсечки.", true);
   }
 
-  function previewEntities() {
-    const { entities, original, ids } = offsetPreview;
-    const originalCuts = fields.cut.value === "original";
-    return entities.map(entity => {
-      if (entity.id === original || entity.parentId === original) return { ...entity, reference: !originalCuts };
-      if (ids.includes(entity.id) || ids.includes(entity.parentId)) return { ...entity, reference: originalCuts };
-      return entity;
+  function offsetContact(point) {
+    const contours = selectedOutlines().filter(editableInGroup);
+    const ids = new Set(contours.map(entity => entity.id));
+    return hit(point, entity => editableInGroup(entity) && cuttingEdge(entity) && (!ids.size || ids.has(entity.id)));
+  }
+
+  function startOffset(point) {
+    const contact = offsetContact(point);
+    if (!contact) {
+      log("Щёлкните по линии контура.", true);
+      return;
+    }
+    const { entity, point: anchor } = contact;
+    const path = geometry(entity).path;
+    const edge = contactEdge(contact);
+    const tangent = arcContactTangent(contact, anchor);
+    const direction = tangent ? mul(tangent, Math.sign(edge?.arc?.sweep ?? entity.sweep ?? 1))
+      : contact.direction || nearestSegment(anchor, path)?.direction;
+    const length = direction ? norm(direction) : 0;
+    if (length <= EPSILON) return;
+    const contours = selectedOutlines().filter(editableInGroup);
+    const originals = new Set(contours.length ? contours.map(item => item.id) : [entity.id]);
+    const family = familyIds(originals);
+    const source = current.entities.filter(item => family.has(item.id));
+    const closed = entity.type === "circle" || entity.closed === true || entity.type === "ellipse" && Math.abs(entity.sweep) === 360;
+    const winding = closed ? path.reduce((sum, item, index) =>
+      sum + cross(sub(item, anchor), sub(path[(index + 1) % path.length], anchor)), 0) : 0;
+    const normalSign = closed && winding >= 0 ? -1 : 1;
+    const state = {
+      originals, family, source, anchor, left: [-direction[1] / length, direction[0] / length],
+      options: originals.size === 1 ? { id: entity.id } : { ids: [...originals] },
+      normalSign, closed, side: 1, pointerDistance: 0, target: 0, result: null, requested: null,
+      timer: null, controller: new AbortController(), error: "", applying: false, findingAnchor: originals.size > 1,
+    };
+    offsetPreview = state;
+    fields["offset-distance"].value = "";
+    cursor = point;
+    hover = null;
+    log();
+    update();
+    if (state.findingAnchor) void readOffsetAnchor(state, entity.id);
+  }
+
+  function offsetRequest(state, operation, options) {
+    return request("/api/cad/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entities: state.source, operation, options }),
+      signal: AbortSignal.any([state.controller.signal, AbortSignal.timeout(15_000)]),
     });
   }
 
-  function applyOffset() {
+  async function readOffsetAnchor(state, anchorId) {
+    try {
+      const { normalSign, closed } = await offsetRequest(state, "offset-anchor", { ...state.options, anchorId });
+      if (offsetPreview !== state) return;
+      state.normalSign = normalSign;
+      state.closed = closed;
+      state.findingAnchor = false;
+      updateOffsetDistance(cursor);
+    } catch (error) {
+      if (offsetPreview !== state) return;
+      clearOffset();
+      log(errorMessage(error), true);
+      update();
+    }
+  }
+
+  function clearOffset() {
     if (!offsetPreview) return;
-    const entities = previewEntities();
-    const warnings = [...current.warnings, ...offsetPreview.warnings];
-    const ids = fields.cut.value === "original" ? [offsetPreview.original] : offsetPreview.ids;
+    clearTimeout(offsetPreview.timer);
+    offsetPreview.controller.abort();
     offsetPreview = null;
+  }
+
+  function offsetSide(state) {
+    return state.closed ? state.side > 0 ? "Наружу" : "Внутрь" : state.side > 0 ? "Слева" : "Справа";
+  }
+
+  function renderOffsetControls() {
+    const state = offsetPreview;
+    views["offset-preview"].hidden = !state;
+    if (!state) return;
+    const input = fields["offset-distance"];
+    input.disabled = state.findingAnchor || state.applying;
+    input.placeholder = state.pointerDistance ? format(state.pointerDistance) : "0";
+    actions["offset-side"].textContent = offsetSide(state);
+    actions["offset-side"].disabled = input.disabled;
+    actions.apply.disabled = input.disabled || !state.target;
+    const warnings = state.result?.distance === state.target && state.result.warnings
+      .map(warning => warning?.message || String(warning)).join(" ");
+    const message = state.findingAnchor ? "Проверяем стыки контура…" : state.applying ? "Строим припуск…"
+      : state.error || warnings || "";
+    if (views["preview-warning"].textContent !== message) views["preview-warning"].textContent = message;
+    views["preview-warning"].hidden = !message;
+  }
+
+  function drawOffsetGuide() {
+    const state = offsetPreview;
+    const anchor = state?.anchor || cursor;
+    if (!anchor) return;
+    const [x, y] = screen(anchor);
+    context.save();
+    context.strokeStyle = CAD_SNAP_COLOR;
+    context.lineWidth = 1.5;
+    context.strokeRect(x - 4, y - 4, 8, 8);
+    context.restore();
+    if (!state?.target) return;
+    const end = add(anchor, mul(state.left, state.target * state.normalSign));
+    drawTransformGuide(anchor, end);
+    drawTransformLabel(end, `${offsetSide(state)} · ${formatLength(Math.abs(state.target))}`);
+  }
+
+  function setOffsetTarget(apply = false) {
+    const state = offsetPreview;
+    const input = fields["offset-distance"];
+    if (!state || state.findingAnchor || state.applying) return;
+    const distance = input.value.trim() ? validSize(input.value.trim()) : state.pointerDistance;
+    const target = distance > CAD_POINT_EPSILON && distance <= MAX_COORDINATE ? state.side * distance : 0;
+    if (target !== state.target) state.error = "";
+    state.target = target;
+    if (apply && !target) {
+      state.error = "Укажите ненулевое смещение в миллиметрах.";
+    } else if (target) {
+      state.applying = apply;
+      if (apply && state.result?.distance === target) {
+        commitOffset(state.result);
+        return;
+      }
+      if (state.requested === null && state.result?.distance !== target && (apply || !state.error && state.timer === null)) {
+        if (apply) clearTimeout(state.timer);
+        state.timer = setTimeout(() => void calculateOffset(state), apply ? 0 : 45);
+      }
+    }
+    renderOffsetControls();
+    draw();
+  }
+
+  function updateOffsetDistance(point) {
+    const state = offsetPreview;
+    if (!state || state.findingAnchor || state.applying) return;
+    if (point) {
+      const signed = dot(sub(point, state.anchor), state.left) * state.normalSign;
+      if (Math.abs(signed) * scale > 2) state.side = Math.sign(signed);
+      state.pointerDistance = Math.abs(signed) * scale > 2 ? Number(Math.abs(signed).toFixed(3)) : 0;
+    }
+    setOffsetTarget();
+  }
+
+  async function calculateOffset(state) {
+    state.timer = null;
+    const distance = state.target;
+    if (offsetPreview !== state || !distance || state.result?.distance === distance) return;
+    state.requested = distance;
+    try {
+      const { entities, selectedIds, warnings = [] } = await offsetRequest(state, "offset",
+        { ...state.options, distance, keepOriginal: true });
+      if (offsetPreview !== state) return;
+      const updated = new Map(entities.map(entity => [entity.id, entity]));
+      state.result = { distance, ids: new Set(selectedIds), warnings,
+        entities: [...current.entities.map(entity => updated.get(entity.id) || entity),
+          ...entities.filter(entity => !state.family.has(entity.id))] };
+      if (state.applying && state.target === distance) {
+        commitOffset(state.result);
+        return;
+      }
+    } catch (error) {
+      if (offsetPreview !== state) return;
+      if (state.target === distance) {
+        state.applying = false;
+        state.error = errorMessage(error);
+        state.result = null;
+      }
+    } finally {
+      if (offsetPreview === state) {
+        state.requested = null;
+        if (state.target && state.target !== distance) void calculateOffset(state);
+        renderOffsetControls();
+        draw();
+      }
+    }
+  }
+
+  function previewEntities() {
+    const { result, target } = offsetPreview;
+    return !offsetPreview.error && Math.sign(result?.distance ?? 0) === Math.sign(target) && result
+      ? result.entities : current.entities;
+  }
+
+  function commitOffset({ entities, warnings, ids }) {
     choose("select");
-    commit(entities, { warnings, ids });
+    commit(entities, { warnings: [...current.warnings, ...warnings], ids });
   }
 
   function setReference() {
@@ -3633,9 +3812,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (event.button === 1 || spacePressed) {
       event.preventDefault();
       gesture = { type: "pan", start, center, pointerId: event.pointerId };
-    } else if (event.button === 0 && !running && !offsetPreview && !notchPreview) {
+    } else if (event.button === 0 && !running && !notchPreview) {
       const point = world(start);
-      if (tool === "scale") {
+      if (tool === "offset") {
+        if (!offsetPreview) startOffset(point);
+        else {
+          updateOffsetDistance(point);
+          setOffsetTarget(true);
+        }
+        return;
+      } else if (tool === "scale") {
         const handle = scaleBox && scaleHandleAt(start);
         if (!handle) return;
         scaleSide = handle;
@@ -3727,6 +3913,19 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       updateGrip(point, event.altKey, event.shiftKey);
     }
     const location = world(at);
+    if (tool === "offset") {
+      if (gesture) draw();
+      else if (offsetPreview) {
+        cursor = location;
+        updateOffsetDistance(location);
+      } else {
+        const contact = offsetContact(location);
+        hover = contact?.entity || null;
+        cursor = contact?.point || null;
+        draw();
+      }
+      return;
+    }
     const picking = tool === "select" || tool.startsWith("notch") || tool === "erase" && event.shiftKey;
     hover = !gesture && !offsetPreview && !notchPreview && picking ? pickAt(location)?.entity : null;
     if (gesture?.type === "scale" && gesture.parameters) {
@@ -3898,6 +4097,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       }
     }
     if (!actions.join.hidden) groupCommands.push(menuControl(actions.join, "join"));
+    if (!actions["close-outline"].disabled) groupCommands.push(menuControl(actions["close-outline"], "close-outline"));
     if (!actions.ungroup.hidden) groupCommands.push(menuControl(actions.ungroup, "ungroup"));
     const pointCommands = [];
     if (editableInGroup(entity) && !entity.notch && ["line", "polyline", "spline"].includes(entity.type)) {
@@ -4066,12 +4266,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     fit: () => fit(offsetPreview ? previewEntities() : current.entities),
     "erase-selection": removeSelected,
     "repair-part": () => editOnServer("repair-part", { ids: [...new Set([...selected, ...selectedEdges.keys()])] }),
+    "close-outline": () => editOnServer("close-outline", { ids: selectedOutlines().map(entity => entity.id) }),
     "show-repair-location": focusRepairLocation,
     "fix-repair-location": () => {
       const location = repairLocations[repairLocationIndex];
       if (gesture || location?.fixable !== true) return;
-      const { point, kind } = location;
-      void editOnServer("repair-conflict", { ids: location.ids ?? repairSourceIds, point, kind });
+      const { point, kind, sourceOperation } = location;
+      void editOnServer("repair-conflict", { ids: location.ids ?? repairSourceIds, point, kind, sourceOperation });
     },
     "fix-all-repair-locations": () => {
       if (!gesture && !repairBulkChecked && repairSourceIds.length) {
@@ -4103,11 +4304,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     finish: () => build(pending),
     close: () => build(pending, true),
     reference: setReference,
-    apply: applyOffset,
-    "cancel-preview": () => {
-      offsetPreview = null;
-      update();
+    apply: () => setOffsetTarget(true),
+    "offset-side": () => {
+      if (!offsetPreview) return;
+      offsetPreview.side *= -1;
+      setOffsetTarget();
     },
+    "cancel-preview": () => choose("select"),
   };
 
   for (const [key, button] of Object.entries(actions)) {
@@ -4126,7 +4329,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (!toolsPanel.hidden && !toolsPanel.contains(event.target) && !actions.tools.contains(event.target)) showTools(false);
     if (!contextMenu.contains(event.target)) closeContextMenu();
   }, listener);
-  const shortcutControls = { ...buttons, ...Object.fromEntries(["import", "save", "part", "join", "undo", "redo", "fit", "reference"]
+  const shortcutControls = { ...buttons, ...Object.fromEntries(["import", "save", "part", "join", "close-outline", "undo", "redo", "fit", "reference"]
     .filter(key => !actions[key].hidden).map(key => [key, actions[key]])) };
   const defaultKeys = { select: "V", line: "L", polyline: "P", circle: "C", arc: "A", spline: "S", point: "Q",
     rectangle: "R", square: "Shift+R", triangle: "T", polygon: "G", ellipse: "O", move: "M", copy: "Shift+C",
@@ -4175,7 +4378,14 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       else log(summary);
     });
   }, listener);
-  fields.cut.addEventListener("change", draw, listener);
+  const offsetInput = fields["offset-distance"];
+  offsetInput.addEventListener("input", () => setOffsetTarget(), listener);
+  offsetInput.addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      setOffsetTarget(true);
+    }
+  }, listener);
   for (const field of [fields.option, fields.proportional]) {
     field.addEventListener("input", () => { if (tool === "scale" && parameterDialog.open) draw(); }, listener);
   }
@@ -4200,8 +4410,6 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     if (tool === "scale" && !(value > CAD_POINT_EPSILON && value <= MAX_COORDINATE)) {
       parameterError("Введите положительный размер в миллиметрах.");
-    } else if (tool === "offset" && !(Math.abs(value) > CAD_POINT_EPSILON && Math.abs(value) <= MAX_COORDINATE)) {
-      parameterError("Введите ненулевое смещение в миллиметрах.");
     } else if (tool === "polygon" && !(Number.isInteger(value) && value >= 3 && value <= 100)) {
       parameterError("Введите целое число сторон от 3 до 100.");
     } else if (tool.startsWith("notch") && !(value > 0 && value <= MAX_COORDINATE)) {
@@ -4214,8 +4422,6 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         applyScale(scaleParameters(scaleSide, value, fields.proportional.checked));
         scaleSide = null;
         update();
-      } else if (tool === "offset" && selected.size === 1) {
-        void editOnServer("offset", { id: selected.values().next().value, distance: value, keepOriginal: true });
       } else if (tool === "notch-edit" && !relocate) updateNotch();
       else {
         placingNotch = tool === "notch-edit" && relocate;
@@ -4354,6 +4560,24 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (event.target !== canvas || event.defaultPrevented) return;
     if (event.key !== "Shift") flushPointerMove();
     const key = event.key.toLowerCase();
+    if (offsetPreview && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing) {
+      if (key === "enter") {
+        if (!event.repeat) setOffsetTarget(true);
+      } else if (key === "backspace") {
+        offsetInput.value = offsetInput.value.slice(0, -1);
+        setOffsetTarget();
+      } else if (/^\d$/.test(key) || ((key === "." || key === ",") && !/[.,]/.test(offsetInput.value))) {
+        if (offsetInput.value.length < offsetInput.maxLength) offsetInput.value += key;
+        setOffsetTarget();
+      } else if (key === "escape") {
+        choose("select");
+      } else {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const mirrorEnter = key === "enter" && tool === "mirror" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing;
     if (mirrorEnter && !event.repeat) applyMirror(cursor);
     if (mirrorEnter || handleRotationInput(event, key) || handleDirectDistance(event, key)) {
@@ -4375,7 +4599,6 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         exitGroup();
         return;
       }
-      offsetPreview = null;
       notchPreview = null;
       choose("select");
       return;
@@ -4418,9 +4641,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   canvas.focus({ preventScroll: true });
   return {
     hasUnsavedChanges: () => saved !== current || savedName !== fields.name.value.trim(),
-    isBusy: () => running,
+    isBusy: () => running || Boolean(offsetPreview?.applying),
     destroy() {
       clearPointerMove();
+      clearOffset();
       lifecycle.abort();
       observer.disconnect();
       container.classList.remove("cad-editor");
