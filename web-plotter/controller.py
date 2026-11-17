@@ -1039,9 +1039,13 @@ class Controller:
             result["baselineEvent"] = {"code": baseline, "label": EVENT_LABELS.get(baseline)}
         return result
 
-    def _move_to(self, x, y, control_token):
+    def move_x(self, x, *, control_token):
+        return self._move_to(x, None, control_token, keep_y=True)
+
+    def _move_to(self, x, y, control_token, *, keep_y=False):
         self.require_control(control_token)
-        target = self._target_ticks(x, "X", self.width), self._target_ticks(y, "Y", self.height)
+        x_ticks = self._target_ticks(x, "X", self.width)
+        y_ticks = None if keep_y else self._target_ticks(y, "Y", self.height)
 
         try:
             with self._io(), self._client() as client:
@@ -1051,6 +1055,9 @@ class Controller:
                         raise ControllerError("Сначала отпустите кнопку ручного движения.")
                 position, baseline = self._preflight(client, None, require_idle_controller=True,
                                                      settle_interval=HOLD_POSITION_INTERVAL_SECONDS)
+                if keep_y:
+                    y_ticks = self._target_ticks(position[1] / TICKS_PER_MM, "Y", self.height)
+                target = x_ticks, y_ticks
                 with self._hold_condition:
                     self._observe_preflight(baseline)
                     self._require_idle_run()

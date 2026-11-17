@@ -92,6 +92,7 @@ let rollResetIntent = null;
 let transferChecklistPlanId = null;
 let activeRun = null;
 let controllerRoll = null;
+let rollPositioningAttempted = false;
 let cutProgress = null;
 let drawingProgressModel = null;
 let completedDrawingPaths = new Set();
@@ -2910,7 +2911,10 @@ function resetTransferChecklist() {
 
 function updateControllerRoll(roll) {
   const previous = controllerRoll;
-  if (roll?.state === "advance" && (roll.planId !== previous?.planId || roll.nextPage !== previous?.nextPage)) {
+  const sameTransition = previous?.state === "advance" && roll?.state === "advance"
+    && roll.planId === previous.planId && roll.nextPage === previous.nextPage;
+  if (!sameTransition) rollPositioningAttempted = false;
+  if (roll?.state === "advance" && !sameTransition) {
     resetTransferChecklist();
   }
   controllerRoll = roll;
@@ -3081,9 +3085,28 @@ function waitingForAutomaticAdvance() {
     && controllerRoll.planId === cutPlan?.planId && !controllerRoll.materialAdvanced;
 }
 
+function rollHeadPositioningState(roll = controllerRoll) {
+  if (!demoMode && machine.rollHeadPositioning === true && roll?.state === "advance") {
+    return roll.headPositioning ?? "pending";
+  }
+  return null;
+}
+
+function rollAdvanceAllowed() {
+  if (waitingForAutomaticAdvance()) return uploadAllowed({ forAdvance: true });
+  const state = rollHeadPositioningState();
+  return ["pending", "unconfirmed", "reached"].includes(state) && controllerRoll.planId === cutPlan?.planId
+    && !layoutPreparation() && !cutWidthPending() && !drawingLocked() && !cutPlacementPreviewActive()
+    && !simulation.active && !currentUpload && controlActive() && !busy() && !runInProgress()
+    && activeRun?.state !== "transferring" && activeRun?.followupFeedPending !== true
+    && !live.stopAvailable && !stopNeedsVerification && !coordinateMoveBlocksControl()
+    && live.responded && !live.busy && live.positionFresh;
+}
+
 function uploadAllowed({ forAdvance = false } = {}) {
   if (layoutPreparation() || layoutReadOnly()) return false;
-  if (waitingForAutomaticAdvance() && !forAdvance) return false;
+  const headPositioning = rollHeadPositioningState();
+  if (!forAdvance && (waitingForAutomaticAdvance() || (headPositioning && headPositioning !== "reached"))) return false;
   const autoRunOff = machine.autoRunReadback === true ? live.autoRunOff === true
     : needsManualAutoRunConfirmation() && live.autoRunOff !== false && $("manual-auto-run-off").checked;
   return machine.verifiedJobUpload === true && controlActive() && autoRunOff
@@ -3226,6 +3249,8 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   renderPagePicker(displayedPlan, roll, importing || partMoving || !cutPlan || locked || Boolean(currentUpload));
   const directRoll = cutPlan?.mode === "roll" && cutPlan.canUpload && machine.directRoll === true;
   const waitingForAdvance = roll?.state === "advance";
+  const headPositioning = rollHeadPositioningState(roll);
+  const headMoving = headPositioning === "moving" || Boolean(headPositioning && pendingCommand === "advance-roll");
   const visibleUploadPage = uploadPageNumber(displayedPlan);
   const manualAutoRun = Boolean(visibleUploadPage && !currentUpload && !jobActive && needsManualAutoRunConfirmation());
   const canResetRoll = Boolean(controllerRoll && ["completed", "cancelled", "unknown", "ready", "advance"].includes(controllerRoll.state));
@@ -3244,12 +3269,16 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateText(uploadButton.querySelector("span"), transferring ? "Загрузка…" : "Старт");
   const canDownloadXiao = !widthPending && !jobError && cutPlan?.canPrepareXiao === true;
   const useXiao = canDownloadXiao && !currentUpload && !cutPlan.canUpload;
-  const showAdvance = !widthPending && waitingForAutomaticAdvance() && !jobActive && !layoutPreparation() && !layoutReadOnly();
+  const demoAdvance = waitingForAutomaticAdvance();
+  const showAdvance = !widthPending && (demoAdvance || Boolean(headPositioning))
+    && !jobActive && !layoutPreparation() && !layoutReadOnly();
   updateControl(advanceButton, "hidden", !showAdvance);
-  updateControl(advanceButton, "disabled", !showAdvance || !uploadAllowed({ forAdvance: true }));
-  updateText(advanceButton, pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход");
+  updateControl(advanceButton, "disabled", !showAdvance || !rollAdvanceAllowed());
+  updateText(advanceButton, headMoving ? "Позиционируем головку…" : demoAdvance
+    ? pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход"
+    : "Подтянуть ткань");
   updateControl(uploadButton, "hidden", (!visibleUploadPage && !currentUpload && !transferring)
-    || showAdvance || jobActive || ["cut", "new-cut"].includes(pendingCommand));
+    || (showAdvance && demoAdvance) || jobActive || ["cut", "new-cut"].includes(pendingCommand));
   updateControl($("job-prepare-actions"), "hidden", uploadButton.hidden && advanceButton.hidden);
   const xiaoOpen = $("prepare-xiao-open");
   const xiaoDownload = $("prepare-xiao-download");
@@ -3269,6 +3298,8 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (stopPending) status = "Отправляем команду остановки…";
   else if (pendingCommand === "cut") status = "Запускаем раскрой…";
   else if (transferring) status = "Передача чертежа…";
+  else if (headMoving) status = `Позиционируем головку для протяжки ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
+  else if (headPositioning === "unconfirmed") status = `Положение головки для протяжки ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм не подтверждено.`;
   else if (inProgress) status = runLabels[live.externalMotion || activeRun?.state] || "Проверьте штатный пульт";
   else if (stopNeedsVerification) status = "Ожидаем подтверждение остановки";
   else if (widthPending && includedBounds) status = "Укажите ширину полотна и выполните автораскладку всех деталей.";
@@ -3282,7 +3313,12 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (roll?.state === "completed") status = `Раскрой завершён · ${roll.completedPages} из ${roll.pages - (roll.firstPage ?? 1) + 1} проходов`;
   else if (cutProgress?.state === "completed" && cutProgress.planId === cutPlan.planId) status = "Раскрой завершён";
   else if (roll?.state === "cancelled" || roll?.state === "unknown") status = `Сверьте проход ${roll.page} и положение ткани перед продолжением.`;
-  else if (waitingForAdvance && showAdvance) status = `Проход ${roll.page} завершён. Протяжка на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
+  else if (headPositioning === "pending") {
+    const action = rollPositioningAttempted ? "Нажмите «Подтянуть ткань», чтобы повторить позиционирование головки." : "Готовим головку.";
+    status = `Проход ${roll.page} завершён. Протяжка ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм. ${action}`;
+  }
+  else if (headPositioning === "reached") status = `Отпустите лапки, протяните ткань на ${formatFeedDistance.format(roll.feedAfterMm)} мм, совместите начало прохода ${roll.nextPage} с X = 0 и закрепите ткань. Затем нажмите «Старт».`;
+  else if (waitingForAdvance && showAdvance && demoAdvance) status = `Проход ${roll.page} завершён. Протяжка на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
   else if (waitingForAdvance && roll.materialAdvanced) status = `Полотно подтянуто. Проход ${roll.nextPage} готов к запуску.`;
   else if (waitingForAdvance) status = `Проход ${roll.page} завершён. Следующий проход — ${roll.nextPage}.`;
   else if (useXiao && cutPlan.uploadIssue) status = cutPlan.uploadIssue;
@@ -3468,10 +3504,14 @@ async function readLive() {
   const epoch = liveEpoch;
   const readStarted = performance.now();
   let finish;
+  let observed = false;
   liveReading = new Promise((resolve) => { finish = resolve; });
   try {
     const response = await getJson("/api/controller-live", jsonRequest({}, AbortSignal.timeout(3500)));
-    if (epoch === liveEpoch && !busy()) applyLive(response);
+    if (epoch === liveEpoch && !busy()) {
+      applyLive(response);
+      observed = response.responded === true;
+    }
   } catch (error) {
     if (epoch === liveEpoch && !busy()) {
       const companionUnavailable = error.status === undefined || error.status === 403 || error.status === 404 || error.status >= 500;
@@ -3500,6 +3540,9 @@ async function readLive() {
     }
     else if (runInProgress()) delay = 500;
     if (!busy()) scheduleLiveRead(immediate ? 0 : delay);
+  }
+  if (observed && rollHeadPositioningState() === "pending" && !rollPositioningAttempted) {
+    void advanceControllerRoll({ automatic: true });
   }
 }
 
@@ -3843,12 +3886,14 @@ function requestControllerLaunch() {
   $("upload-confirm-auto-run").hidden = !intent.checkAutoRun;
   $("upload-confirm-zero").hidden = !intent.checkZero;
   const target = demoMode ? "виртуального станка" : "станка";
-  const feed = controllerRoll?.state === "advance" ? cutPlan.pages[page - 2]?.feedAfterMm : null;
+  const feed = controllerRoll?.state === "advance" ? controllerRoll.feedAfterMm ?? cutPlan.pages[page - 2]?.feedAfterMm : null;
   const showFeed = intent.checkZero && Number.isFinite(feed) && feed > 0;
   $("upload-confirm-feed").hidden = !showFeed;
   if (showFeed) {
-    const feedAction = demoMode ? "Имитируйте протяжку полотна на" : "Протяните полотно на";
-    $("upload-confirm-feed-text").textContent = `${feedAction} ${formatFeedDistance.format(feed)} мм.`;
+    const distance = formatFeedDistance.format(feed);
+    const feedAction = demoMode ? `Имитируйте протяжку полотна на ${distance} мм.` : rollHeadPositioningState() === "reached"
+      ? `Убедитесь, что ткань протянута на ${distance} мм и закреплена.` : `Протяните полотно на ${distance} мм.`;
+    $("upload-confirm-feed-text").textContent = feedAction;
   }
   $("upload-confirm-zero-text").textContent = `Совместите начало прохода ${page} с нулём ${target}.`;
   $("upload-confirm-seam").hidden = !intent.checkZero || !cutPlan.pages[page - 1]?.incomingSeams?.length;
@@ -3915,18 +3960,25 @@ async function uploadControllerDrawing(intent) {
   }
 }
 
-async function advanceControllerRoll() {
-  if (!focused() || !waitingForAutomaticAdvance() || !uploadAllowed({ forAdvance: true })) return;
+async function advanceControllerRoll({ automatic = false } = {}) {
+  if (!focused() || !rollAdvanceAllowed()) return;
+  const headPositioning = rollHeadPositioningState();
+  if (automatic && (headPositioning !== "pending" || rollPositioningAttempted)) return;
+  if (headPositioning) rollPositioningAttempted = true;
   const { planId, nextPage: page } = controllerRoll;
   const payload = { action: "advance-roll", planId, page, controlToken: control.token,
-    ...(managedCut ? { cutId: managedCut.id } : {}) };
+    ...(managedCut ? { cutId: managedCut.id } : {}), ...(automatic ? { automatic: true } : {}) };
   setPending("advance-roll");
   try {
     const result = await getJson("/api/controller-operation", jsonRequest(payload, AbortSignal.timeout(8000)));
-    if (result.roll?.planId !== planId || result.roll.nextPage !== page || result.roll.materialAdvanced !== true) {
-      throw new Error("Протяжка не подтверждена.");
+    const matching = result.roll?.planId === planId && result.roll.nextPage === page;
+    if (matching && headPositioning) applyPosition(result);
+    const confirmed = headPositioning ? ["moving", "reached"].includes(result.roll?.headPositioning)
+      : result.roll?.materialAdvanced === true;
+    if (!matching || !confirmed) {
+      throw new Error(headPositioning ? "Позиционирование головки не подтверждено." : "Протяжка не подтверждена.");
     }
-    applyJobStatus(result);
+    if (!headPositioning) applyJobStatus(result);
   } catch (error) {
     setMachineError(messageFrom(error));
   } finally {
@@ -4303,7 +4355,7 @@ rollResetDialog.addEventListener("close", () => {
   if (rollResetDialog.returnValue === "confirm") void resetControllerRoll(intent);
 });
 $("controller-upload-button").addEventListener("click", requestControllerLaunch);
-$("roll-advance-button").addEventListener("click", advanceControllerRoll);
+$("roll-advance-button").addEventListener("click", () => void advanceControllerRoll());
 $("upload-confirm-cancel").addEventListener("click", closeUploadConfirmation);
 uploadConfirmDialog.addEventListener("cancel", (event) => {
   event.preventDefault();

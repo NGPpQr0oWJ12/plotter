@@ -287,6 +287,16 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(unchanged["coordinateMove"]["state"], "reached")
         self.assertEqual(self.commands(), [b"cmd(1036,12345,6789)\0"])
 
+    def test_move_x_uses_exact_work_coordinate_and_keeps_y_from_preflight(self):
+        self.replies(STATUS, START, JOB)
+        token = self.controller.control_session("arm", ready=True)["controlToken"]
+        position = b"(237000,5364,0,-26997,0)\0"
+        self.replies(STATUS, position, position)
+        with patch("controller.sleep"):
+            move = self.controller.move_x(2004.8, control_token=token)
+        self.assertEqual(move["coordinateMove"], {"state": "moving", "x": 2004.8, "y": 53.64})
+        self.assertEqual(self.commands(), [b"cmd(1036,200480,5364)\0"])
+
     def test_coordinate_move_rejects_invalid_target_unsafe_pose_and_active_event(self):
         self.replies(STATUS, START, JOB)
         token = self.controller.control_session("arm", ready=True)["controlToken"]

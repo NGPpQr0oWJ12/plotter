@@ -212,13 +212,15 @@ class RollRun:
     started_at: int | None = None
     baseline_event: int | None = None
     material_advanced: bool = False
+    head_positioning: str | None = None
+    head_move_target: tuple[float, float] | None = None
 
     def snapshot(self):
         next_page = self.page if self.state == "ready" else self.page + 1 if self.state == "advance" else None
         return {"planId": self.plan_id, "page": self.page, "pages": self.pages, "firstPage": self.first_page,
                 "state": self.state,
                 "completedPages": self.completed_pages, "feedAfterMm": self.feed_after_mm, "nextPage": next_page,
-                "materialAdvanced": self.material_advanced}
+                "materialAdvanced": self.material_advanced, "headPositioning": self.head_positioning}
 
 
 @dataclass(frozen=True)
@@ -483,6 +485,7 @@ class PlotterState:
                 "directRoll": True,
                 "continuousRoll": True,
                 "automaticRollFeed": self.demo_mode,
+                "rollHeadPositioning": not (self.demo_mode or self.central_mode),
                 "liveCutProgress": True,
                 "stopDuringExternalRun": True,
                 "arbitraryNestRotation": True,
@@ -595,7 +598,7 @@ class PlotterState:
             progress = replace(progress, state=state)
         self.cut_progress = progress
 
-    def verify_roll_advance(self):
+    def verify_roll_advance(self, *, positioning=False):
         # Completion was already recorded before the operator moved the fabric.
         # Check that the machine is still ready even if releasing the material reset the job index.
         result = self.controller.read_live()
@@ -603,6 +606,7 @@ class PlotterState:
         if (result.get("responded") is not True or result.get("busy") or not result.get("position")
                 or result.get("motionInhibited") or result.get("externalMotion")
                 or run.get("fresh") is not True or run.get("state") not in ("idle", "ready", "completed", "cancelled")
+                or (positioning and run.get("followupFeedPending"))
                 or result.get("lastEvent", {}).get("code") in ACTIVE_CONTROLLER_EVENTS):
             raise RequestError("Контроллер не подтвердил готовность к следующему проходу. Сверьте станок на пульте.",
                                HTTPStatus.CONFLICT)
@@ -638,6 +642,13 @@ class PlotterState:
         roll = self.roll
         if roll is None:
             return
+        if roll.state == "advance" and roll.head_positioning == "moving":
+            move = result.get("coordinateMove") or {}
+            state = move.get("state") if (move.get("x"), move.get("y")) == roll.head_move_target else None
+            if state != "moving":
+                self.roll = replace(roll, head_positioning="reached" if state == "reached" else "unconfirmed",
+                                    head_move_target=None)
+            return
         run = result.get("run", {})
         if roll.state == "ready":
             roll = self.observe_ready_roll(roll, result, run)
@@ -646,7 +657,9 @@ class PlotterState:
             return
         if self.page_finished(roll, result):
             state = "completed" if roll.page == roll.pages else "advance"
-            self.roll = replace(roll, state=state, completed_pages=roll.completed_pages + 1)
+            head_positioning = "pending" if state == "advance" and not self.demo_mode else None
+            self.roll = replace(roll, state=state, completed_pages=roll.completed_pages + 1,
+                                head_positioning=head_positioning)
         elif roll.state == "unknown" and run.get("fresh") and run.get("state") in ("running", "paused", "feeding"):
             self.roll = replace(roll, state="running")
         elif run.get("state") in ("cancelled", "unknown", "error"):
@@ -970,6 +983,9 @@ class PlotterState:
             if previous and previous.state == "advance":
                 if not advance_confirmed:
                     raise RequestError("Подтвердите протяжку ткани и положение рабочего нуля.")
+                if not self.demo_mode and previous.head_positioning != "reached":
+                    raise RequestError("Сначала дождитесь, пока головка встанет на границу следующего прохода.",
+                                       HTTPStatus.CONFLICT)
                 self.verify_roll_advance()
             elif previous:
                 self.verify_ready_roll()
@@ -1041,14 +1057,15 @@ class PlotterState:
         return self.controller.hold(*args)
 
     def advance_roll_material(self, data, control_token):
-        if not self.demo_mode:
-            raise RequestError("Автопротяжка с заданным расстоянием доступна в деморежиме.", HTTPStatus.CONFLICT)
-        self.controller.require_control(control_token)
         with request_lock(self.upload_lock, "Дождитесь завершения передачи задания."), self.workspace_lock:
             roll = self.roll
             if (roll is None or roll.state != "advance" or data.get("planId") != roll.plan_id
                     or type(data.get("page")) is not int or data["page"] != roll.page + 1):
                 raise RequestError("Следующий проход ещё не готов к протяжке.", HTTPStatus.CONFLICT)
+            self.controller.require_control(control_token)
+            if (not self.demo_mode and (roll.head_positioning == "moving" or
+                    (data.get("automatic") is True and roll.head_positioning != "pending"))):
+                return {**self.cut_status(), "feedMm": roll.feed_after_mm}
             job, filename = self.current_drawing(data.get("cutId"), for_machine=True)
             page_add = self.controller.upload_page_add()
             current = drawing_key(job, filename, self.simulator.width, self.simulator.height, page_add, roll=True)
@@ -1058,10 +1075,17 @@ class PlotterState:
                 return {**self.cut_status(), "feedMm": roll.feed_after_mm}
             if not 0 < roll.feed_after_mm <= self.roll_pass_length(page_add):
                 raise RequestError("Раскладка не содержит допустимого расстояния протяжки.", HTTPStatus.CONFLICT)
-            self.verify_roll_advance()
-            result = self.controller.advance_material(roll.feed_after_mm, control_token=control_token)
-            self.roll = replace(roll, material_advanced=True)
-            return {**self.cut_status(), **result}
+            self.verify_roll_advance(positioning=not self.demo_mode)
+            if self.demo_mode:
+                result = self.controller.advance_material(roll.feed_after_mm, control_token=control_token)
+                self.roll = replace(roll, material_advanced=True)
+            else:
+                # The next pass is measured from this pass's X=0. Keep the head's current Y.
+                result = self.controller.move_x(roll.feed_after_mm, control_token=control_token)
+                move = result["coordinateMove"]
+                target = (move["x"], move["y"]) if move["state"] == "moving" else None
+                self.roll = replace(roll, head_positioning=move["state"], head_move_target=target)
+            return {**self.cut_status(), "feedMm": roll.feed_after_mm, **result}
 
     def operate_controller(self, data):
         action, token = data.get("action"), data.get("controlToken")

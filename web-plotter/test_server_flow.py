@@ -367,6 +367,12 @@ class ServerFlowTests(unittest.TestCase):
         self.controller.read_live.return_value = report
         return report
 
+    def position_next_head(self, plan, page, *, state="reached"):
+        target = plan["pages"][page - 2]["feedAfterMm"]
+        self.controller.move_x.return_value = {"coordinateMove": {"state": state, "x": target, "y": 30.25}}
+        return self.request("/api/controller-operation", {"action": "advance-roll", "controlToken": "control",
+                                                         "planId": plan["planId"], "page": page, "automatic": True})
+
     def test_status_reports_material_control_capabilities(self):
         with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
             client.request("GET", "/api/status")
@@ -383,6 +389,7 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(status["machine"]["rollPassLengthMm"], 2450)
         self.assertIs(status["machine"]["continuousRoll"], True)
         self.assertIs(status["machine"]["coordinateMove"], True)
+        self.assertIs(status["machine"]["rollHeadPositioning"], True)
         self.assertIs(status["machine"]["stopDuringExternalRun"], True)
         self.assertIs(status["machine"]["independentVacuumControl"], True)
         self.assertIs(status["machine"]["clampControl"], True)
@@ -687,6 +694,52 @@ class ServerFlowTests(unittest.TestCase):
         self.request("/api/controller-operation", {"action": "advance-roll", "page": 2}, HTTPStatus.CONFLICT)
         self.assertEqual(self.controller.mock_calls, [])
 
+    def test_roll_head_positions_at_exact_continuation_boundary_once_and_waits_for_arrival(self):
+        workspace = drawing()
+        workspace["paths"] = [
+            {"layer": "Крой", "closed": True, "points": [[40, 50], [3100, 50], [3100, 70], [40, 70]]},
+            {"layer": "Крой", "closed": False, "points": [[2004.8, 100], [2700, 150]]},
+        ]
+        workspace["excluded"] = []
+        self.save(workspace)
+        plan = self.preview(workspace)
+        self.assertTrue(plan["hasContinuations"])
+        self.assertEqual((plan["pages"][0]["feedAfterMm"], plan["pages"][1]["startX"]), (2004.8, 2004.8))
+        first = self.upload(plan, advanceConfirmed=True)
+        self.report_live(first, 8, "ready")
+        self.controller.operate.return_value = {"sent": True, "run": {"state": "starting", "startedAt": 11}}
+        self.start(plan, first)
+        command = {"action": "advance-roll", "controlToken": "control", "planId": plan["planId"],
+                   "page": 2, "automatic": True}
+        self.request("/api/controller-operation", command, HTTPStatus.CONFLICT)
+        report = self.report_live(first, 4, "completed", startedAt=11, endedAt=12, completedPages=1,
+                                  followupFeedPending=True)
+        state = self.request("/api/controller-live", {})["roll"]
+        self.assertEqual(state["headPositioning"], "pending")
+        self.request("/api/controller-operation", command, HTTPStatus.CONFLICT)
+        self.controller.move_x.assert_not_called()
+        report["run"]["followupFeedPending"] = False
+
+        moving = self.position_next_head(plan, 2, state="moving")
+        self.assertEqual((moving["roll"]["headPositioning"], moving["feedMm"]), ("moving", 2004.8))
+        self.assertEqual(self.request("/api/controller-operation", command)["roll"]["headPositioning"], "moving")
+        self.controller.move_x.assert_called_once_with(2004.8, control_token="control")
+        self.upload(plan, HTTPStatus.CONFLICT, page=2, advanceConfirmed=True)
+
+        report["coordinateMove"] = {**moving["coordinateMove"], "state": "unconfirmed"}
+        self.assertEqual(self.request("/api/controller-live", {})["roll"]["headPositioning"], "unconfirmed")
+        self.assertEqual(self.request("/api/controller-operation", command)["roll"]["headPositioning"], "unconfirmed")
+        self.controller.move_x.assert_called_once()
+        self.request("/api/controller-operation", {**command, "automatic": False})
+        report["coordinateMove"]["state"] = "reached"
+        reached = self.request("/api/controller-live", {})["roll"]
+        self.assertEqual(reached["headPositioning"], "reached")
+        self.assertFalse(reached["materialAdvanced"])
+        self.upload(plan, HTTPStatus.BAD_REQUEST, page=2)
+        self.assertEqual(self.upload(plan, page=2, advanceConfirmed=True)["roll"]["page"], 2)
+        self.assertEqual(self.controller.move_x.call_count, 2)
+        self.controller.advance_material.assert_not_called()
+
     def test_demo_disallows_xiao_handoff_and_keeps_real_status(self):
         with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
             client.request("GET", "/demo/api/status")
@@ -870,11 +923,14 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(self.request("/api/controller-live", {})["roll"]["nextPage"], 2)
         self.upload(plan, HTTPStatus.BAD_REQUEST, page=2, autoRunOff=True)
         self.report_live(first, 50, "feeding")
+        self.request("/api/controller-operation", {"action": "advance-roll", "controlToken": "control",
+                                                   "planId": plan["planId"], "page": 2}, HTTPStatus.CONFLICT)
         self.upload(plan, HTTPStatus.CONFLICT, page=2, autoRunOff=True, advanceConfirmed=True)
         live = self.report_live(first, 5, "completed", startedAt=11, endedAt=12, completedPages=1)
         # Releasing the material can reset the controller's last job index after observed completion.
         live["indexLimit"] = 0
         live["run"].update(index=None, indexLimit=None)
+        self.position_next_head(plan, 2)
         second = self.upload(plan, page=2, autoRunOff=True, advanceConfirmed=True)
         self.assertEqual((second["roll"]["completedPages"], second["roll"]["page"]), (1, 2))
 
@@ -955,6 +1011,7 @@ class ServerFlowTests(unittest.TestCase):
         finish(11, first, event=50)
         self.upload(plan, HTTPStatus.CONFLICT, page=2, advanceConfirmed=True, autoRunOff=True)
         finish(11, first, event=11)
+        self.position_next_head(plan, 2)
         second = self.upload(plan, page=2, advanceConfirmed=True, autoRunOff=True)
         self.assertEqual((second["roll"]["state"], second["roll"]["completedPages"]), ("ready", 1))
         encoded, _, _ = self.controller.upload_job.call_args.args
@@ -965,6 +1022,7 @@ class ServerFlowTests(unittest.TestCase):
         self.start(plan, second)
         self.assertEqual(finish(21, second)["nextPage"], 3)
 
+        self.position_next_head(plan, 3)
         third = self.upload(plan, page=3, advanceConfirmed=True, autoRunOff=True)
         self.report_live(third, 8, "ready")
         self.controller.operate.return_value = {"sent": True, "run": {"state": "starting", "startedAt": 31}}
@@ -1011,6 +1069,7 @@ class ServerFlowTests(unittest.TestCase):
         self.report_live(first, 4, "completed", startedAt=11, endedAt=12, completedPages=1)
         progress = self.request("/api/controller-live", {})["cutProgress"]
         self.assertEqual((progress["state"], progress["page"], progress["index"]), ("advance", 1, 4))
+        self.position_next_head(plan, 2)
         second = self.upload(plan, page=2, advanceConfirmed=True)
         self.assertEqual((second["cutProgress"]["index"], second["cutProgress"]["completedPages"]), (0, 1))
         self.assertEqual(second["cutProgress"]["events"][-2]["kind"], "page_completed")
@@ -1066,6 +1125,7 @@ class ServerFlowTests(unittest.TestCase):
         self.upload(plan, HTTPStatus.CONFLICT, page=1, advanceConfirmed=True)
         self.upload(plan, HTTPStatus.CONFLICT, page=2, advanceConfirmed=True)
 
+        self.position_next_head(plan, 3)
         third = self.upload(plan, page=3, advanceConfirmed=True)
         self.report_live(third, 8, "ready")
         self.controller.operate.return_value = {"sent": True, "run": {"state": "starting", "startedAt": 31}}
@@ -1095,6 +1155,7 @@ class ServerFlowTests(unittest.TestCase):
         after_first = self.request("/api/controller-live", {})["roll"]
         self.assertEqual((after_first["state"], after_first["completedPages"], after_first["nextPage"]),
                          ("advance", 1, 2))
+        self.position_next_head(plan, 2)
         second = self.upload(plan, page=2, advanceConfirmed=True)
         self.assertEqual((second["roll"]["page"], second["roll"]["state"]), (2, "ready"))
 

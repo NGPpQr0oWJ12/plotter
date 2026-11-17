@@ -60,6 +60,8 @@ class RunMonitor:
                   "startedReceipt": self.started_receipt,
                   "endedAt": self.ended_at, "updatedAt": self.updated_at, "fresh": fresh,
                   "completedIndex": self.completed_index,
+                  "followupFeedPending": self.followup_feed_deadline is not None
+                                         and monotonic() <= self.followup_feed_deadline,
                   "events": list(self.events)}
         if fresh and self.index is not None:
             result["index"] = self.index
