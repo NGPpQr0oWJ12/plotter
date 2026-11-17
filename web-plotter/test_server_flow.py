@@ -404,6 +404,32 @@ class ServerFlowTests(unittest.TestCase):
                 response.read()
         self.controller.operate.assert_not_called()
 
+    def test_deferred_cut_cannot_transfer_or_export_a_partial_layout_with_tentative_width(self):
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Сиденье", "entities": [
+            {"id": "perimeter", "type": "polyline", "layer": "0", "closed": True,
+             "points": [[20, 20], [60, 20], [60, 70], [20, 70]]},
+        ]})
+        order = self.request("/api/orders", {"action": "save", "number": "Без указанной ткани"})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Крой", "members": [{"id": part["id"], "quantity": 2}]})
+        cut_id = order["cutId"]
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        self.controller.read_live.return_value = {"responded": False}
+        working = self.request("/api/cut-context", {"action": "select", "cutId": cut_id})
+        draft = working["workspace"]
+        draft["excluded"] = [1]
+        draft["optimization"]["nesting"] = {"widthMm": 1380, "gapMm": 3, "marginMm": 0,
+                                             "rotation": "quarter", "widthExplicit": True}
+        saved = self.request("/api/operator-workspace", {"mode": "operator", "action": "save", "cutId": cut_id, **working})
+        self.assertIsNone(saved["widthMm"])
+        job, filename = self.server.workspace_drawing(saved["workspace"])
+        plan = self.request("/api/cut-plan", {"job": {**job, "cutContext": [cut_id, saved["cutRevision"]]},
+                                              "filename": filename})
+        self.assertTrue(plan["canPrepareXiao"])
+        self.upload(plan, HTTPStatus.CONFLICT, cutId=cut_id, autoRunOff=True)
+        self.request("/api/prepare-xiao", {"planId": plan["planId"], "cutId": cut_id}, HTTPStatus.CONFLICT)
+        self.controller.upload_job.assert_not_called()
+
     def test_unloaded_registered_cut_returns_to_queue_only_when_controller_is_idle(self):
         model = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Диван", "model": True})
         part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Сиденье", "entities": [

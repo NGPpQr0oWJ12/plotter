@@ -1,9 +1,10 @@
+from datetime import datetime
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from production_store import ProductionStore, RecordNotFound, verify_arrangement
+from production_store import MOSCOW_TIME, ProductionStore, RecordNotFound, verify_arrangement
 from workspace import WorkspaceConflict
 
 
@@ -143,6 +144,107 @@ class ProductionTests(unittest.TestCase):
         self.add_cut("Новый размер детали")
         self.assertFalse(self.order["cuts"][-1]["prepared"])
         self.assertEqual(self.store.workspace(cut_id, "design"), before)
+
+    def test_no_width_prefers_newest_distinct_compatible_kit_layout(self):
+        def save_variant(width):
+            draft = self.store.kit_layout(self.kit["id"], width, 2)
+            for path in draft["workspace"]["paths"]:
+                path["points"] = [[x + 50 * path["partNumber"], y + width / 10] for x, y in path["points"]]
+            return self.store.save_kit_layout(draft, verify_arrangement)
+
+        save_variant(1000)
+        latest = save_variant(1400)
+        first = save_variant(1000)
+        self.assertEqual(first["revision"], 2)
+
+        def reject_latest(draft, width):
+            if width == 1400:
+                raise ValueError("Недоступная ширина.")
+            verify_arrangement(draft, width)
+
+        for options, verifier, expected in (
+                ({}, verify_arrangement, latest), ({"widthMm": None}, reject_latest, first),
+                ({"widthMm": 1000}, verify_arrangement, first)):
+            with self.subTest(options=options, verifier=verifier.__name__):
+                self.order = self.store.save_cut({"orderId": self.order["id"], "orderRevision": self.order["revision"],
+                                                  "name": "Ткань", "members": [self.member(self.kit)], **options}, verifier)
+                cut = self.order["cuts"][-1]
+                draft = self.store.workspace(cut["id"], "design")
+                self.assertEqual((cut["widthMm"], cut["prepared"], draft["widthMm"]),
+                                 (expected["widthMm"], True, expected["widthMm"]))
+                self.assertEqual(draft["workspace"]["paths"], expected["workspace"]["paths"])
+
+    def test_new_order_without_model_or_width_can_be_assigned_and_arranged_by_operator(self):
+        today = datetime.now(MOSCOW_TIME).date().isoformat()
+        order = self.store.save_order({"number": "260555", "notes": "Ткань у оператора"})
+        self.assertEqual((order["modelId"], order["modelName"], order["quantity"], order["dueOn"]), (None, None, 1, None))
+        self.assertIn(order["placedOn"], (today, datetime.now(MOSCOW_TIME).date().isoformat()))
+        order = self.store.save_cut({"orderId": order["id"], "orderRevision": order["revision"], "name": "Ткань",
+                                     "members": [self.member(self.part)]})
+        cut_id = order["cutId"]
+        draft = self.store.workspace(cut_id, "design")
+        self.assertIsNone(draft["widthMm"])
+        self.assertNotIn("nesting", draft["workspace"]["optimization"])
+        draft["workspace"]["excluded"] = [0]
+        saved = self.store.save_workspace({"cutId": cut_id, **draft}, "design", verify_arrangement)
+        with self.assertRaisesRegex(ValueError, "все детали"):
+            self.store.publish_order(order, verify_arrangement)
+        saved["workspace"]["excluded"] = []
+        self.store.save_workspace({"cutId": cut_id, **saved}, "design", verify_arrangement)
+        published = self.store.publish_order(order, verify_arrangement)
+        cut, = published["cuts"]
+        self.assertEqual((cut["widthMm"], cut["prepared"], cut["released"]), (None, False, True))
+        self.assertIsNone(self.store.workspace(cut_id, "operator")["widthMm"])
+
+        demo = self.store.progress(cut_id, "start", "demo")
+        nesting = {"widthMm": 700, "gapMm": 3, "marginMm": 0, "rotation": "quarter"}
+        demo["workspace"]["optimization"]["nesting"] = nesting
+        saved_demo = self.store.save_workspace({"cutId": cut_id, **demo}, "demo", verify_arrangement)
+        self.assertIsNone(saved_demo["widthMm"])
+        opened = self.store.progress(cut_id, "start", "operator")
+        self.assertEqual((opened["widthMm"], opened["opened"], opened["status"]), (None, True, "active"))
+        opened["workspace"]["optimization"]["nesting"] = {**nesting, "widthMm": 10}
+        invalid = self.store.save_workspace({"cutId": cut_id, **opened}, "operator", verify_arrangement)
+        self.assertIsNone(invalid["widthMm"])
+        self.assertFalse(self.store.orders(order["id"])["cuts"][0]["prepared"])
+
+        invalid["workspace"]["optimization"]["nesting"] = nesting
+        saved = self.store.save_workspace({"cutId": cut_id, **invalid}, "operator", verify_arrangement)
+        self.assertEqual(saved["widthMm"], 700)
+        released = self.store.release_cut(cut_id, saved["revision"])
+        self.assertEqual((released["widthMm"], released["status"]), (700, "pending"))
+        public, = self.store.orders(published_only=True)["orders"]
+        self.assertEqual((public["materials"][0]["widthMm"], public["materials"][0]["prepared"]), (700, True))
+        reopened = self.store.reopen_order(published)
+        pending, = reopened["cuts"]
+        self.assertEqual((pending["widthMm"], pending["prepared"]), (None, False))
+        self.assertNotIn("nesting", self.store.workspace(cut_id, "design")["workspace"]["optimization"])
+        republished = self.store.publish_order(reopened, verify_arrangement)
+        self.assertEqual((republished["cuts"][0]["widthMm"], republished["cuts"][0]["released"]), (None, True))
+
+    def test_designer_adopts_width_only_after_valid_layout_and_metadata_edits_keep_it(self):
+        order = self.store.save_cut({"orderId": self.order["id"], "orderRevision": self.order["revision"],
+                                     "name": "Подкладка", "members": [self.member(self.part)]})
+        cut_id = order["cutId"]
+        record = self.store.workspace(cut_id, "design")
+        record["workspace"]["optimization"]["nesting"] = {"widthMm": 750, "gapMm": 3, "marginMm": 0,
+                                                             "rotation": "quarter"}
+        invalid = self.store.save_workspace({"cutId": cut_id, **record}, "design", verify_arrangement)
+        self.assertIsNone(invalid["widthMm"])
+        for path in invalid["workspace"]["paths"]:
+            path["points"] = [[x + 50 * path["partNumber"], y] for x, y in path["points"]]
+        saved = self.store.save_workspace({"cutId": cut_id, **invalid}, "design", verify_arrangement)
+        self.assertEqual(saved["widthMm"], 750)
+        renamed_order = self.store.save_order({"id": order["id"], "revision": order["revision"], "number": "260556",
+                                               "notes": "Сначала подкладка"})
+        for field in ("modelId", "modelName", "quantity", "placedOn", "dueOn"):
+            self.assertEqual(renamed_order[field], order[field])
+        renamed = self.store.save_cut({"id": cut_id, "orderId": order["id"], "orderRevision": renamed_order["revision"],
+                                       "name": "Ткань"})
+        kept = self.store.workspace(cut_id, "design")
+        self.assertEqual((kept["widthMm"], kept["cutRevision"], kept["workspace"]),
+                         (750, saved["cutRevision"], saved["workspace"]))
+        self.assertTrue(self.store.publish_order(renamed, verify_arrangement)["cuts"][0]["prepared"])
 
     def test_snapshots_operator_progress_demo_and_reopen(self):
         first, second = self.add_cut("Основная ткань"), self.add_cut("Подкладка")

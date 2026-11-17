@@ -117,13 +117,18 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
   dialog.setAttribute("aria-labelledby", "cad-shortcut-title");
   const title = element(root, "h2", "", "Горячие клавиши");
   title.id = "cad-shortcut-title";
-  title.tabIndex = -1;
   const heading = element(root, "header", "drawing-dialog-heading cad-shortcut-heading");
   heading.append(title);
   const body = element(root, "div", "drawing-dialog-body cad-shortcut-body");
-  const instructions = element(root, "p", "cad-shortcut-instructions",
-    "Выберите «Назначить» и нажмите клавишу или сочетание. Буквы обозначены по латинской раскладке. Esc отменяет ввод.");
+  const search = element(root, "input", "cad-shortcut-search");
+  search.type = "search";
+  search.placeholder = "Название команды или сочетание клавиш";
+  const searchField = element(root, "label", "cad-shortcut-search-field", "Поиск по командам");
+  searchField.append(search);
   const list = element(root, "ul", "cad-shortcut-list");
+  const empty = element(root, "p", "cad-shortcut-empty", "Команды не найдены.");
+  empty.setAttribute("role", "status");
+  empty.hidden = true;
   const status = element(root, "p", "cad-shortcut-status");
   status.setAttribute("role", "status");
   status.hidden = true;
@@ -138,6 +143,20 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
     announce(storageError ? message + " Браузер не сохранил настройки для следующего сеанса." : message, storageError);
   }
 
+  function filterRows() {
+    const query = search.value.trim().toLocaleLowerCase();
+    let hasMatches = false;
+    let focusHidden = false;
+    for (const [id, { row }] of rows) {
+      const match = !query || [commandLabels.get(id), ...displayKeys(id)].some(value => value.toLocaleLowerCase().includes(query));
+      focusHidden ||= !match && row.contains(root.activeElement);
+      row.hidden = !match;
+      hasMatches ||= match;
+    }
+    empty.hidden = hasMatches;
+    if (focusHidden) search.focus({ preventScroll: true });
+  }
+
   function render() {
     for (const [id, { row, key, assign, clear }] of rows) {
       const active = capturing === id;
@@ -147,17 +166,24 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
       assign.setAttribute("aria-label", assign.textContent + " — " + commandLabels.get(id));
       clear.disabled = !bindings.has(id);
     }
+    filterRows();
+  }
+
+  function cancelCapture() {
+    if (!capturing) return;
+    capturing = null;
+    render();
+    announce("Ввод отменён.");
   }
 
   function startCapture(id) {
     if (capturing === id) {
-      capturing = null;
-      announce("Ввод отменён.");
-    } else {
-      capturing = id;
-      rows.get(id).assign.focus();
-      announce("Нажмите сочетание для команды «" + commandLabels.get(id) + "».");
+      cancelCapture();
+      return;
     }
+    capturing = id;
+    rows.get(id).assign.focus();
+    announce("Нажмите сочетание для команды «" + commandLabels.get(id) + "».");
     render();
   }
 
@@ -206,27 +232,29 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
   const close = action("Готово", () => dialog.close());
   close.classList.add("primary");
   footer.append(reset, close);
-  body.append(instructions, status, list);
+  body.append(searchField, status, list, empty);
   dialog.append(heading, body, footer);
   container.append(dialog);
   gear.setAttribute("aria-haspopup", "dialog");
   gear.setAttribute("aria-controls", dialog.id);
 
+  search.addEventListener("input", filterRows, listener);
+  search.addEventListener("focus", cancelCapture, listener);
   dialog.addEventListener("keydown", event => {
     event.stopPropagation();
+    if (event.target === search) {
+      cancelCapture();
+      return;
+    }
     if (!capturing || event.isComposing || MODIFIER_KEYS.has(event.key)) return;
     if (event.key === "Tab") {
-      capturing = null;
-      render();
-      announce("Ввод отменён.");
+      cancelCapture();
       return;
     }
     event.preventDefault();
     if (event.repeat) return;
     if (event.key === "Escape") {
-      capturing = null;
-      render();
-      announce("Ввод отменён.");
+      cancelCapture();
       return;
     }
     const key = fromEvent(event);
@@ -245,6 +273,7 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
   }, listener);
   dialog.addEventListener("close", () => {
     capturing = null;
+    search.value = "";
     announce();
     render();
     gear.focus({ preventScroll: true });
@@ -254,7 +283,7 @@ export function mountCadShortcuts(container, { commands, activate, signal }) {
     refreshBindings();
     render();
     dialog.showModal();
-    title.focus({ preventScroll: true });
+    search.focus({ preventScroll: true });
   }, listener);
 
   container.addEventListener("keydown", event => {

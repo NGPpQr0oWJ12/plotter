@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from designer_cad import CadDesignError, edit_design, validate_design
+from designer_cad import CadDesignError, edit_design, prepare_design, validate_design
 
 
 def line(id, start, end, layer="0", **properties):
@@ -13,6 +13,134 @@ def quick_trim(entities, stroke, tolerance=0.25):
 
 
 class QuickTrimTests(unittest.TestCase):
+    def test_click_persists_intersection_segments_and_selects_hit_span_once(self):
+        target = line("target", [0, 0], [20, 0], "cut", groupPath=["detail"])
+        fixtures = [
+            target, line("first", [5, -5], [5, 5], groupPath=["detail"]),
+            line("crossing", [10, -5], [10, 5], groupPath=["detail"]),
+            line("shared", [10, 0], [12, 5], groupPath=["detail"]),
+            line("reference", [12, -5], [12, 5], groupPath=["detail"], reference=True),
+            line("other-group", [15, -5], [15, 5], groupPath=["other"]),
+            line("notch", [17, 0], [17, 4], notch=True, parentId="target"),
+        ]
+        response = edit_design(fixtures, "split-intersections", {"id": "target", "point": [15, 0]})
+        head, middle, tail, *unchanged, mark = response["entities"]
+        self.assertEqual((response["changed"], response["selectedIds"], response["selectedEdgeIndex"]),
+                         (True, [tail["id"]], None))
+        self.assertEqual([shape["start"] for shape in (head, middle, tail)], [[0, 0], [5, 0], [10, 0]])
+        self.assertEqual([shape["end"] for shape in (head, middle, tail)], [[5, 0], [10, 0], [20, 0]])
+        self.assertEqual((head["id"], middle["layer"], tail["groupPath"]), ("target", "cut", ["detail"]))
+        self.assertEqual(unchanged, fixtures[1:-1])
+        self.assertEqual(mark, {**fixtures[-1], "parentId": tail["id"]})
+        second = edit_design(response["entities"], "split-intersections", {"id": tail["id"], "point": [15, 0]})
+        self.assertEqual((second["changed"], second["selectedIds"], second["entities"]),
+                         (False, [tail["id"]], response["entities"]))
+
+    def test_intersection_nodes_preserve_closed_contour_and_untouched_bulge(self):
+        contour = {"id": "outline", "type": "polyline", "layer": "cut", "closed": True,
+                   "points": [[0, 0], [20, 0], [20, 20], [0, 20]], "bulges": [0, 0.2, 0, 0]}
+        cutter = line("cutter", [10, -5], [10, 5])
+        entities = [contour, cutter]
+        response = edit_design(entities, "split-intersections", {"id": "outline", "edgeIndex": 0, "point": [16, 0]})
+        result, unmodified_cutter = response["entities"]
+        self.assertEqual((response["changed"], response["selectedIds"], response["selectedEdgeIndex"]),
+                         (True, ["outline"], 1))
+        self.assertEqual(result, {**contour, "points": [[0, 0], [10, 0], [20, 0], [20, 20], [0, 20]],
+                                  "bulges": [0, 0, 0.2, 0, 0]})
+        self.assertEqual(unmodified_cutter, cutter)
+        self.assertTrue(any(path["closed"] for path in prepare_design(response["entities"])["paths"]))
+        again = edit_design(response["entities"], "split-intersections",
+                            {"id": "outline", "edgeIndex": 1, "point": [16, 0]})
+        self.assertEqual((again["changed"], again["selectedEdgeIndex"]), (False, 1))
+
+        for index, invalid in ((1, contour), (0, {**contour, "joined": True}), (True, contour)):
+            with self.subTest(index=index, contour=invalid), self.assertRaises(CadDesignError):
+                edit_design([invalid, cutter], "split-intersections", {"id": "outline", "edgeIndex": index, "point": [16, 0]})
+
+    def test_deleting_a_whole_cutter_materializes_crossing_even_before_selection(self):
+        target = line("target", [0, 0], [20, 0])
+        cutter = line("cutter", [10, -5], [10, 5])
+        notch = line("notch", [10, 3], [12, 3], notch=True, parentId="cutter")
+        unrelated = line("reference", [0, 2], [20, 2], reference=True)
+        response = edit_design([target, cutter, notch, unrelated], "split-intersections", {"removeIds": ["cutter"]})
+        head, tail, untouched = response["entities"]
+        self.assertEqual((response["changed"], response["selectedIds"], response["selectedEdgeIndex"]), (True, [], None))
+        self.assertEqual(head, {**target, "end": [10, 0]})
+        self.assertEqual((tail["start"], tail["end"], untouched), ([10, 0], [20, 0], unrelated))
+        erased = edit_design(response["entities"], "split-intersections", {"removeIds": [head["id"]]})
+        self.assertEqual(erased["entities"], [tail, unrelated])
+
+    def test_deleting_one_polyline_span_opens_only_that_side_and_splits_its_neighbor(self):
+        contour = {"id": "outline", "type": "polyline", "layer": "cut", "closed": True,
+                   "points": [[0, 0], [20, 0], [20, 20], [0, 20]], "bulges": [0, 0.2, 0, 0]}
+        cutter = line("cutter", [10, -5], [10, 5])
+        removed = line("removed-mark", [3, 0], [3, 2], notch=True, parentId="outline")
+        retained = line("retained-mark", [0, 15], [3, 15], notch=True, parentId="outline")
+        response = edit_design([contour, cutter, removed, retained], "split-intersections",
+                               {"id": "outline", "edgeIndex": 0, "removeSpan": True})
+        shape, first, second, mark = response["entities"]
+        self.assertEqual(shape, {**contour, "points": [[20, 0], [20, 20], [0, 20], [0, 0]],
+                                 "closed": False, "bulges": [0.2, 0, 0, 0]})
+        self.assertEqual((first["end"], second["start"], mark), ([10, 0], [10, 0], retained))
+        self.assertFalse(any(path["closed"] for path in prepare_design(response["entities"])["paths"]))
+
+    def test_eraser_opt_in_leaves_crossing_node_on_the_other_stroke(self):
+        target = line("target", [0, 0], [20, 0])
+        cutter = line("cutter", [10, -8], [10, 8])
+        options = {"stroke": [[10, -4]], "tolerance": 0.25}
+        legacy = edit_design([target, cutter], "trim-quick", options)
+        self.assertEqual(legacy["entities"][0], target)
+        response = edit_design([target, cutter], "trim-quick", {**options, "preserveIntersections": True})
+        head, tail, kept = response["entities"]
+        self.assertEqual(head, {**target, "end": [10, 0]})
+        self.assertEqual((tail["start"], tail["end"], kept["start"], kept["end"]),
+                         ([10, 0], [20, 0], [10, 0], [10, 8]))
+        self.assertEqual(response["selectedIds"], [kept["id"]])
+
+    def test_exclusive_eraser_filters_neither_hit_nor_partition_with_hidden_geometry(self):
+        guide = line("guide", [0, 0], [20, 0], reference=True)
+        cut = line("cut", [10, -10], [10, 10])
+        options = {"stroke": [[4, 0]], "tolerance": 0.25, "preserveIntersections": True}
+        all_geometry = edit_design([guide, cut], "trim-quick", {**options, "canvasFilter": "all"})
+        self.assertEqual(all_geometry["entities"][0]["start"], [10, 0])
+        self.assertEqual(all_geometry["entities"][0]["end"], [20, 0])
+        guides = edit_design([guide, cut], "trim-quick", {**options, "canvasFilter": "guides"})
+        self.assertTrue(guides["changed"])
+        self.assertEqual(guides["entities"], [cut])
+        cuts = edit_design([guide, cut], "trim-quick", {**options, "canvasFilter": "cut"})
+        self.assertFalse(cuts["changed"])
+        self.assertEqual(cuts["entities"], [guide, cut])
+        with self.assertRaisesRegex(CadDesignError, "фильтр"):
+            edit_design([guide, cut], "trim-quick", {**options, "canvasFilter": "unknown"})
+
+    def test_eraser_filter_prefers_notch_category_and_keeps_parent_rules(self):
+        cut = line("cut", [0, 0], [20, 0], groupPath=["detail"])
+        mark = line("mark", [10, 0], [10, 5], reference=True, notch=True, parentId="cut")
+        point = {"id": "point", "type": "point", "point": [10, 0], "groupPath": ["detail"]}
+        entities = [cut, mark, point]
+        options = {"stroke": [[10, 0]], "tolerance": 0.25, "groupPath": ["detail"]}
+        for category, expected in (("notches", [cut, point]), ("guides", [cut, mark]), ("cut", [point])):
+            with self.subTest(category=category):
+                response = edit_design(entities, "trim-quick", {**options, "canvasFilter": category})
+                self.assertTrue(response["changed"])
+                self.assertEqual(response["entities"], validate_design(expected))
+
+    def test_corner_repair_ignores_hidden_guides_but_protects_attached_notches(self):
+        outline = {"id": "outline", "type": "polyline", "layer": "0", "closed": True, "joined": True,
+                   "points": [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]}
+        guide = line("guide", [20.004, 0], [22, 0], reference=True)
+        notch = line("protected", [20.004, 0], [22, 0], notch=True, parentId="outline")
+        options = {"stroke": [[20.002, -0.0025]], "tolerance": 0.00032}
+        self.assertFalse(edit_design([outline, guide], "trim-quick", options)["changed"])
+        filtered = edit_design([outline, guide], "trim-quick", {**options, "canvasFilter": "cut"})
+        self.assertTrue(filtered["changed"])
+        self.assertEqual(filtered["entities"], [
+            {**outline, "points": [[0, 0], [20, 0], [20, 20], [0, 20]]}, guide,
+        ])
+        protected = edit_design([outline, notch], "trim-quick", {**options, "canvasFilter": "cut"})
+        self.assertFalse(protected["changed"])
+        self.assertEqual(protected["entities"], [outline, notch])
+
     def test_click_on_tiny_corner_loop_keeps_closed_outline_identity_and_notch(self):
         points = [[0, 0], [20.004, 0], [20, -0.005], [20, 20], [0, 20]]
         for closed in (True, False):

@@ -4,7 +4,7 @@ from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict, deque
 from codecs import BOM_UTF8
 from io import BytesIO, TextIOWrapper
-from itertools import islice, pairwise
+from itertools import groupby, islice, pairwise
 import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -779,6 +779,8 @@ def _path(entity, budget=MAX_POINTS, *, tolerance=CURVE_TOLERANCE_MM):
         if closed:
             raise CadDesignError("Насечка должна быть открытой.")
         result["notch"] = True
+    elif entity.get("notch") is False and not closed:
+        result["notch"] = False
     return result
 
 
@@ -814,6 +816,9 @@ def prepare_design(entities):
     for index in notches:
         paths[index] = marked[index]
     repaired = repair_closed_contours(paths, notches)
+    for path in repaired.paths:
+        if path["closed"] and path.get("notch") is False:
+            path.pop("notch")
     source_ids = [[cut_entities[index]["id"] for index in indices] for indices in repaired.sources]
     parents = {entity["id"]: entity["parentId"] for entity in cut_entities if entity.get("parentId")}
     if parents:
@@ -1015,6 +1020,19 @@ def _check_notch_spacing(shapes, siblings):
         added.append((start, line))
 
 
+def _notch_endpoint_matches(candidates, points):
+    queries = [Point(point) for point in points]
+    tolerance = NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
+    budget = MAX_POINTS
+    for entity in candidates:
+        contour = _NotchContour(entity, budget, require_simple=False)
+        if not contour.circle:
+            budget -= len(contour.line.coords)
+        for index, query in enumerate(queries):
+            if contour.distance(query) <= tolerance:
+                yield contour, index, query
+
+
 def _find_notch_attachment(existing, by_id, options):
     requested = options.get("parentId")
     path = _path(existing)
@@ -1025,7 +1043,6 @@ def _find_notch_attachment(existing, by_id, options):
         return _NotchContour(parent), _point(options.get("point", path["points"][0]))
 
     points = [_point(options["point"])] if "point" in options else [path["points"][0], path["points"][-1]]
-    queries = [Point(point) for point in points]
     if requested is not None:
         candidates = [_selected(by_id, requested)]
     else:
@@ -1034,21 +1051,15 @@ def _find_notch_attachment(existing, by_id, options):
     match = None
     error = "Насечка примыкает к нескольким сторонам. Укажите контур и точку явно."
     tolerance = NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
-    budget = MAX_POINTS
-    for entity in candidates:
-        contour = _NotchContour(entity, budget, require_simple=False)
-        if not contour.circle:
-            budget -= len(contour.line.coords)
-        for point, query in zip(points, queries):
-            if contour.distance(query) <= tolerance:
-                if match is not None:
-                    raise CadDesignError(error)
-                if "point" not in options and entity["type"] == "polyline":
-                    nearby = (edge for edge in contour.polyline_edges() if edge.distance(query) <= tolerance)
-                    next(nearby, None)
-                    if next(nearby, None) is not None:
-                        raise CadDesignError(error)
-                match = contour, point
+    for contour, index, query in _notch_endpoint_matches(candidates, points):
+        if match is not None:
+            raise CadDesignError(error)
+        if "point" not in options and contour.parent["type"] == "polyline":
+            nearby = (edge for edge in contour.polyline_edges() if edge.distance(query) <= tolerance)
+            next(nearby, None)
+            if next(nearby, None) is not None:
+                raise CadDesignError(error)
+        match = contour, points[index]
     if match is None:
         raise CadDesignError("Не найден соседний край насечки. Укажите контур и точку на нём.")
     contour, point = match
@@ -1083,6 +1094,166 @@ def _edit_notches(entities, by_id, operation, options):
     _check_notch_spacing(shapes, [entity for entity in entities
                                  if entity.get("parentId") == parent["id"] and entity["id"] != ignored])
     return result, shapes
+
+
+def _notch_stroke(entity):
+    if entity["type"] == "line":
+        return [entity["start"], entity["end"]]
+    if entity["type"] == "polyline" and not entity["closed"]:
+        return entity["points"]
+    raise CadDesignError("Насечка должна быть отрезком или открытой полилинией.")
+
+
+def _notch_scope(entity):
+    return tuple(entity.get("groupPath", ())), entity.get("reference", False)
+
+
+def _notch_conversion_index(entities, selected, scopes):
+    contours, envelopes = defaultdict(list), defaultdict(list)
+    budget = MAX_POINTS
+    for entity in entities:
+        scope = _notch_scope(entity)
+        if scope not in scopes or entity["id"] in selected or entity.get("notch") or entity["type"] == "point":
+            continue
+        contour = _NotchContour(entity, budget, require_simple=False)
+        if contour.circle:
+            x, y = entity["center"]
+            radius = entity["radius"]
+            envelope = box(x - radius, y - radius, x + radius, y + radius)
+        else:
+            budget -= len(contour.line.coords)
+            envelope = contour.line
+        contours[scope].append(contour)
+        envelopes[scope].append(envelope)
+    return {scope: (contours[scope], STRtree(shapes)) for scope, shapes in envelopes.items()}
+
+
+def _conversion_matches(index, points):
+    if index is None:
+        return
+    contours, tree = index
+    tolerance = NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
+    for side, (x, y) in enumerate(points):
+        query = Point(x, y)
+        for position in tree.query(box(x - tolerance, y - tolerance, x + tolerance, y + tolerance)):
+            contour = contours[position]
+            if contour.distance(query) <= tolerance:
+                yield contour, side
+
+
+def _convert_notch(entities, by_id, options):
+    ids = options.get("ids", [options.get("id")])
+    if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_ENTITIES:
+        raise CadDesignError("Выберите один или несколько прямых отрезков для насечек.")
+    ids = [_text(value, "идентификатор линии", 128) for value in ids]
+    selected = set(ids)
+    if len(selected) != len(ids):
+        raise CadDesignError("Выбранные объекты повторяются.")
+    owners = {entity.get("parentId") for entity in entities}
+    changes = []
+    for identifier in ids:
+        source = by_id.get(identifier)
+        if source is None:
+            raise CadDesignError("Выберите существующую линию для насечки.")
+        points = _notch_stroke(source)
+        if len(points) != 2 or source.get("bulges", [0])[0] or math.dist(*points) <= POINT_EPSILON_MM:
+            raise CadDesignError("В насечку можно преобразовать только один прямой отрезок.")
+        if not source.get("notch"):
+            if identifier in owners:
+                raise CadDesignError("Сначала перенесите насечки, уже привязанные к этой линии.")
+            changes.append((source, points))
+
+    parent_index = _notch_conversion_index(entities, selected, {_notch_scope(source) for source, _ in changes})
+    replacements = {}
+    standalone = Counter()
+    checked_parents = set()
+    for source, points in changes:
+        matches = list(islice(_conversion_matches(parent_index.get(_notch_scope(source)), points), 2))
+        shape = {**source, "notch": True}
+        if len(matches) == 1:
+            contour, side = matches[0]
+            parent_id = contour.parent["id"]
+            if parent_id not in checked_parents:
+                contour.require_simple()
+                checked_parents.add(parent_id)
+            shape["parentId"] = parent_id
+            if side:
+                if source["type"] == "line":
+                    shape.update(start=points[1], end=points[0])
+                else:
+                    shape["points"] = points[::-1]
+        else:
+            standalone["примыкание неоднозначно" if matches else "край детали не найден"] += 1
+        replacements[source["id"]] = shape
+
+    warnings = [f"Линия сохранена как отдельная насечка: {reason}." if count == 1
+                else f"Отдельных насечек — {count}: {reason}." for reason, count in standalone.items()]
+    result = [replacements.get(entity["id"], entity) for entity in entities]
+    return result, [replacements.get(identifier, by_id[identifier]) for identifier in ids], warnings, bool(changes)
+
+
+def _notch_boundaries(entities, parents, scopes):
+    boundaries, groups = {}, defaultdict(list)
+    budget = MAX_POINTS
+    for entity in entities:
+        if entity.get("notch") or entity["type"] == "point":
+            continue
+        identifier, scope = entity["id"], _notch_scope(entity)
+        if identifier not in parents and scope not in scopes:
+            continue
+        path = _path(entity, budget)
+        budget -= len(path["points"])
+        line = _line_geometry(path)
+        if identifier in parents:
+            boundaries[identifier] = line
+        if scope in scopes:
+            groups[scope].append(line)
+    return boundaries, {scope: STRtree(lines) for scope, lines in groups.items()}, budget
+
+
+def _resize_all_notches(entities, options):
+    depth = _positive(options.get("depth"), "Глубина")
+    changes = []
+    for entity in entities:
+        if not entity.get("notch"):
+            continue
+        points = _notch_stroke(entity)
+        current = math.dist(points[0], points[-1])
+        if current <= POINT_EPSILON_MM:
+            raise CadDesignError("Глубину насечки с совпадающими концами изменить нельзя.")
+        if abs(current - depth) > POINT_EPSILON_MM:
+            changes.append((entity, points, depth / current))
+    if not changes:
+        return entities, [], [], False
+
+    parents = {entity["parentId"] for entity, _, _ in changes if "parentId" in entity}
+    scopes = {_notch_scope(entity) for entity, _, _ in changes if "parentId" not in entity}
+    boundaries, trees, budget = _notch_boundaries(entities, parents, scopes)
+    tolerance = NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
+    replacements = {}
+    for entity, points, factor in changes:
+        parent_id = entity.get("parentId")
+        anchor = 0
+        if parent_id is None and (tree := trees.get(_notch_scope(entity))) is not None:
+            contacts = [tree.query(Point(point), predicate="dwithin", distance=tolerance).size > 0
+                        for point in (points[0], points[-1])]
+            if contacts == [False, True]:
+                anchor = -1
+        base = points[anchor]
+        scaled = [[base[0] + (x - base[0]) * factor, base[1] + (y - base[1]) * factor] for x, y in points]
+        scaled[anchor] = base
+        geometry = {"start": scaled[0], "end": scaled[-1]} if entity["type"] == "line" else {"points": scaled}
+        shape = {**entity, **geometry}
+        if parent_id is not None:
+            cut = _path(shape, budget)
+            budget -= len(cut["points"])
+            crossing = boundaries[parent_id].intersection(_line_geometry(cut))
+            if (crossing.length > POINT_EPSILON_MM
+                    or not crossing.is_empty and not Point(base).buffer(tolerance).covers(crossing)):
+                raise CadDesignError("Насечка пересекает границу детали. Уменьшите общую глубину.")
+        replacements[entity["id"]] = shape
+    result = [replacements.get(entity["id"], entity) for entity in entities]
+    return result, list(replacements.values()), [], True
 
 
 def _move_notches(entities, targets):
@@ -1487,6 +1658,14 @@ MAX_TRIM_EDGES = 50_000
 MAX_TRIM_CHECKS = 250_000
 
 
+def _trim_canvas_category(entity):
+    if entity.get("notch"):
+        return "notches"
+    if entity.get("reference") or entity["type"] == "point":
+        return "guides"
+    return "cut"
+
+
 def _quick_trim(entities, options):
     stroke = options.get("stroke")
     if not isinstance(stroke, list) or not 1 <= len(stroke) <= MAX_TRIM_STROKE:
@@ -1495,13 +1674,20 @@ def _quick_trim(entities, options):
     tolerance = _positive(options.get("tolerance"), "Допуск выбора")
     if tolerance > 800_001:
         raise CadDesignError("Недопустимый допуск выбора для обрезки.")
+    preserve_intersections = _flag(options.get("preserveIntersections", False), "сохранение пересечений")
+    canvas_filter = options.get("canvasFilter", "all")
+    if canvas_filter not in ("all", "guides", "cut", "notches"):
+        raise CadDesignError("Неизвестный фильтр видимости чертежа.")
+    visible = None if canvas_filter == "all" else {entity["id"] for entity in entities
+                                                   if _trim_canvas_category(entity) == canvas_filter}
 
     scope = _group_path(options["groupPath"]) if "groupPath" in options else None
     by_id = {entity["id"]: entity for entity in entities} if scope is not None else {}
     edges, owners, bounds = [], [], []
     for entity in entities:
         owner = by_id.get(entity.get("parentId"), entity)
-        if scope is not None and owner.get("groupPath", []) != scope:
+        if ((visible is not None and entity["id"] not in visible)
+                or (scope is not None and owner.get("groupPath", []) != scope)):
             continue
         available = MAX_TRIM_EDGES - len(edges)
         contour_edges = list(islice(_quick_trim_edges(entity, available + 1), available + 1))
@@ -1589,7 +1775,7 @@ def _quick_trim(entities, options):
         if click_hit is not None:
             _, contour, edge, position = click_hit
             if contour.can_partition and min(position, edge.length - position) <= MAX_CORNER_OVERRUN_MM:
-                correction = _erase_corner_overlap(entities, contour.entity, stroke[0], tolerance)
+                correction = _erase_corner_overlap(entities, contour.entity, stroke[0], tolerance, visible=visible)
                 if correction is not None:
                     return correction
 
@@ -1684,7 +1870,210 @@ def _quick_trim(entities, options):
                     contour.closed and start - POINT_EPSILON_MM <= at + contour.length <= end + POINT_EPSILON_MM):
                 result.append({**entity, "parentId": shape["id"]})
                 break
+    if removed and preserve_intersections:
+        retained = {shape["id"] for shape in shapes}
+        cutters = ((_notch_scope(contour.entity), edge) for contour, discarded in removed.items()
+                   for edge in _erased_straight_edges(contour, partitions[contour], discarded))
+        targets = ((entity, index, edge) for entity in result if entity["id"] not in retained
+                   and (visible is None or entity["id"] in visible)
+                   for index, edge in _intersection_edges(entity, editable=True))
+        cuts = _intersection_cuts(targets, cutters)
+        pieces = {entity["id"]: _intersection_pieces(entity, cuts[entity["id"]])
+                  for entity in result if entity["id"] in cuts}
+        if pieces:
+            result = _apply_intersection_edits(result, pieces, set())
     return result, shapes, warnings, bool(removed)
+
+
+def _erased_straight_edges(contour, partitions, discarded):
+    if not contour.can_partition or contour.entity["type"] not in ("line", "polyline"):
+        return
+    intervals = [(0, contour.length)] if None in discarded else [partitions[index] for index in discarded]
+    for start, end in intervals:
+        spans = [(start, min(end, contour.length))]
+        if end > contour.length:
+            spans.append((0, end - contour.length))
+        for left, right in spans:
+            first = max(0, bisect_right(contour.offsets, left) - 1)
+            last = bisect_left(contour.offsets, right)
+            for index in range(first, last):
+                edge, offset = contour.edges[index], contour.offsets[index]
+                a, b = max(0, left - offset), min(edge.length, right - offset)
+                if edge.center is None and b - a > POINT_EPSILON_MM:
+                    yield _QuickTrimEdge(edge.at(a), edge.at(b))
+
+
+def _intersection_edges(entity, *, editable=False):
+    kind = entity["type"]
+    if entity.get("notch") or kind == "point":
+        return
+    if kind != "polyline":
+        if kind == "line":
+            yield 0, _QuickTrimEdge(entity["start"], entity["end"])
+        elif not editable and kind in ("arc", "circle"):
+            yield 0, next(_quick_trim_edges(entity, 2))
+        return
+    points = entity["points"]
+    count = len(points) - int(not entity["closed"])
+    if editable and count > 1 and entity.get("joined"):
+        return
+    bulges = entity.get("bulges")
+    for index in range(count):
+        start, end = points[index], points[(index + 1) % len(points)]
+        bulge = bulges[index] if bulges else 0
+        if (not editable or abs(bulge) < 1e-12) and math.dist(start, end) > POINT_EPSILON_MM:
+            yield index, _curve_edge(start, end, bulge)
+
+
+def _intersection_cuts(targets, cutters):
+    scopes = defaultdict(list)
+    edge_count = 0
+    checks = 0
+    for scope, edge in cutters:
+        edge_count += 1
+        if edge_count > MAX_TRIM_EDGES:
+            raise CadDesignError("Слишком много рёбер для разделения в пересечениях.")
+        scopes[scope].append(edge)
+    if not scopes:
+        return {}
+    trees = {scope: STRtree([edge.geometry for edge in edges]) for scope, edges in scopes.items()}
+    cuts = defaultdict(dict)
+    for entity, index, edge in targets:
+        scope = _notch_scope(entity)
+        if scope not in trees:
+            continue
+        edge_count += 1
+        candidates = trees[scope].query(edge.geometry)
+        checks += len(candidates)
+        if edge_count > MAX_TRIM_EDGES or checks > MAX_TRIM_CHECKS:
+            raise CadDesignError("Слишком много пересечений для разделения. Уменьшите область выбора.")
+        positions = sorted(position for cutter in candidates
+                           for position in _quick_trim_crossings(edge, scopes[scope][cutter]))
+        previous = edge.start
+        stops = []
+        for position in positions:
+            point = edge.at(position)
+            if min(math.dist(previous, point), math.dist(point, edge.end)) > POINT_EPSILON_MM:
+                stops.append((position, point))
+                previous = point
+        if stops:
+            cuts[entity["id"]][index] = stops
+    return cuts
+
+
+def _intersection_pieces(entity, cuts):
+    if entity["type"] == "line":
+        points = [entity["start"], *(point for _, point in cuts[0]), entity["end"]]
+        return [{**entity, "id": entity["id"] if first == 0 else uuid4().hex,
+                 "start": start, "end": end}
+                for first, (start, end) in enumerate(pairwise(points))]
+    points, bulges = [], []
+    original_bulges = entity.get("bulges")
+    for index, point in enumerate(entity["points"]):
+        additions = [point for _, point in cuts.get(index, ())]
+        points.extend([point, *additions])
+        if original_bulges is not None:
+            bulges.extend([original_bulges[index], *([0] * len(additions))])
+    return [{**entity, "points": points, **({"bulges": bulges} if original_bulges is not None else {})}]
+
+
+def _remove_intersection_edge(entity, index):
+    points = entity["points"]
+    if entity["closed"]:
+        ranges = [[*range(index + 1, len(points)), *range(index + 1)]]
+    else:
+        ranges = [range(index + 1), range(index + 1, len(points))]
+    shapes = []
+    for indices in ranges:
+        if len(indices) < 2:
+            continue
+        shape = {**entity, "id": entity["id"] if not shapes else uuid4().hex,
+                 "points": [points[vertex] for vertex in indices], "closed": False}
+        if "bulges" in entity:
+            shape["bulges"] = [entity["bulges"][vertex] for vertex in indices]
+            shape["bulges"][-1] = 0
+        shapes.append(shape)
+    return shapes
+
+
+def _apply_intersection_edits(entities, replacements, removed, opened_id=None):
+    attached = defaultdict(list)
+    for entity in entities:
+        if (parent := entity.get("parentId")) in replacements:
+            attached[parent].append(entity)
+    owners = {}
+    for identifier, notches in attached.items():
+        shapes = replacements[identifier]
+        if len(shapes) == 1 and identifier != opened_id:
+            continue
+        edges, ids = [], []
+        for shape in shapes:
+            for edge in _quick_trim_edges(shape, MAX_TRIM_EDGES):
+                edges.append(edge)
+                ids.append(shape["id"])
+        owners.update(_outline_notch_owners(notches, edges, ids, allow_missing=identifier == opened_id))
+    result = []
+    for entity in entities:
+        identifier, parent = entity["id"], entity.get("parentId")
+        if identifier in removed or parent in removed:
+            continue
+        if identifier in replacements:
+            result.extend(replacements[identifier])
+        elif identifier in owners:
+            result.append({**entity, "parentId": owners[identifier]})
+        elif opened_id is None or parent != opened_id:
+            result.append(entity)
+    return result
+
+
+def _split_intersections(entities, by_id, options):
+    if "removeIds" in options:
+        ids = options["removeIds"]
+        if (any(key in options for key in ("id", "edgeIndex", "point", "removeSpan"))
+                or not isinstance(ids, list) or not 1 <= len(ids) <= MAX_ENTITIES
+                or any(not isinstance(identifier, str) or identifier not in by_id for identifier in ids)):
+            raise CadDesignError("Выберите существующие объекты для удаления.")
+        removed = set(ids)
+        cutters = ((_notch_scope(by_id[identifier]), edge) for identifier in removed
+                   for _, edge in _intersection_edges(by_id[identifier]) if edge.center is None)
+        source = None
+    else:
+        source = _selected(by_id, options.get("id"))
+        index = options.get("edgeIndex")
+        if index is None and (source["type"] == "line" or source["type"] == "polyline"
+                              and not source["closed"] and len(source["points"]) == 2):
+            index = 0
+        edge = next((edge for at, edge in _intersection_edges(source, editable=True)
+                     if at == index), None) if type(index) is int else None
+        if edge is None:
+            raise CadDesignError("Выберите редактируемый прямой отрезок.")
+        remove_span = _flag(options.get("removeSpan", False), "удаление ребра")
+        if not remove_span:
+            position, _ = edge.project(_point(options.get("point")))
+            group = _notch_scope(source)
+            cutters = ((group, edge) for entity in entities if entity is not source and _notch_scope(entity) == group
+                       for _, edge in _intersection_edges(entity))
+            stops = _intersection_cuts([(source, index, edge)], cutters).get(source["id"], {})
+            offset = bisect_left([at for at, _ in stops.get(index, ())], position + POINT_EPSILON_MM)
+            if not stops:
+                return entities, [source], None if source["type"] == "line" else index, False
+            shapes = _intersection_pieces(source, stops)
+            result = _apply_intersection_edits(entities, {source["id"]: shapes}, set())
+            selected_index = None if source["type"] == "line" else index + offset
+            return result, [shapes[offset if selected_index is None else 0]], selected_index, True
+        if source["type"] != "polyline":
+            raise CadDesignError("Выберите ребро полилинии для удаления.")
+        removed = set()
+        cutters = [(_notch_scope(source), edge)]
+
+    targets = ((entity, index, edge) for entity in entities if entity is not source and entity["id"] not in removed
+               for index, edge in _intersection_edges(entity, editable=True))
+    cuts = _intersection_cuts(targets, cutters)
+    replacements = {identifier: _intersection_pieces(by_id[identifier], stops) for identifier, stops in cuts.items()}
+    if source is not None:
+        replacements[source["id"]] = _remove_intersection_edge(source, index)
+    result = _apply_intersection_edits(entities, replacements, removed, source["id"] if source is not None else None)
+    return result, [], None, True
 
 
 def _join_shapes(entities, tolerance, *, bridges=None, preserve_endpoints=False, traversal=None):
@@ -1788,10 +2177,12 @@ def _selected(by_id, value):
 
 def _insert_polyline_points(entity, click, edge_index, count):
     line = entity["type"] == "line"
-    points = [entity["start"], entity["end"]] if line else entity["points"]
     closed = entity.get("closed", False)
+    points = [entity["start"], entity["end"]] if line else entity["points"]
     bulges = entity.get("bulges")
     edge_count = len(points) - int(not closed)
+    if entity.get("joined") and edge_count >= 2:
+        raise CadDesignError("У объединённого контура нельзя редактировать отдельные сегменты.")
     if edge_index is not None and not 0 <= edge_index < edge_count:
         raise CadDesignError("Указано несуществующее ребро.")
     indices = range(edge_count) if edge_index is None else (edge_index,)
@@ -2123,6 +2514,348 @@ def _closed_corner_trial(entity):
     return trial
 
 
+def _outline_notch_owners(attached, edges, identifiers, *, allow_missing=False):
+    if not attached:
+        return {}
+    tree = STRtree([edge.geometry for edge in edges])
+    tolerance = NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
+    owners = {}
+    for notch in attached:
+        base = _path(notch)["points"][0]
+        x, y = base
+        matching = []
+        for index in tree.query(box(x - tolerance, y - tolerance, x + tolerance, y + tolerance)):
+            position, distance = edges[index].project(base)
+            if distance <= tolerance:
+                # At a shared vertex keep the notch on the outgoing side.
+                matching.append((0 if distance <= POINT_EPSILON_MM else distance,
+                                 position > POINT_EPSILON_MM, index))
+        if not matching:
+            if allow_missing:
+                continue
+            raise CadDesignError("Не удалось сохранить привязку насечки к ребру контура.")
+        owners[notch["id"]] = identifiers[min(matching)[2]]
+    return owners
+
+
+def _split_outline(entities, source):
+    if source["type"] != "polyline" or not (source["closed"] or source.get("joined")):
+        raise CadDesignError("Разъединение доступно для объединённой или замкнутой полилинии с отдельными рёбрами.")
+    edges = _checked_repair_edges(source)
+    shapes = []
+    for edge in edges:
+        if edge.center is None:
+            shape = _new_shape(source, "line", start=edge.start, end=edge.end, notch=False)
+        else:
+            shape = _new_shape(source, "arc", center=list(edge.center), radius=edge.radius,
+                               startAngle=math.degrees(edge.angle), sweep=math.degrees(edge.sweep), notch=False)
+        shapes.append(shape)
+    if len(shapes) < 2:
+        raise CadDesignError("В контуре недостаточно отдельных рёбер для разъединения.")
+
+    parent_id = source["id"]
+    attached = [entity for entity in entities if entity.get("parentId") == parent_id]
+    owners = _outline_notch_owners(attached, edges, [shape["id"] for shape in shapes])
+
+    result = []
+    for entity in entities:
+        if entity is source:
+            result.extend(shapes)
+        elif entity["id"] in owners:
+            result.append({**entity, "parentId": owners[entity["id"]]})
+        else:
+            result.append(entity)
+    # Splitting must not introduce a gap at the preparation precision or turn
+    # a former closed cut into a set of independent paths in the cutting plan.
+    if source["closed"]:
+        drawing = prepare_design([{**shape, "reference": False} for shape in shapes] if source.get("reference") else result)
+        needed = {shape["id"] for shape in shapes}
+        if not any(path["closed"] and set(ids) == needed for path, ids in zip(drawing["paths"], drawing["sourceIds"])):
+            raise CadDesignError("Не удалось разъединить рёбра без разрыва замкнутой траектории.")
+    else:
+        paths = _cut_paths(shapes, CURVE_TOLERANCE_MM)
+        if any(first["points"][-1] != second["points"][0] for first, second in pairwise(paths)):
+            raise CadDesignError("Не удалось разъединить рёбра без разрыва траектории.")
+    return result, shapes
+
+
+def _outline_selection(by_id, options, *, keep_edge_selection=False):
+    ids, edges = options.get("ids", []), options.get("edges", [])
+    if (not isinstance(ids, list) or not isinstance(edges, list)
+            or not 1 <= len(ids) + len(edges) <= MAX_ENTITIES):
+        raise CadDesignError("Выберите объекты или рёбра одной траектории.")
+    selected = {}
+    for identifier in ids:
+        entity = _selected(by_id, identifier)
+        if entity["id"] in selected:
+            raise CadDesignError("Выбранные объекты повторяются.")
+        selected[entity["id"]] = None
+    for item in edges:
+        if not isinstance(item, dict):
+            raise CadDesignError("Неверный список выбранных рёбер.")
+        entity = _selected(by_id, item.get("id"))
+        if entity["id"] in selected:
+            raise CadDesignError("Выбранные объекты повторяются.")
+        if entity["type"] != "polyline":
+            raise CadDesignError("Выберите полилинию с отдельными редактируемыми рёбрами.")
+        count = len(entity["points"]) - int(not entity["closed"])
+        if count >= 2 and entity.get("joined"):
+            raise CadDesignError("Выберите полилинию с отдельными редактируемыми рёбрами.")
+        indices = item.get("indices")
+        if (not isinstance(indices, list) or not 1 <= len(indices) <= count
+                or any(type(index) is not int or not 0 <= index < count for index in indices)
+                or len(set(indices)) != len(indices)):
+            raise CadDesignError("Указаны недопустимые или повторяющиеся рёбра.")
+        selected[entity["id"]] = None if len(indices) == count and not keep_edge_selection else set(indices)
+    if len({_conflict_scope(by_id[identifier]) for identifier in selected}) != 1:
+        raise CadDesignError("Выберите объекты одного слоя, группы и назначения.")
+    return selected
+
+
+def _outline_spans(source, selected):
+    if selected is None:
+        return [(True, source, ())]
+    points = source["points"]
+    count = len(points) - int(not source["closed"])
+    order = range(count)
+    if source["closed"]:
+        # Start at a transition so spans crossing the stored seam do not split.
+        first = next(index for index in order if (index in selected) != ((index - 1) % count in selected))
+        order = ((first + offset) % count for offset in range(count))
+    bulges = source.get("bulges")
+    retained = False
+    spans = []
+    for chosen, run in groupby(order, key=selected.__contains__):
+        indices = tuple(run)
+        vertices = [points[indices[0]], *(points[(index + 1) % len(points)] for index in indices)]
+        shape = _new_shape(source, "polyline", points=vertices, closed=False, notch=False)
+        if bulges is not None:
+            shape["bulges"] = [*(bulges[index] for index in indices), 0]
+        if not chosen and not retained:
+            shape["id"] = source["id"]
+            retained = True
+        spans.append((chosen, shape, indices))
+    return spans
+
+
+def _join_outline(entities, by_id, options):
+    selection = _outline_selection(by_id, options)
+    spans = {identifier: _outline_spans(by_id[identifier], indices) for identifier, indices in selection.items()}
+    chosen = [shape for entries in spans.values() for selected, shape, _ in entries if selected]
+    if len(chosen) == 1:
+        source = chosen[0]
+        if source["type"] != "polyline" or source.get("joined"):
+            return entities, chosen, ["Объект уже образует одну траекторию."], False
+        combined = {**source, "joined": True}
+    else:
+        if any(shape["type"] not in ("line", "arc", "polyline") for shape in chosen):
+            raise CadDesignError("Сплайн или эллипс нельзя объединить с другими фрагментами без изменения формы.")
+        combined = _join_shapes(chosen, POINT_EPSILON_MM, preserve_endpoints=True)
+        if any(shape.get("notch") is False for shape in chosen):
+            combined["notch"] = False
+        if original_id := next((identifier for identifier, indices in selection.items() if indices is None), None):
+            combined["id"] = original_id
+
+    attached = defaultdict(list)
+    for entity in entities:
+        if entity.get("parentId") in selection:
+            attached[entity["parentId"]].append(entity)
+    owners = {}
+    for identifier, notches in attached.items():
+        if selection[identifier] is None:
+            owners.update((notch["id"], combined["id"]) for notch in notches)
+            continue
+        source = by_id[identifier]
+        points, bulges = source["points"], source.get("bulges")
+        edges, identifiers = [], []
+        for selected, shape, indices in spans[identifier]:
+            for index in indices:
+                start, end = points[index], points[(index + 1) % len(points)]
+                if math.dist(start, end) > POINT_EPSILON_MM:
+                    edges.append(_curve_edge(start, end, bulges[index] if bulges else 0))
+                    identifiers.append(combined["id"] if selected else shape["id"])
+        owners.update(_outline_notch_owners(notches, edges, identifiers))
+
+    result = []
+    inserted = False
+    for entity in entities:
+        identifier = entity["id"]
+        if identifier in spans:
+            for selected, piece, _ in spans[identifier]:
+                if not selected:
+                    result.append(piece)
+                elif not inserted:
+                    result.append(combined)
+                    inserted = True
+        elif identifier in owners:
+            result.append({**entity, "parentId": owners[identifier]})
+        else:
+            result.append(entity)
+
+    closed_parts = [{combined["id"], *(shape["id"] for chosen, shape, _ in spans[identifier] if not chosen)}
+                    for identifier, indices in selection.items() if indices is not None and by_id[identifier]["closed"]]
+    if closed_parts:
+        required = set().union(*closed_parts)
+        check = result if not combined.get("reference") else [{**shape, "reference": False} for shape in result
+                                                               if shape["id"] in required]
+        prepared = prepare_design(check)
+        outlines = [set(ids) for path, ids in zip(prepared["paths"], prepared["sourceIds"])
+                    if path["closed"] and combined["id"] in ids]
+        if any(not any(part <= outline for outline in outlines) for part in closed_parts):
+            raise CadDesignError("Объединение выбранных рёбер не сохраняет исходную замкнутую траекторию.")
+    return result, [combined], [], True
+
+
+def _fillet_arc(before, corner, after, radius):
+    length_in, length_out = math.dist(before, corner), math.dist(corner, after)
+    if min(length_in, length_out) <= POINT_EPSILON_MM:
+        raise CadDesignError("Для скругления нужны два отрезка ненулевой длины.")
+    ux, uy = ((b - a) / length_in for a, b in zip(before, corner))
+    vx, vy = ((b - a) / length_out for a, b in zip(corner, after))
+    cross, dot = ux * vy - uy * vx, ux * vx + uy * vy
+    if abs(cross) <= 1e-12:
+        raise CadDesignError("Параллельные отрезки нельзя скруглить.")
+    sweep = math.atan2(cross, dot)
+    trim_per_radius = math.tan(abs(sweep) / 2)
+    trim = radius * trim_per_radius
+    if trim <= POINT_EPSILON_MM:
+        raise CadDesignError("Радиус скругления слишком мал для этого угла.")
+    available = min(length_in, length_out) - POINT_EPSILON_MM
+    if trim >= available:
+        limit = available / trim_per_radius
+        raise CadDesignError(f"Скругление не помещается на выбранных сторонах. "
+                             f"Введите радиус меньше {limit:.6g} мм.")
+    first = [corner[0] - ux * trim, corner[1] - uy * trim]
+    last = [corner[0] + vx * trim, corner[1] + vy * trim]
+    offset = math.copysign(radius, sweep)
+    center = [first[0] - uy * offset, first[1] + ux * offset]
+    angle = math.atan2(first[1] - center[1], first[0] - center[0])
+    if math.dist(first, last) <= POINT_EPSILON_MM or abs(math.degrees(sweep)) < 1e-9:
+        raise CadDesignError("Радиус скругления слишком мал для этого угла.")
+    return _QuickTrimEdge(first, last, center, radius, angle, sweep)
+
+
+def _fillet_removes_contact(edge, point, tolerance):
+    along, distance = edge.project(point)
+    return distance <= tolerance and along < edge.length - POINT_EPSILON_MM
+
+
+def _fillet_notches(entities, removed, source):
+    scope = _notch_scope(source)
+    all_edges = [edge for pair in removed.values() for edge in pair]
+    for entity in entities:
+        if not entity.get("notch"):
+            continue
+        parent = entity.get("parentId")
+        if parent in removed:
+            points = _notch_stroke(entity)[:1]
+            edges, tolerance = removed[parent], NOTCH_BIND_TOLERANCE_MM + POINT_EPSILON_MM
+        elif parent is None and _notch_scope(entity) == scope:
+            stroke = _notch_stroke(entity)
+            points = [stroke[0], stroke[-1]]
+            edges, tolerance = all_edges, POINT_EPSILON_MM
+        else:
+            continue
+        if any(_fillet_removes_contact(edge, point, tolerance) for edge in edges for point in points):
+            raise CadDesignError("Уменьшите радиус: скругление удаляет место привязки насечки.")
+
+
+def _fillet_polyline(source, indices, radius):
+    points = source["points"]
+    first, second = sorted(indices)
+    if source["closed"] and (first, second) == (0, len(points) - 1):
+        first, second = second, first
+    if second != (first + 1) % len(points):
+        raise CadDesignError("Выберите два соседних прямых ребра.")
+    bulges = source.get("bulges", [0] * len(points))
+    if any(abs(bulges[index]) >= 1e-12 for index in (first, second)):
+        raise CadDesignError("Скругление выполняется между двумя прямыми рёбрами.")
+    corner = points[second]
+    arc = _fillet_arc(points[first], corner, points[(second + 1) % len(points)], radius)
+    geometry = arc.geometry
+    count = len(points) - int(not source["closed"])
+    for index in range(count):
+        start, end = points[index], points[(index + 1) % len(points)]
+        if index in (first, second) or math.dist(start, end) <= POINT_EPSILON_MM:
+            continue
+        edge = _curve_edge(start, end, bulges[index])
+        edge_geometry = edge.geometry
+        if geometry.intersects(edge_geometry) and next(_diagnostic_contacts(arc, edge, geometry, edge_geometry), None):
+            raise CadDesignError("Уменьшите радиус: скругление пересекает другое ребро этой полилинии.")
+    rounded = {**source, "points": [*points[:second], arc.start, arc.end, *points[second + 1:]],
+               "bulges": [*bulges[:second], math.tan(arc.sweep / 4), *bulges[second:]]}
+    return [rounded], {source["id"]: (_QuickTrimEdge(corner, arc.start), _QuickTrimEdge(corner, arc.end))}
+
+
+def _fillet_lines(first, second, radius):
+    def endpoints(entity):
+        if entity["type"] == "line":
+            return entity["start"], entity["end"]
+        if (entity["type"] == "polyline" and not entity["closed"] and len(entity["points"]) == 2
+                and abs(entity.get("bulges", (0,))[0]) < 1e-12):
+            return entity["points"]
+        raise CadDesignError("Для скругления выберите два прямых отрезка.")
+
+    a, b = endpoints(first), endpoints(second)
+    joints = [(i, j) for i in range(2) for j in range(2) if math.dist(a[i], b[j]) <= POINT_EPSILON_MM]
+    if len(joints) != 1:
+        raise CadDesignError("У выбранных отрезков должен быть один общий угол.")
+    i, j = joints[0]
+    before, after = a[1 - i], b[1 - j]
+    corner = a[i]
+    if corner != b[j]:
+        corner = next(_straight_crossings(_QuickTrimEdge(*a), _QuickTrimEdge(*b)), None)
+        if corner is None or max(math.dist(corner, a[i]), math.dist(corner, b[j])) > POINT_EPSILON_MM:
+            raise CadDesignError("У выбранных отрезков должен быть один общий угол.")
+    arc = _fillet_arc(before, corner, after, radius)
+
+    def trimmed(source, ends, index, point):
+        if source["type"] == "line":
+            return {**source, ("start", "end")[index]: point, "notch": False}
+        points = list(ends)
+        points[index] = point
+        return {**source, "points": points, "notch": False}
+
+    shapes = [trimmed(first, a, i, arc.start), trimmed(second, b, j, arc.end),
+              _new_shape(first, "arc", center=arc.center, radius=radius, startAngle=math.degrees(arc.angle),
+                         sweep=math.degrees(arc.sweep), notch=False)]
+    removed = {first["id"]: (_QuickTrimEdge(corner, arc.start),),
+               second["id"]: (_QuickTrimEdge(corner, arc.end),)}
+    return shapes, removed
+
+
+def _fillet(entities, by_id, options):
+    radius = _positive(options.get("radius"), "Радиус скругления")
+    selection = _outline_selection(by_id, options, keep_edge_selection=True)
+    sources = [by_id[identifier] for identifier in selection]
+    if len(sources) == 1:
+        source = sources[0]
+        indices = selection[source["id"]]
+        if indices is None and source["type"] == "polyline" and not source["closed"] and len(source["points"]) == 3:
+            indices = {0, 1}
+        if indices is None or len(indices) != 2:
+            raise CadDesignError("Выберите два соседних прямых ребра полилинии.")
+        shapes, removed = _fillet_polyline(source, indices, radius)
+    elif len(sources) == 2 and all(indices is None for indices in selection.values()):
+        shapes, removed = _fillet_lines(*sources, radius)
+    else:
+        raise CadDesignError("Выберите два отрезка или два соседних прямых ребра одной полилинии.")
+
+    _fillet_notches(entities, removed, sources[0])
+    scope = _conflict_scope(sources[0])
+    junctions = _outline_junctions((entity for entity in entities if entity["id"] not in selection
+                                   and not entity.get("notch") and entity["type"] != "point"
+                                   and _conflict_scope(entity) == scope), include_arcs=True)
+    for edges in removed.values():
+        for edge in edges:
+            for index in junctions.query(edge.geometry.buffer(POINT_EPSILON_MM)):
+                if _fillet_removes_contact(edge, junctions.geometries[index].coords[0], POINT_EPSILON_MM):
+                    raise CadDesignError("Уменьшите радиус: к удаляемой части примыкает другой контур.")
+    replacements = {shape["id"]: shape for shape in shapes if shape["id"] in selection}
+    new_shapes = [shape for shape in shapes if shape["id"] not in selection]
+    return [*(replacements.get(entity["id"], entity) for entity in entities), *new_shapes], shapes
+
+
 def _corner_has_external_contact(loop, crossing, neighbors, work=None):
     boundary = loop.boundary
     tolerance = POINT_EPSILON_MM
@@ -2304,7 +3037,7 @@ def _line_corner_changes(chain, first, second, crossing):
     return connector, [{**incoming, incoming_end: crossing}, {**outgoing, outgoing_side: crossing}]
 
 
-def _erase_corner_overlap(entities, target, point, tolerance):
+def _erase_corner_overlap(entities, target, point, tolerance, *, visible=None):
     click = Point(point), min(tolerance, MAX_CORNER_OVERRUN_MM)
     if target["type"] == "polyline":
         trial = _closed_corner_trial(target)
@@ -2319,7 +3052,9 @@ def _erase_corner_overlap(entities, target, point, tolerance):
         sources = {entity["id"] for entity, _ in chain}
     else:
         return None
-    overlap = _corner_overlap(trial, (entity for entity in entities if entity["id"] not in sources), click)
+    neighbors = (entity for entity in entities if entity["id"] not in sources
+                 and (visible is None or entity["id"] in visible or entity.get("parentId") in sources))
+    overlap = _corner_overlap(trial, neighbors, click)
     if overlap is None:
         return None
     outline, first, second, crossing = overlap
@@ -3295,6 +4030,8 @@ def _close_selected_outline(selected, neighbors, confirmed_point):
         raise CadDesignError("Контур не образует замкнутую область без пересечений.")
     if bridges:
         trial = _confirm_bridges(trial, bridges, (*selected, *neighbors), confirmed_point)
+    if trial["type"] == "polyline" and not trial.get("joined"):
+        trial = {**trial, "joined": True}
     return trial
 
 
@@ -3337,7 +4074,7 @@ def _repair_selected(entities, by_id, options, diagnostics, *, confirmed_point=N
             _annotate_repair_conflicts(entities, selected, diagnostics)
         return entities, selected, [str(error)], False
     if close_outline and not changed:
-        return entities, selected, ["Контур уже замкнут и не самопересекается."], False
+        return entities, selected, ["Контур уже является одной траекторией."], False
     repaired["id"] = selected[0]["id"]
     unresolved = _retain_import_issues(repaired, selected, set() if close_outline else {IMPORT_DUPLICATE_POINTS})
     if not close_outline and confirmed_point is not None and len(selected) == 1:
@@ -3355,9 +4092,10 @@ def _repair_selected(entities, by_id, options, diagnostics, *, confirmed_point=N
             result.append(repaired)
         elif entity["id"] not in remove:
             result.append({**entity, "parentId": repaired["id"]} if entity.get("parentId") in remove else entity)
-    message = "Контур замкнут." if close_outline else "Контур детали восстановлен."
+    message = "Контур объединён в одну траекторию." if close_outline else "Контур детали восстановлен."
     if unresolved:
-        message = "Контур замкнут. Отмеченные потери при импорте требуют ручной проверки."
+        prefix = message if close_outline else "Контур замкнут."
+        message = f"{prefix} Отмеченные потери при импорте требуют ручной проверки."
     messages = [message]
     if removed_overlap:
         messages.append("Малая петля в углу удалена. Контур остался замкнутым.")
@@ -3463,10 +4201,20 @@ def edit_design(entities, operation, options):
                 warnings.append("Сплайны и эллипсы в соединённом контуре представлены полилинией.")
         elif operation == "trim-quick":
             result, shapes, warnings, changed = _quick_trim(entities, options)
+        elif operation == "split-intersections":
+            result, shapes, selected_edge, changed = _split_intersections(entities, by_id, options)
         elif operation == "repair-part":
             result, shapes, warnings, changed = _repair_selected(entities, by_id, options, diagnostics)
         elif operation == "close-outline":
             result, shapes, warnings, changed = _repair_selected(entities, by_id, options, diagnostics, close_outline=True)
+        elif operation == "join-outline":
+            result, shapes, warnings, changed = _join_outline(entities, by_id, options)
+        elif operation == "fillet":
+            result, shapes = _fillet(entities, by_id, options)
+            changed = True
+        elif operation == "split-outline":
+            result, shapes = _split_outline(entities, _selected(by_id, options.get("id")))
+            changed = True
         elif operation == "repair-conflict":
             if options.get("kind") == "gap":
                 result, shapes, warnings, changed = _repair_selected(
@@ -3483,6 +4231,10 @@ def edit_design(entities, operation, options):
             result, shapes, warnings = _scale_design(entities, by_id, options)
         elif operation in ("notch", "notch-series", "notch-edit"):
             result, shapes = _edit_notches(entities, by_id, operation, options)
+        elif operation == "notch-convert":
+            result, shapes, warnings, changed = _convert_notch(entities, by_id, options)
+        elif operation == "notch-depth-all":
+            result, shapes, warnings, changed = _resize_all_notches(entities, options)
         elif operation in ("offset", "offset-anchor"):
             offset_ids = options.get("ids", [options.get("id")])
             if not isinstance(offset_ids, list) or not 1 <= len(offset_ids) <= MAX_ENTITIES:
@@ -3536,7 +4288,10 @@ def edit_design(entities, operation, options):
                 "selectedIds": [shape["id"] for shape in shapes]}
     if operation == "offset" and "ids" in options:
         response["originalIds"] = offset_ids
-    if operation in ("trim-quick", "repair-part", "close-outline", "repair-conflict", "repair-conflicts", "simplify"):
+    if operation == "split-intersections":
+        response["selectedEdgeIndex"] = selected_edge
+    if operation in ("trim-quick", "repair-part", "close-outline", "repair-conflict", "repair-conflicts", "simplify",
+                     "notch-convert", "notch-depth-all", "join-outline", "split-outline", "fillet", "split-intersections"):
         response["changed"] = changed
     if diagnostics:
         response["diagnostics"] = diagnostics

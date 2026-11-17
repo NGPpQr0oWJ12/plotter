@@ -570,7 +570,7 @@ function renderTable() {
   const units = camera.width / Math.max(svg.clientWidth, 1);
   const surface = svgBox({ minX: 0, minY: 0, maxX: length, maxY: height });
   const parts = [element("rect", { ...surface, class: "table-background" })];
-  const materialWidth = nestingSettings?.widthMm ?? height;
+  const materialWidth = nestingSettings?.widthMm ?? (cutWidthPending() ? 0 : height);
   const fabric = includedBounds && materialWidth > 0 ? Math.min(materialWidth, height) : 0;
   if (fabric) {
     parts.push(element("rect", { x: -fabric, y: -length, width: fabric, height: length, class: "material-surface" }));
@@ -2181,7 +2181,11 @@ function stepDrawingHistory(redo = false) {
   cancelCanvasGesture();
   const state = from.pop();
   to.push(drawingHistoryState(state.label));
+  const priorNesting = nestingSettings;
   ({ placed, excluded, selection, nestingSettings, routeApplied } = state);
+  if (fixedDesignWidth() && nestingSettings?.widthMm !== managedCut.widthMm) {
+    nestingSettings = { ...(nestingSettings ?? priorNesting), widthMm: managedCut.widthMm, widthExplicit: true };
+  }
   updateDrawing();
   if (!contourDialog.open) svg.focus({ preventScroll: true });
 }
@@ -2305,14 +2309,26 @@ function defaultFabricWidthMm() {
   return Math.min(machine.height, machine.defaultFabricWidthMm ?? DEFAULT_FABRIC_WIDTH_MM);
 }
 
+function fixedDesignWidth() {
+  return managedCut?.mode === "design" && Number.isFinite(managedCut.widthMm);
+}
+
+function cutWidthPending() {
+  if (managedCut?.widthMm === undefined || kitLayout()) return false;
+  return !Number.isFinite(nestingSettings?.widthMm) || (managedCut.widthMm === null && managedCut.mode !== "demo");
+}
+
 function applyNestingSettings() {
   const width = $("nest-width");
-  width.readOnly = kitLayout() || managedCut?.mode === "design";
+  const pending = cutWidthPending();
+  width.readOnly = kitLayout() || managedCut?.mode === "design" && managedCut.widthMm !== null;
+  width.required = pending && !width.readOnly;
   width.max = String(machine.height);
   width.placeholder = String(defaultFabricWidthMm());
   const savedWidth = nestingSettings?.widthMm;
   const oldDefault = nestingSettings?.widthExplicit == null && savedWidth === machine.height;
-  width.value = kitLayout() ? managedCut.widthMm : !oldDefault && savedWidth != null ? savedWidth : defaultFabricWidthMm();
+  width.value = kitLayout() || fixedDesignWidth() ? managedCut.widthMm
+    : pending ? savedWidth ?? "" : !oldDefault && savedWidth != null ? savedWidth : defaultFabricWidthMm();
   $("nest-length").value = nestingSettings?.lengthMm ?? "";
   $("nest-gap").value = nestingSettings?.gapMm ?? 10;
   $("nest-margin").value = nestingSettings?.marginMm ?? 10;
@@ -2527,6 +2543,15 @@ function writeWorkspace(workspace, partCorrection = false) {
   }, AbortSignal.timeout(30_000)));
 }
 
+function updateManagedCutMetadata(response) {
+  if (!managedCut || kitLayout()) return false;
+  const revised = managedCut.cutRevision !== response.cutRevision;
+  const widthChanged = Object.hasOwn(response, "widthMm") && managedCut.widthMm !== response.widthMm;
+  managedCut.cutRevision = response.cutRevision;
+  if (widthChanged) managedCut.widthMm = response.widthMm;
+  return revised || widthChanged;
+}
+
 function persistWorkspace() {
   clearTimeout(saveTimer);
   if (savePromise) return savePromise;
@@ -2539,9 +2564,8 @@ function persistWorkspace() {
         const response = await writeWorkspace(workspaceSnapshot());
         if (kitLayout()) {
           managedCut.saved = true;
-        } else if (managedCut) {
-          if (managedCut.cutRevision !== response.cutRevision) resetCutPlan({ keepView: true });
-          managedCut.cutRevision = response.cutRevision;
+        } else if (updateManagedCutMetadata(response)) {
+          resetCutPlan({ keepView: true });
         }
         workspaceRevision = response.revision;
         workspaceSaved = change;
@@ -2617,7 +2641,8 @@ function resetCutPlan({ keepView = false } = {}) {
   cutPlanEpoch++;
   cutPlanRequest?.controller.abort();
   cutPlanRequest = null;
-  pendingCanvasPlan = keepView && includedBounds ? (cutPlan?.pages.length ? cutPlan : pendingCanvasPlan) : null;
+  const widthPending = cutWidthPending();
+  pendingCanvasPlan = !widthPending && keepView && includedBounds ? (cutPlan?.pages.length ? cutPlan : pendingCanvasPlan) : null;
   cutPlan = null;
   keepViewForPlan = keepView;
   if (!keepView) previewCutPage = null;
@@ -2631,7 +2656,7 @@ function resetCutPlan({ keepView = false } = {}) {
   simulation.close();
   renderPaths();
   renderPages();
-  if (source && includedBounds) cutPlanTimer = setTimeout(() => void requestCutPlan(), 250);
+  if (source && includedBounds && !widthPending) cutPlanTimer = setTimeout(() => void requestCutPlan(), 250);
 }
 
 function indexCutSections(plan, includedIndices) {
@@ -2658,6 +2683,7 @@ function indexCutSections(plan, includedIndices) {
 }
 
 function requestCutPlan() {
+  if (cutWidthPending()) return Promise.resolve(null);
   if (cutPlan) return Promise.resolve(cutPlan);
   const epoch = cutPlanEpoch;
   if (cutPlanRequest?.epoch === epoch) return cutPlanRequest.promise;
@@ -2969,12 +2995,12 @@ function operationAllowed(action, allowPending = false) {
   if (!live.positionFresh && action !== "home") return false;
   if (live.operations[action] === false) return false;
   if (action !== "cut") return true;
-  return Boolean(!jobError && !drawingLocked() && !cutPlacementPreviewActive() && !simulation.active && currentUpload && cutPlan?.planId === currentUpload.planId
-    && $("job-verified").checked);
+  return Boolean(!cutWidthPending() && !jobError && !drawingLocked() && !cutPlacementPreviewActive() && !simulation.active
+    && currentUpload && cutPlan?.planId === currentUpload.planId && $("job-verified").checked);
 }
 
 function uploadPageNumber(plan = cutPlan) {
-  if (!plan?.canUpload) return null;
+  if (cutWidthPending() || !plan?.canUpload) return null;
   if (controllerRoll) return controllerRoll.planId === plan.planId ? controllerRoll.nextPage : null;
   const page = plan.mode === "roll" && machine.apiVersion >= 17 ? selectedCutPage : 1;
   return plan.pages[page - 1]?.canStart === false ? null : page;
@@ -3159,10 +3185,11 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   transferring = pendingCommand === "upload" || activeRun?.state === "transferring",
   jobActive = inProgress || stopPending || Boolean(live.stopAvailable), armed = controlActive() } = {}) {
   const partMoving = cutPlacementPreviewActive();
+  const widthPending = cutWidthPending();
   const displayedPlan = cutPlan ?? pendingCanvasPlan;
   const planPending = !cutPlan && Boolean(includedBounds) && !cutPlanError;
   updateControl($("simulation-button"), "disabled", (importing && !layoutReadOnly()) || partMoving || stopPending || Boolean(currentUpload) || Boolean(jobError)
-    || planPending || !includedBounds || Boolean(cutPlan && !cutPlan.pages.length));
+    || widthPending || planPending || !includedBounds || Boolean(cutPlan && !cutPlan.pages.length));
   const uploadButton = $("controller-upload-button");
   const advanceButton = $("roll-advance-button");
   const roll = controllerRoll?.planId === displayedPlan?.planId ? controllerRoll : null;
@@ -3185,9 +3212,9 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
     else updateControl($("upload-confirm-accept"), "disabled", !matchesLaunchIntent(uploadConfirmation));
   }
   updateText(uploadButton.querySelector("span"), transferring ? "Загрузка…" : "Старт");
-  const canDownloadXiao = !jobError && cutPlan?.canPrepareXiao === true;
+  const canDownloadXiao = !widthPending && !jobError && cutPlan?.canPrepareXiao === true;
   const useXiao = canDownloadXiao && !currentUpload && !cutPlan.canUpload;
-  const showAdvance = waitingForAutomaticAdvance() && !jobActive && !layoutPreparation() && !layoutReadOnly();
+  const showAdvance = !widthPending && waitingForAutomaticAdvance() && !jobActive && !layoutPreparation() && !layoutReadOnly();
   updateControl(advanceButton, "hidden", !showAdvance);
   updateControl(advanceButton, "disabled", !showAdvance || !uploadAllowed({ forAdvance: true }));
   updateText(advanceButton, pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход");
@@ -3204,7 +3231,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
     : partMoving ? "Завершите перемещение детали." : "");
   updateText(xiaoOpen, xiaoHandoff === "open" ? "Открываем…" : "Открыть в Xiao");
   updateText(xiaoDownload, xiaoHandoff === "download" ? "Готовим DXF…" : "Скачать DXF");
-  updateControl($("xiao-handoff"), "hidden", !includedBounds);
+  updateControl($("xiao-handoff"), "hidden", widthPending || !includedBounds);
   updateControl($("xiao-result"), "hidden", !xiaoResult);
   updateText($("xiao-result"), xiaoResult || "");
   let status;
@@ -3214,6 +3241,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (transferring) status = "Передача чертежа…";
   else if (inProgress) status = runLabels[live.externalMotion || activeRun?.state] || "Проверьте штатный пульт";
   else if (stopNeedsVerification) status = "Ожидаем подтверждение остановки";
+  else if (widthPending && includedBounds) status = "Укажите ширину полотна и выполните автораскладку всех деталей.";
   else if (machine.verifiedJobUpload === false) status = "Перезапустите локальный сервер плоттера";
   else if (!source) status = "Откройте DXF или DWG";
   else if (!includedBounds) status = "Добавьте контур к заданию";
@@ -3985,7 +4013,7 @@ async function clearForNewCut() {
 }
 
 async function prepareXiaoDrawing(openInXiao) {
-  if (xiaoHandoff || jobError || drawingLocked() || cutPlacementPreviewActive() || !cutPlan?.canPrepareXiao
+  if (cutWidthPending() || xiaoHandoff || jobError || drawingLocked() || cutPlacementPreviewActive() || !cutPlan?.canPrepareXiao
       || (openInXiao && $("prepare-xiao-open").disabled)) return;
   const { planId, exportPlanId, filename } = cutPlan;
   xiaoHandoff = openInXiao ? "open" : "download";
@@ -4076,11 +4104,14 @@ contourCheckDialog.addEventListener("close", () => {
 $("nest-button").addEventListener("click", () => {
   cancelCanvasGesture();
   nestSelection = new Set(selection);
-  $("nest-scope").textContent = nestSelection.size
+  const scope = nestSelection.size
     ? "В раскрой попадут только выделенные детали. Остальные останутся на чертеже как исключённые."
     : "В раскрой попадут все включённые детали.";
+  const pendingWidth = cutWidthPending();
+  $("nest-scope").textContent = pendingWidth ? `Чтобы сохранить ширину полотна, разложите все детали. ${scope}` : scope;
   applyNestingSettings();
   nestDialog.showModal();
+  if (pendingWidth && $("nest-width").required) $("nest-width").focus();
   void checkNestingBackend();
 });
 $("nest-cancel").addEventListener("click", () => {
@@ -5517,7 +5548,7 @@ async function openLayoutPart(part) {
         }
         rememberDrawing("изменение детали в конструкторе");
         workspaceRevision = response.revision;
-        if (managedCut) managedCut.cutRevision = response.cutRevision;
+        updateManagedCutMetadata(response);
         placed = next;
         excluded = nextExcluded;
         selection = nextSelection;
@@ -5609,7 +5640,7 @@ async function navigateLayout(next, { resume = false } = {}) {
     $("workplace-page").hidden = true;
     managedCut = next.mode === "kit"
       ? { ...next, widthMm: response.widthMm, quantity: response.quantity, saved: response.saved && response.valid }
-      : next.id ? { ...next, name: response.name, status: response.status, cutRevision: response.cutRevision } : null;
+      : next.id ? { ...next, name: response.name, status: response.status, cutRevision: response.cutRevision, widthMm: response.widthMm } : null;
     if (interactive && oldHardwareCut !== hardwareCutId) {
       clearCurrentUpload();
       activeRun = null;

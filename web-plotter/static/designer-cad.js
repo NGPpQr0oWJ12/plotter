@@ -15,10 +15,17 @@ const SPLINE_TOLERANCE_MM = .01;
 const SPLINE_TOLERANCE_PX = .35;
 const MAX_SPLINE_REFINEMENT_POINTS = 16_384;
 const MAX_GROUP_DEPTH = 32;
+const MAX_CAD_ENTITIES = 50_000;
+const MAX_CAD_POINTS = 250_000;
+const MAX_ARRAY_COPIES = 1000;
+let cadClipboard = null;
 const CAD_SELECTED_COLOR = "#1688de";
 const CAD_TRANSFORM_COLOR = "#6941b5";
 const CAD_SNAP_COLOR = "#0869a7";
 const CAD_NOTCH_COLOR = "#e45a08";
+const CAD_REFERENCE_COLOR = "#777";
+const CAD_REFERENCE_DASH = [6, 4];
+const CANVAS_FILTERS = { all: "Всё", guides: "Направляющие", cut: "Линии реза", notches: "Насечки" };
 const REPAIR_DIAGNOSTICS = {
   branch: ["Развилка", "Снимите выделение с лишней ветви через Shift + щелчок и повторите восстановление."],
   gap: ["Разрыв контура", "Проверьте отмеченные концы и исправьте контур вручную."],
@@ -444,6 +451,7 @@ function snapPoints(entity, path) {
         ...nodes([arcPoint(entity, 0), arcPoint(entity, 1), entity.center])];
     }
     case "polyline": {
+      if (isUnifiedContour(entity)) return entity.closed ? [] : nodes([entity.points[0], entity.points.at(-1)]);
       const points = nodes(entity.points);
       for (let i = 0; i < entity.points.length - Number(!entity.closed); i++) {
         const { start, end, arc } = polylineEdge(entity, i);
@@ -624,14 +632,32 @@ function crossingSpans(entity, path, bounds) {
   return path.slice(1).map((point, index) => line(path[index], point));
 }
 
-function enclosed(path, box, crossing) {
+function marqueeSides([left, bottom, right, top]) {
+  const corners = [[left, bottom], [right, bottom], [right, top], [left, top]];
+  return corners.map((a, i) => ({ a, b: corners[(i + 1) % corners.length] }));
+}
+
+function enclosed(path, box, sides) {
   if (!path.length) return false;
-  if (!crossing) return path.every(point => within(point, box));
+  if (!sides) return path.every(point => within(point, box));
   if (path.some(point => within(point, box))) return true;
-  const [x, y, right, top] = box;
-  const corners = [[x, y], [right, y], [right, top], [x, top]];
-  return path.some((point, i) => i && corners.some((corner, k) =>
-    intersection(path[i - 1], point, corner, corners[(k + 1) % 4])));
+  return path.some((point, i) => i && sides.some(({ a, b }) => intersection(path[i - 1], point, a, b)));
+}
+
+function boundsInside([left, bottom, right, top], box) {
+  return left >= box[0] && bottom >= box[1] && right <= box[2] && top <= box[3];
+}
+
+function boundsOverlap([left, bottom, right, top], box) {
+  return right >= box[0] && top >= box[1] && left <= box[2] && bottom <= box[3];
+}
+
+function edgeInMarquee(edge, box, sides) {
+  if (boundsInside(edge.bounds, box)) return true;
+  if (!sides || !boundsOverlap(edge.bounds, box)) return false;
+  const start = edge.a ?? edge.curve.entity.start;
+  const end = edge.b ?? edge.curve.entity.end;
+  return within(start, box) || within(end, box) || sides.some(side => snapCrossings(side, edge).length > 0);
 }
 
 const CREATE = {
@@ -640,6 +666,7 @@ const CREATE = {
   polyline: { label: "Полилиния", points: ["Начальная точка", "Следующая вершина"] },
   circle: { label: "Окружность", points: ["Центр окружности", "Точка на окружности"] },
   arc: { label: "Дуга", points: ["Начало дуги", "Конец дуги", "Изгиб"] },
+  "arc-three": { label: "Дуга по трём точкам", points: ["Начало дуги", "Точка на дуге", "Конец дуги"] },
   spline: { label: "Сплайн по точкам", points: ["Начальная точка", "Следующая точка сплайна"] },
 };
 const FIGURES = {
@@ -650,10 +677,11 @@ const FIGURES = {
   ellipse: { label: "Эллипс", points: ["Центр эллипса", "Конец первой оси", "Точка для второй полуоси"] },
 };
 const DRAW = { ...CREATE, ...FIGURES };
+const hasDrawingMode = key => key !== "point" && Object.hasOwn(DRAW, key);
 const DIRECT_DISTANCE_LABELS = {
   line: "Длина", polyline: "Длина сегмента", circle: "Радиус", spline: "Расстояние до точки",
   triangle: "Расстояние до вершины", polygon: "Радиус",
-  move: "Смещение", copy: "Смещение", measure: "Расстояние",
+  move: "Смещение", measure: "Расстояние",
 };
 const RECTANGLE_SIDES = ["A", "B"];
 const TOOL_PARAMETERS = {
@@ -661,13 +689,14 @@ const TOOL_PARAMETERS = {
   notch: ["Надсечка", "Глубина, мм", "Выбрать кромку", "3"],
   "notch-series": ["Серия надсечек", "Глубина, мм", "Выбрать кромку", "3"],
   "notch-edit": ["Изменить надсечку", "Глубина, мм", "Изменить глубину"],
+  "notch-depth-all": ["Глубина всех надсечек", "Глубина, мм", "Применить ко всем"],
+  fillet: ["Сопряжение", "Радиус, мм", "Скруглить"],
   scale: ["Масштабирование", "", "Применить"],
   "insert-points": ["Добавить несколько точек", "Число точек на выбранном участке", "Добавить точки"],
 };
 const MAX_INSERT_POINTS = 100;
 const EDIT = {
   move: { label: "Перенести", points: ["Базовая точка", "Новая точка"] },
-  copy: { label: "Копировать", points: ["Базовая точка", "Точка вставки"] },
   rotate: { label: "Повернуть", points: ["Центр поворота", "Исходное направление", "Новое направление"] },
   scale: { label: "Масштабировать" },
   mirror: { label: "Отразить", points: ["Начало оси", "Конец оси"] },
@@ -675,7 +704,7 @@ const EDIT = {
   "notch-series": { label: "Серия надсечек", points: ["Точка на контуре"] },
   "notch-edit": { label: "Изменить надсечку", points: ["Точка на контуре"] },
 };
-const OBJECT_TRANSFORMS = new Set(["move", "copy", "rotate", "scale", "mirror"]);
+const OBJECT_TRANSFORMS = new Set(["move", "rotate", "scale", "mirror"]);
 const MIRROR_MODES = { points: "По двум точкам", edge: "По ребру", vertical: "Вертикаль", horizontal: "Горизонталь" };
 const MIRROR_AXIS_WARNING = { points: "Укажите две разные точки оси.", edge: "Наведите на прямое ребро для отражения." };
 const ENTITY_NAMES = { ...Object.fromEntries(Object.entries(DRAW).map(([key, value]) => [key, value.label])) };
@@ -693,24 +722,29 @@ const CAD_ICONS = {
   polyline: '<path d="m4 17 5-9 5 5 6-7"/><circle cx="4" cy="17" r="1.5"/><circle cx="9" cy="8" r="1.5"/><circle cx="14" cy="13" r="1.5"/><circle cx="20" cy="6" r="1.5"/>',
   circle: '<circle cx="12" cy="12" r="8"/><path d="M10 12h4m-2-2v4"/>',
   arc: '<path d="M4 16a8 8 0 0 1 16 0"/><path d="M3 16h2m14 0h2M12 7v2"/>',
+  "arc-three": '<path d="M4 17a8 8 0 0 1 16 0"/><circle cx="4" cy="17" r="1.5"/><circle cx="12" cy="9" r="1.5"/><circle cx="20" cy="17" r="1.5"/>',
   spline: '<path d="M3 16c5 0 3-9 8-9s3 9 10 9"/><circle cx="3" cy="16" r="1"/><circle cx="11" cy="7" r="1"/><circle cx="21" cy="16" r="1"/>',
   move: '<path d="M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3m12-6 3 3-3 3"/>',
-  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2"/>',
   rotate: '<use href="#i-turn-cw"/>',
   scale: '<path d="M13 4h7v7m0-7-8 8"/><rect x="4" y="12" width="8" height="8" rx="1"/>',
   mirror: '<path d="M12 3v18M9 5 3 18h6Zm6 0 6 13h-6Z"/>',
   join: '<path d="M12 9V5H5a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h7m0-2h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7v-4M8 12h8"/>',
-  "close-outline": '<path d="M8 5h9l3 4v10H4V9l4-4"/><circle cx="4" cy="9" r="1.5"/><circle cx="8" cy="5" r="1.5"/>',
+  "close-outline": '<path d="m4 18 5-7h6l5-5"/><circle cx="4" cy="18" r="1.5"/><circle cx="20" cy="6" r="1.5"/>',
+  "split-outline": '<path d="m4 18 5-7h1m4 0h1l5-5"/><circle cx="4" cy="18" r="1.5"/><circle cx="20" cy="6" r="1.5"/>',
   ungroup: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><path d="m10 14 4-4M12 7h3v3m-6 4v3h3"/>',
   offset: '<path d="M5 20V5h15M9 20V9h11m-5 6h5m-2-2 2 2-2 2"/>',
+  fillet: '<path d="M4 20v-8a8 8 0 0 1 8-8h8"/><path d="m13 13-5-5m3 0H8v3"/>',
   notch: '<path d="M3 17h7l2-5 2 5h7m-9-9V4m-2 2 2 2 2-2"/>',
   "notch-series": '<path d="M3 17h18M6 17v-6m6 6v-6m6 6v-6M3 6h18"/>',
   "notch-edit": '<path d="M3 18h18m-9 0V8M4 6h16m-3-3 3 3-3 3M7 3 4 6l3 3"/>',
+  "notch-convert": '<path d="m3 11 5-5m1 8h6m-2-2 2 2-2 2m3 3h5m-2 0v-8"/>',
+  "notch-depth-all": '<path d="M3 19h13m-11 0v-7m5 7v-7m5 7v-7m5 0v7m-2-5 2-2 2 2m-4 3 2 2 2-2M3 8h13"/>',
   erase: '<path d="m4 13 9-9a2 2 0 0 1 3 0l4 4a2 2 0 0 1 0 3l-9 9H8l-4-4a2 2 0 0 1 0-3Zm4-4 8 8m-5 3h10"/>',
   undo: '<use href="#i-undo"/>',
   redo: '<use href="#i-redo"/>',
   fit: '<use href="#i-fit"/>',
   measure: '<use href="#i-ruler"/>',
+  "measure-radius": '<circle cx="12" cy="12" r="8"/><path d="m12 12 5.66-5.66m-4.42.65 4.42-.65-.65 4.42"/><circle cx="12" cy="12" r="1"/>',
   tools: '<use href="#i-sliders"/>',
   repair: '<path d="m3 9 3-3 3 3m-3-3v6a5 5 0 0 0 5 5h2m8-2-3 3-3-3m3 3v-6a5 5 0 0 0-5-5h-2"/>',
   reference: '<path d="M4 5h6m4 0h6M20 9v6m0 4h-6m-4 0H4m0-4V9"/>',
@@ -758,32 +792,44 @@ const markup = `
       <div class="cad-tool-group" role="group" aria-label="Правка">
         ${toolButtons(Object.fromEntries(Object.entries(EDIT).filter(([key]) => !key.startsWith("notch"))))}
         ${iconButton("offset", "Припуск", "tool")}
+        ${iconButton("fillet", "Сопряжение", "action", "Скруглить угол заданным радиусом")}
         ${iconButton("erase", "Ластик", "tool")}
         <div class="cad-group-actions">
           <button type="button" class="button cad-icon-button cad-group-button" data-action="join" aria-label="Соединить в группу" title="Создать группу из выделения. При выборе ребра в группу войдёт весь его объект.">${cadIcon("join")}</button>
           <button type="button" class="button cad-icon-button cad-group-button" data-action="ungroup" aria-label="Разъединить" title="Разъединить выбранные группы на текущем уровне" hidden>${cadIcon("ungroup")}</button>
         </div>
-        ${iconButton("close-outline", "Замкнуть контур", "action", "Объединить выделенные объекты в один замкнутый контур. При выборе ребра используется весь его объект.")}
+        ${iconButton("close-outline", "Соединить")}
       </div>
       <div class="cad-tool-group" role="group" aria-label="Надсечки">
         <span class="cad-tool-caption">Надсечки</span>
         ${toolButtons(Object.fromEntries(Object.entries(EDIT).filter(([key]) => key.startsWith("notch"))))}
+        ${iconButton("notch-convert", "Преобразовать линии в надсечки", "action", "Преобразовать выделенные прямые отрезки в надсечки")}
+        ${iconButton("notch-depth-all", "Глубина всех надсечек", "action", "Задать глубину всем надсечкам чертежа")}
       </div>
       <div class="cad-tool-group" role="group" aria-label="История и вид">
         ${iconButton("undo", "Отменить", "action", "Отменить (Ctrl+Z)")}
         ${iconButton("redo", "Повторить", "action", "Повторить (Ctrl+Y или Ctrl+Shift+Z)")}
         ${iconButton("fit", "Вписать", "action", "Показать чертёж целиком")}
         ${iconButton("measure", "Измерить расстояние", "tool")}
+        ${iconButton("measure-radius", "Измерить радиус", "tool")}
       </div>
     </div>
     <div class="cad-view">
       <canvas tabindex="0" aria-label="Графическое поле чертежа"></canvas>
       <div class="cad-context-menu" data-view="context-menu" role="menu" aria-label="Команды чертежа" hidden></div>
-      <div class="cad-group-status" data-view="group-status" hidden>
-        <span data-view="group-label"></span>
-        <button type="button" class="button" data-action="exit-group">Выйти из группы</button>
+      <div class="cad-canvas-toolbar">
+        <div class="cad-group-status" data-view="group-status" hidden>
+          <span data-view="group-label"></span>
+          <button type="button" class="button" data-action="exit-group">Выйти из группы</button>
+        </div>
+        <div class="cad-canvas-panel">
+          <div class="cad-canvas-filters" role="group" aria-label="Отображение чертежа">
+            ${Object.entries(CANVAS_FILTERS).map(([key, label]) =>
+              `<button type="button" data-canvas-filter="${key}" aria-pressed="${key === "all"}">${label}</button>`).join("")}
+          </div>
+          <div class="cad-grid-status" data-view="scale"></div>
+        </div>
       </div>
-      <div class="cad-grid-status" data-view="scale"></div>
       <output class="cad-distance" data-view="distance-entry" hidden><span data-view="distance-value"></span><kbd data-view="distance-key">Enter</kbd></output>
       <details class="cad-warnings" data-view="warnings" hidden>
         <summary></summary><ul></ul>
@@ -847,10 +893,10 @@ const markup = `
         <div class="cad-snaps" data-view="tools-panel" role="group" aria-label="Привязки" hidden>
           <strong>Привязки</strong>
           <label class="cad-checkbox" title="Привязка к узлам и серединам рёбер"><input type="checkbox" data-field="objects" checked> Узлы</label>
-          <label class="cad-checkbox" title="Привязка к пересечениям"><input type="checkbox" data-field="crossings"> Пересечения</label>
-          <label class="cad-checkbox" title="Привязка к ближайшей точке ребра. При удержании Shift ребро также может задать точку на оси."><input type="checkbox" data-field="edges"> Рёбра</label>
-          <label class="cad-checkbox" title="Перпендикуляр к прямому ребру от последней точки"><input type="checkbox" data-field="perpendicular"> Перпендикуляр</label>
-          <label class="cad-checkbox" title="Наведите на узел, ребро или кривую, чтобы продолжить построение по направляющей. От последней точки направляющая появляется автоматически."><input type="checkbox" data-field="tracking"> Направляющие</label>
+          <label class="cad-checkbox" title="Привязка к пересечениям"><input type="checkbox" data-field="crossings" checked> Пересечения</label>
+          <label class="cad-checkbox" title="Привязка к ближайшей точке ребра. При удержании Shift ребро также может задать точку на оси."><input type="checkbox" data-field="edges" checked> Рёбра</label>
+          <label class="cad-checkbox" title="Перпендикуляр к прямому ребру от последней точки"><input type="checkbox" data-field="perpendicular" checked> Перпендикуляр</label>
+          <label class="cad-checkbox" title="Наведите на узел, ребро или кривую, чтобы продолжить построение по направляющей. От последней точки направляющая появляется автоматически."><input type="checkbox" data-field="tracking" checked> Направляющие</label>
           <label class="cad-checkbox" title="Округлять координаты до шага видимой сетки"><input type="checkbox" data-field="grid"> Сетка</label>
           <label class="cad-checkbox" title="Ограничить следующую точку горизонталью или вертикалью. Shift удерживает текущую ось до отпускания."><input type="checkbox" data-field="ortho"> Орто</label>
           <small>Метки при указании точки</small>
@@ -886,6 +932,10 @@ function errorMessage(error) {
 
 function isClosedContour(entity) {
   return entity.closed === true || entity.type === "circle" || entity.type === "ellipse" && Math.abs(entity.sweep) === 360;
+}
+
+function isUnifiedContour(entity) {
+  return entity?.type === "polyline" && entity.joined && entity.points.length - Number(!entity.closed) >= 2;
 }
 
 function angleTransform(center, degrees) {
@@ -958,6 +1008,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   const actions = Object.fromEntries(Array.from(container.querySelectorAll("[data-action]"), node => [node.dataset.action, node]));
   const views = Object.fromEntries(Array.from(container.querySelectorAll("[data-view]"), node => [node.dataset.view, node]));
   const buttons = Object.fromEntries(Array.from(container.querySelectorAll("[data-tool]"), node => [node.dataset.tool, node]));
+  const filterButtons = container.querySelectorAll("[data-canvas-filter]");
   const optionForm = container.querySelector('[data-form="option"]');
   const parameterDialog = views.parameters;
   const contextMenu = views["context-menu"];
@@ -976,6 +1027,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   let current = initial;
   let byId = new Map(current.entities.map(entity => [entity.id, entity]));
   let activeGroup = [];
+  let canvasFilter = "all";
   let saved = initial;
   let savedName = draft?.name || "Новый чертёж";
   let selected = new Set();
@@ -989,6 +1041,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   let insertPointsTarget = null;
   let tool = "select";
   let pending = [];
+  let drawingReference = false;
+  let copyMode = false;
+  let pastePlacement = null;
+  let copyArray = null;
+  let arrayInput = "";
   let arcStartContact = null;
   let arcSymmetry = null;
   let arcBulges = [];
@@ -1004,11 +1061,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   let offsetPreview = null;
   let notchPreview = null;
   let notchTarget = null;
+  let parameterCommand = null;
+  let optionBeforeBulkDepth = "";
+  let filletRadius = "";
   let placingNotch = false;
   let scaleBox = null;
   let scaleSide = null;
   let scaleIds = new Set();
-  const measurements = [];
+  let measurements = [];
+  let selectedMeasurement = null;
+  let measurementLabels = [];
   let cursor = null;
   let lastPointer = null;
   let pointerFrame = null;
@@ -1093,7 +1155,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       && bounds[1] <= y + tolerance + margin && bounds[3] >= y - tolerance - margin;
     const nearby = [];
     for (const entity of current.entities) {
-      if (entity.id === ignoredId || entity.type === "point") continue;
+      if (!canvasShows(entity) || entity.id === ignoredId || entity.type === "point") continue;
       const source = geometry(entity);
       if (!visible(source.bounds, entity.type === "spline" ? SPLINE_TOLERANCE_MM : 0)) continue;
       const cached = viewportGeometry(entity, source);
@@ -1132,7 +1194,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const overlaps = (bounds, margin = EPSILON) => bounds[0] <= right + margin && bounds[2] >= left - margin
       && bounds[1] <= top + margin && bounds[3] >= bottom - margin;
     for (const entity of current.entities) {
-      if (entity.id === ignoredId || entity.notch || entity.type === "point") continue;
+      if (!canvasShows(entity) || entity.id === ignoredId || entity.notch || entity.type === "point") continue;
       const source = geometry(entity);
       if (!overlaps(source.bounds, entity.type === "spline" ? SPLINE_TOLERANCE_MM : EPSILON)) continue;
       const cached = viewportGeometry(entity, source);
@@ -1158,9 +1220,74 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     return current.entities.filter(entity => selected.has(entity.id));
   }
 
+  function canvasShows(entity) {
+    if (!entity) return false;
+    if (canvasFilter === "all") return true;
+    if (entity.notch) return canvasFilter === "notches";
+    const guide = entity.reference || entity.type === "point";
+    return canvasFilter === (guide ? "guides" : "cut");
+  }
+
+  function selectCanvasFilter(next) {
+    if (next === canvasFilter || running || gesture || offsetPreview || notchPreview) return;
+    canvasFilter = next;
+    closeContextMenu();
+    selected = new Set([...selected].filter(id => canvasShows(byId.get(id))));
+    for (const id of selectedEdges.keys()) {
+      if (!canvasShows(byId.get(id))) selectedEdges.delete(id);
+    }
+    selectedMeasurement = null;
+    cursor = hover = trackingSource = shiftGuide = null;
+    clearSnapGuides();
+    clearRepairDiagnostics();
+    if (OBJECT_TRANSFORMS.has(tool) || tool === "notch-edit" && notchTarget) choose("select");
+    else update();
+  }
+
   function selectedOutlines() {
     return [...new Set([...selected, ...selectedEdges.keys()])].map(id => byId.get(id))
       .filter(entity => entity && !entity.notch && entity.type !== "point");
+  }
+
+  function selectedNotchLines(outlines = selectedOutlines()) {
+    return outlines.filter(entity => editableInGroup(entity) && (entity.type === "line"
+      || entity.type === "polyline" && !entity.closed && entity.points.length === 2 && !entity.bulges?.[0]));
+  }
+
+  function connectionCommand(outlines = selectedOutlines()) {
+    if (!outlines.every(editableInGroup)) return null;
+    const ids = [];
+    const edges = [];
+    for (const entity of outlines) {
+      if (selected.has(entity.id)) ids.push(entity.id);
+      else edges.push({ id: entity.id, indices: [...selectedEdges.get(entity.id)] });
+    }
+    if (ids.length === 1 && !edges.length) {
+      const entity = byId.get(ids[0]);
+      if (isUnifiedContour(entity)) return { operation: "split-outline", options: { id: entity.id } };
+      if (entity.type !== "polyline" || entity.points.length - Number(!entity.closed) < 2) return null;
+    } else if (ids.length + edges.reduce((count, entry) => count + entry.indices.length, 0) < 2) {
+      return null;
+    }
+    return { operation: "join-outline", options: { ids, edges } };
+  }
+
+  function filletSelection(outlines = selectedOutlines()) {
+    if (outlines.length === 2 && selectedNotchLines(outlines).length === 2) {
+      return { ids: outlines.map(entity => entity.id), edges: [] };
+    }
+    if (outlines.length !== 1) return null;
+    const [entity] = outlines;
+    if (entity.type !== "polyline" || !editableInGroup(entity)) return null;
+    if (selected.has(entity.id) && !entity.closed && entity.points.length === 3
+      && !polylineEdge(entity, 0).arc && !polylineEdge(entity, 1).arc) {
+      return { ids: [entity.id], edges: [] };
+    }
+    const edges = selectedEdges.get(entity.id);
+    if (edges?.size !== 2) return null;
+    const indices = [...edges];
+    return indices.every(index => !polylineEdge(entity, index).arc)
+      ? { ids: [], edges: [{ id: entity.id, indices }] } : null;
   }
 
   function groupPath(entity) {
@@ -1195,7 +1322,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function groupMembers(group) {
-    return current.entities.filter(entity => !entity.parentId && inActiveGroup(entity) && groupAt(entity) === group);
+    return current.entities.filter(entity => canvasShows(entity) && (!entity.parentId || canvasFilter === "notches")
+      && inActiveGroup(entity) && groupAt(entity) === group);
   }
 
   function canCreateGroup({ objects, groups }) {
@@ -1307,8 +1435,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   function gripOwner() {
     if (tool !== "select" || selected.size + selectedEdges.size !== 1) return null;
     const id = (selectedEdges.size ? selectedEdges.keys() : selected.values()).next().value;
-    const entity = current.entities.find(item => item.id === id);
-    return entity && !groupAt(entity) && !(entity.notch && entity.parentId) ? entity : null;
+    const entity = byId.get(id);
+    return entity && !isUnifiedContour(entity) && !groupAt(entity) && !(entity.notch && entity.parentId) ? entity : null;
   }
 
   function familyIds(ids) {
@@ -1484,6 +1612,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function focusWarning(entity) {
     if (running || gesture || offsetPreview || notchPreview || parameterDialog.open) return false;
+    if (!canvasShows(entity)) selectCanvasFilter("all");
     if (tool !== "select") choose("select");
     activeGroup = [...groupPath(entity)];
     selectContour(new Set([entity.id]));
@@ -1519,6 +1648,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function toolInstruction() {
     if (running || notchPreview) return "";
+    if (pastePlacement) return "Вставка · Укажите положение копии.";
+    if (copyArray) return arrayInput ? `Массив · ${arrayInput} · Enter` : "Массив · Введите x5 или /5 и нажмите Enter.";
     if (tool === "offset") return offsetPreview
       ? "Ведите курсор в нужную сторону. Щёлкните для применения или введите миллиметры и нажмите Enter."
       : "Щёлкните по контуру, от которого нужно построить припуск.";
@@ -1530,16 +1661,19 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     if (tool === "scale") return "Масштаб · Потяните ручку рамки или щёлкните по ней для точного размера.";
     if (tool === "erase") return "Ластик · Щёлкните по участку или проведите по нему курсором.";
+    if (tool === "measure-radius") return "Измерить радиус · Щёлкните по дуге или окружности.";
     if (tool === "notch-edit") return placingNotch ? "Надсечка · Укажите новую точку на контуре." : "Надсечка · Выберите надсечку.";
-    if (tool === "arc" && !pending.length) return "Дуга · Укажите первый конец. Привязка к контуру включена.";
     const definition = DRAW[tool] || EDIT[tool] || (tool === "measure"
       ? { label: "Измерить", points: ["Начало измерения", "Конец измерения"] } : null);
     if (!definition?.points) return "";
-    const step = definition.points[Math.min(pending.length, definition.points.length - 1)];
+    const step = tool === "arc" && !pending.length ? "Укажите первый конец. Привязка к контуру включена."
+      : definition.points[Math.min(pending.length, definition.points.length - 1)];
+    const drawingMode = hasDrawingMode(tool) ? (drawingReference ? "Вспомогательный" : "Для реза") : "";
     const exact = tool === "rotate" && pending.length ? "Введите угол и нажмите Enter. Shift задаёт шаг 45°."
       : directDistance() ? tool === "rectangle" ? "Размеры можно ввести с клавиатуры. Tab переключает сторону, Enter применяет."
         : "Размер можно ввести с клавиатуры и подтвердить Enter." : "";
-    return [definition.label, step, exact].filter(Boolean).join(" · ");
+    const copyHint = tool === "move" || tool === "rotate" ? (copyMode ? "+ Копирование" : "Ctrl — копия") : "";
+    return [definition.label, drawingMode, copyHint, step, exact].filter(Boolean).join(" · ");
   }
 
   function update() {
@@ -1551,10 +1685,15 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const transformSelection = settings || selectedEdges.size > 0;
     const first = items[0];
     const active = Boolean(gesture?.type === "grip" || gesture?.type === "scale" || offsetPreview || notchPreview);
+    for (const button of filterButtons) {
+      button.setAttribute("aria-pressed", String(button.dataset.canvasFilter === canvasFilter));
+      button.disabled = running || active;
+    }
     actions["fix-repair-location"].disabled = running || active || repairLocations[repairLocationIndex]?.fixable !== true;
     actions["fix-all-repair-locations"].disabled = running || active || repairBulkChecked || !repairSourceIds.length;
     for (const [key, button] of Object.entries(buttons)) {
       button.setAttribute("aria-pressed", String(key === tool));
+      button.toggleAttribute("data-drawing-reference", key === tool && drawingReference);
       button.disabled = running || active || (key in EDIT && !key.startsWith("notch") && !(OBJECT_TRANSFORMS.has(key) ? transformSelection : settings))
         || (key === "scale" && !selectedEdges.size && !items.some(entity => entity.type !== "point"));
     }
@@ -1562,13 +1701,21 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const canGroup = canCreateGroup(groupable);
     actions.join.disabled = tool !== "select" || running || active || !canGroup;
     const outlines = selectedOutlines();
-    const single = outlines.length === 1 ? outlines[0] : null;
-    const alreadyClosed = single && isClosedContour(single);
-    const closeOutline = actions["close-outline"];
-    closeOutline.disabled = tool !== "select" || running || active || !outlines.every(editableInGroup)
-      || (outlines.length < 2 && !alreadyClosed && single?.type !== "polyline");
-    closeOutline.title = alreadyClosed ? "Проверить замыкание и пересечения выделенного контура."
-      : "Объединить выделенные объекты в один замкнутый контур. При выборе ребра используется весь его объект.";
+    const connection = connectionCommand(outlines);
+    const connect = actions["close-outline"];
+    const split = connection?.operation === "split-outline";
+    const icon = split ? "split-outline" : "close-outline";
+    const label = split ? "Разъединить" : "Соединить";
+    connect.disabled = tool !== "select" || running || active || !connection;
+    if (connect.dataset.icon !== icon) {
+      connect.dataset.icon = icon;
+      connect.setAttribute("aria-label", label);
+      connect.title = label;
+      connect.innerHTML = cadIcon(icon);
+    }
+    actions["notch-convert"].disabled = tool !== "select" || running || active || !selectedNotchLines(outlines).length;
+    actions.fillet.disabled = tool !== "select" || running || active || !filletSelection(outlines);
+    actions["notch-depth-all"].disabled = running || active || !current.entities.some(entity => entity.notch);
     const canUngroup = tool === "select" && units.groups.size > 0;
     actions.join.hidden = canUngroup && !canGroup;
     actions.ungroup.hidden = !canUngroup;
@@ -1582,7 +1729,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions.save.disabled = running || active;
     actions.part.disabled = running || active || !outlines.some(entity => !entity.reference);
     views["notch-preview"].hidden = !notchPreview;
-    views.measurements.hidden = tool !== "measure" || !measurements.length;
+    views.measurements.hidden = !["measure", "measure-radius"].includes(tool) || !measurements.length;
     views.erase.hidden = tool !== "erase" || !settings;
     canvas.dataset.tool = tool;
     const finishable = tool === "spline" || tool === "polyline";
@@ -1606,13 +1753,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       .map(entity => [entity.id, entity])).values()];
     const needsReview = selection.filter(entity => entity.importDamaged).length;
     const onlyGroup = count === 1 && !edgeCount && units.groups.size;
-    if (count + edgeCount === 1) {
+    if (selectedMeasurement) {
+      views.selection.textContent = `Измерение · ${measurementText(selectedMeasurement)}`;
+    } else if (count + edgeCount === 1) {
       const [entity] = selection;
       const polyline = entity.type === "polyline" && !edgeCount;
-      views.selection.textContent = onlyGroup ? "" : [edgeCount ? "Ребро полилинии" : ENTITY_NAMES[entity.type] || entity.type, entity.layer,
+      const entityLabel = entity.notch ? "Надсечка" : ENTITY_NAMES[entity.type] || entity.type;
+      views.selection.textContent = onlyGroup ? "" : [edgeCount ? "Ребро полилинии" : entityLabel, entity.layer,
         !edgeCount && isClosedContour(entity) ? "Замкнутый контур" : "",
-        polyline ? `Сегменты: ${entity.points.length - Number(!entity.closed)}` : "",
-        polyline && (entity.joined || entity.points.length > 32) ? "Alt+щелчок — выбрать ребро" : "",
+        polyline ? entity.joined ? "Единая траектория" : `Сегменты: ${entity.points.length - Number(!entity.closed)}` : "",
+        polyline && !entity.joined && entity.points.length > 32 ? "Alt+щелчок — выбрать ребро" : "",
         entity.reference ? "вспомогательный" : "", entity.importDamaged ? "Проверьте после импорта" : ""].filter(Boolean).join(" · ");
     } else {
       views.selection.textContent = [
@@ -1621,7 +1771,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         needsReview ? `Требуют проверки после импорта: ${needsReview}` : "",
       ].filter(Boolean).join(" · ");
     }
-    views["selection-summary"].hidden = Boolean(onlyGroup || !count && !edgeCount || tool !== "select");
+    views["selection-summary"].hidden = Boolean(onlyGroup || !count && !edgeCount && !selectedMeasurement || tool !== "select");
     actions["repair-part"].hidden = tool !== "select" || units.groups.size > 0 || !selection.length
       || !selection.every(entity => !entity.notch && entity.type !== "point");
     actions["repair-part"].disabled = running || active;
@@ -1636,13 +1786,29 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     draw();
   }
 
-  function commit(entities, { warnings = current.warnings, ids = selected } = {}) {
-    previous.push(current);
+  function rememberEdit() {
+    previous.push({ drawing: current, measurements });
     if (previous.length > 50) previous.shift();
     future.length = 0;
+  }
+
+  function changeMeasurements(next) {
+    rememberEdit();
+    measurements = next;
+    selectedMeasurement = null;
+    update();
+  }
+
+  function commit(entities, { warnings = current.warnings, ids = selected, amend = false, nextMeasurements = measurements } = {}) {
+    if (!amend) rememberEdit();
+    copyArray = null;
+    arrayInput = "";
+    future.length = 0;
+    measurements = nextMeasurements;
+    selectedMeasurement = null;
     setCurrent({ entities, warnings });
     if (ids !== selected) selectedEdges.clear();
-    selected = new Set(ids);
+    selected = new Set([...ids].filter(id => canvasShows(byId.get(id))));
     updateWarnings(warnings);
     update();
   }
@@ -1652,11 +1818,14 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     clearPointerMove();
     cancelGesture();
     clearOffset();
-    if (tool === "measure") {
-      measurements.length = 0;
-      if (next === "measure") next = "select";
-    }
+    if (tool === next && ["measure", "measure-radius"].includes(tool)) next = "select";
     tool = next;
+    selectedMeasurement = null;
+    drawingReference = false;
+    copyMode = false;
+    pastePlacement = null;
+    copyArray = null;
+    arrayInput = "";
     if (OBJECT_TRANSFORMS.has(next)) for (const id of selectedEdges.keys()) selected.add(id);
     mirrorMode = "points";
     mirrorEdge = null;
@@ -1683,22 +1852,29 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     visibleGuide = null;
   }
 
-  function openParameters() {
+  function openParameters(command = insertPointsTarget ? "insert-points" : tool) {
     if (running || root.querySelector("dialog[open]")) return;
     showTools(false);
-    const [title, label, submit] = TOOL_PARAMETERS[insertPointsTarget ? "insert-points" : tool];
+    parameterCommand = command;
+    if (command === "notch-depth-all") {
+      optionBeforeBulkDepth = fields.option.value;
+      fields.option.value = "";
+    }
+    if (command === "fillet") fields.option.value = filletRadius;
+    const [title, label, submit] = TOOL_PARAMETERS[command];
     views["parameter-title"].textContent = title;
-    views["option-label"].textContent = tool === "scale" ? `${scaleSide.axis === 0 ? "Ширина" : "Высота"}, мм` : label;
+    const scaling = command === "scale";
+    views["option-label"].textContent = scaling ? `${scaleSide.axis === 0 ? "Ширина" : "Высота"}, мм` : label;
     views["option-button"].textContent = submit;
-    views["scale-mode"].hidden = tool !== "scale";
-    views["notch-series"].hidden = tool !== "notch-series";
-    actions["relocate-notch"].hidden = tool !== "notch-edit";
-    fields.option.inputMode = insertPointsTarget ? "numeric" : "decimal";
+    views["scale-mode"].hidden = !scaling;
+    views["notch-series"].hidden = command !== "notch-series";
+    actions["relocate-notch"].hidden = command !== "notch-edit";
+    fields.option.inputMode = command === "insert-points" ? "numeric" : "decimal";
     parameterError();
     parameterDialog.showModal();
     fields.option.focus({ preventScroll: true });
     fields.option.select();
-    if (tool === "scale") draw();
+    if (scaling) draw();
   }
 
   function parameterError(message = "") {
@@ -1707,12 +1883,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function closeParameters() {
+    if (parameterCommand === "notch-depth-all") fields.option.value = optionBeforeBulkDepth;
+    parameterCommand = null;
     parameterDialog.close();
     canvas.focus({ preventScroll: true });
   }
 
   function cancelParameters() {
+    const command = parameterCommand;
     closeParameters();
+    if (command === "notch-depth-all" || command === "fillet") return;
     if (insertPointsTarget) {
       insertPointsTarget = null;
       return;
@@ -1726,8 +1906,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   function undo(from, to) {
     if (!from.length || running || gesture?.type === "grip" || offsetPreview || notchPreview) return;
     cancelGesture();
-    to.push(current);
-    setCurrent(from.pop());
+    to.push({ drawing: current, measurements });
+    const snapshot = from.pop();
+    setCurrent(snapshot.drawing);
+    measurements = snapshot.measurements;
     selected = new Set();
     selectedEdges.clear();
     choose(tool === "erase" ? "erase" : "select");
@@ -1760,8 +1942,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     stroke();
   }
 
-  function selectionBounds() {
-    const points = selectedEntities().flatMap(entity => {
+  function selectionBounds(entities = selectedEntities()) {
+    const points = entities.flatMap(entity => {
       const [left, bottom, right, top] = geometry(entity).bounds;
       return [[left, bottom], [right, top]];
     });
@@ -1829,7 +2011,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (preview) {
       const { origin, sx, sy } = preview;
       const pointTransform = ([x, y]) => [origin[0] + (x - origin[0]) * sx, origin[1] + (y - origin[1]) * sy];
-      drawSelectionPreview(pointTransform, scaleIds);
+      drawSelectionPreview(pointTransform, Array.from(scaleIds, id => byId.get(id)));
       const target = pointTransform(scaleSide.point);
       drawTransformGuide(origin, target);
       const [x, y] = screen(origin);
@@ -2051,11 +2233,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const [maxX, minY] = world([width + 10, height + 10]);
     const margin = entity.type === "spline" ? SPLINE_TOLERANCE_MM : 0;
     if (bounds[2] + margin < minX || bounds[0] - margin > maxX || bounds[3] + margin < minY || bounds[1] - margin > maxY) return;
-    const baseColor = entity.importDamaged ? "#b00020" : entity.notch ? CAD_NOTCH_COLOR : entity.reference ? "#777" : "#171717";
+    const baseColor = entity.importDamaged ? "#b00020" : entity.notch ? CAD_NOTCH_COLOR : entity.reference ? CAD_REFERENCE_COLOR : "#171717";
     const overlay = highlighted && (entity.importDamaged || entity.notch);
     context.strokeStyle = highlighted ? CAD_SELECTED_COLOR : baseColor;
     context.lineWidth = overlay ? 5 : highlighted ? 3 : preview || entity.notch || entity.importDamaged ? 2.25 : 1.5;
-    context.setLineDash(!highlighted && entity.reference ? [6, 4] : []);
+    context.setLineDash(entity.reference ? CAD_REFERENCE_DASH : []);
     context.beginPath();
     if (entity.type === "point") {
       const [x, y] = screen(entity.point);
@@ -2076,7 +2258,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     context.setLineDash([]);
   }
 
-  function drawSelectionPreview(pointTransform, ids = familyIds(selected)) {
+  function drawSelectionPreview(pointTransform, entities = Array.from(familyIds(selected), id => byId.get(id))) {
     const [minX, maxY] = world([-10, -10]);
     const [maxX, minY] = world([width + 10, height + 10]);
     const transformedCenter = pointTransform(center);
@@ -2091,9 +2273,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const project = point => screen(pointTransform(point));
     context.save();
     context.lineJoin = "round";
-    for (const id of ids) {
-      const entity = byId.get(id);
-      if (!entity) continue;
+    for (const entity of entities) {
+      if (!canvasShows(entity)) continue;
       const cached = geometry(entity);
       const [left, bottom, right, top] = cached.bounds;
       const margin = entity.type === "spline" ? SPLINE_TOLERANCE_MM : 0;
@@ -2113,7 +2294,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         context.lineTo(x, y + 5);
         context.stroke();
       } else {
-        context.setLineDash(entity.reference ? [6, 4] : []);
+        context.setLineDash(entity.reference ? CAD_REFERENCE_DASH : []);
         context.beginPath();
         const path = viewportPath(entity, cached);
         const extent = nativePathExtent(entity, path) * Math.max(1, stretch) + Math.max(Math.abs(offsetX), Math.abs(offsetY));
@@ -2155,6 +2336,33 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     context.fillStyle = color;
     context.textBaseline = "middle";
     context.fillText(text, x + 6, y + 10.5);
+    context.restore();
+  }
+
+  function drawCopyBadge([pointerX, pointerY]) {
+    const radius = 11;
+    const inset = radius + 4;
+    const x = Math.max(inset, pointerX - 25);
+    const verticalOffset = pointerX - x < 18 && pointerY + 25 <= height - inset ? 25 : -18;
+    const y = Math.max(inset, Math.min(height - inset, pointerY + verticalOffset));
+    context.save();
+    context.setLineDash([]);
+    context.beginPath();
+    context.arc(x, y, radius, 0, 2 * Math.PI);
+    context.fillStyle = "#1857d6";
+    context.fill();
+    context.strokeStyle = "#fff";
+    context.lineWidth = 2;
+    context.stroke();
+
+    context.beginPath();
+    context.moveTo(x - 5, y);
+    context.lineTo(x + 5, y);
+    context.moveTo(x, y - 5);
+    context.lineTo(x, y + 5);
+    context.lineWidth = 3;
+    context.lineCap = "round";
+    context.stroke();
     context.restore();
   }
 
@@ -2225,6 +2433,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
   }
 
+  function styleDrawingPreview() {
+    context.strokeStyle = drawingReference ? CAD_REFERENCE_COLOR : "#171717";
+    context.setLineDash(drawingReference ? CAD_REFERENCE_DASH : []);
+  }
+
   function drawArcPreview(point) {
     const [start, end] = pending;
     if (!start || (!end && !point)) return;
@@ -2252,7 +2465,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       pathLine([sub(middle, extent), add(middle, extent)]);
       const arc = point && creation([start, end, point]);
       if (arc) {
-        context.setLineDash([]);
+        styleDrawingPreview();
         context.lineWidth = 2.5;
         context.beginPath();
         traceEntityPath(arc);
@@ -2275,7 +2488,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const isSelected = entity => selected.has(entity.id) || (groupAt(entity) && selected.has(entity.parentId));
     const hoveredGroup = hover && groupAt(hover);
     for (const entity of shown) {
-      if (scalePreview && scaleIds.has(entity.id)) continue;
+      if (!canvasShows(entity) || scalePreview && scaleIds.has(entity.id)) continue;
       if (!offsetPreview && !notchPreview && isSelected(entity)) continue;
       if (!inActiveGroup(entity)) context.globalAlpha = .25;
       drawEntity(entity, offsetResult?.ids.has(entity.parentId || entity.id), Boolean(hover?.id === entity.id || hoveredGroup && inActiveGroup(entity) && groupAt(entity) === hoveredGroup
@@ -2283,19 +2496,20 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       context.globalAlpha = 1;
     }
     for (const entity of shown) {
-      if (offsetPreview || notchPreview) continue;
+      if (!canvasShows(entity) || offsetPreview || notchPreview) continue;
       if (isSelected(entity) && !scalePreview) drawEntity(entity, true);
       const edges = selectedEdges.get(entity.id);
       if (edges) {
         context.strokeStyle = CAD_SELECTED_COLOR;
         context.lineWidth = entity.importDamaged ? 4.5 : 3;
-        context.setLineDash([]);
+        context.setLineDash(entity.reference ? CAD_REFERENCE_DASH : []);
         for (const index of edges) drawEdge(entity, index);
         if (entity.importDamaged) {
           context.strokeStyle = "#b00020";
           context.lineWidth = 1.5;
           for (const index of edges) drawEdge(entity, index);
         }
+        context.setLineDash([]);
       }
     }
     if (tool === "select" && !gesture && !offsetPreview && !notchPreview && !selectedEdges.size) {
@@ -2330,9 +2544,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     else if (pending.length && previewPoint && DRAW[tool]) {
       const points = [...pending, previewPoint];
       const provisional = creation(points, false, true);
-      context.strokeStyle = "#555";
+      styleDrawingPreview();
       context.lineWidth = 1.5;
-      context.setLineDash([5, 4]);
       if (provisional) {
         context.beginPath();
         traceEntityPath(provisional, samples(provisional));
@@ -2343,14 +2556,21 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       drawRotationPreview(cursor);
     } else if (tool === "mirror") {
       drawMirrorPreview(cursor);
-    } else if (pending.length && previewPoint && (tool === "move" || tool === "copy")) {
+    } else if (pending.length && previewPoint && tool === "move") {
       drawPlacementPreview(pending[0], previewPoint);
     }
+    if (pastePlacement && cursor) {
+      const delta = sub(cursor, pastePlacement.anchor);
+      drawSelectionPreview(point => add(point, delta), pastePlacement.entities);
+    }
+    if (pastePlacement) drawTransformLabel(previewPoint || pending.at(-1) || center, "+");
     if (tool === "scale" && scaleBox) drawScaleFrame(scalePreview);
     else if (canvas.dataset.scaleAxis) delete canvas.dataset.scaleAxis;
-    if (tool === "measure" && (measurements.length || pending.length && previewPoint)) {
-      drawMeasurements(pending.length && previewPoint ? [pending[0], previewPoint] : null);
-    }
+    const measurementPreview = tool === "measure" && pending.length && previewPoint
+      ? { points: [pending[0], previewPoint] }
+      : tool === "measure-radius" && cursor ? radiusMeasurementAt(cursor) : null;
+    if (canvasFilter === "all" || tool === "measure" || tool === "measure-radius") drawMeasurements(measurementPreview);
+    else measurementLabels = [];
     if (pending.length && DRAW[tool]) {
       context.fillStyle = "#171717";
       for (const p of pending) {
@@ -2462,6 +2682,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       context.lineWidth = 2;
       context.stroke();
     }
+    if (copyMode && lastPointer) drawCopyBadge(lastPointer.at);
     const gridLabel = `${fields.grid.checked ? "Привязка к сетке" : "Сетка"} ${formatLength(gridStep())}`;
     if (views.scale.textContent !== gridLabel) views.scale.textContent = gridLabel;
   }
@@ -2494,28 +2715,34 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     context.fillText(label, left + 6, top + 14);
   }
 
+  function measurementText(measurement) {
+    return measurement.radius == null ? formatLength(distance(...measurement.points)) : `R ${formatLength(measurement.radius)}`;
+  }
+
   function drawMeasurements(preview) {
     const lines = preview ? [...measurements, preview] : measurements;
     const labelRows = [];
     context.font = "500 14px Inter, Segoe UI, sans-serif";
-    for (const line of lines) {
-      const provisional = line === preview;
-      const [start, end] = line.map(screen);
+    for (const measurement of lines) {
+      const provisional = measurement === preview;
+      const [start, end] = measurement.points.map(screen);
       if (Math.min(start[0], end[0]) > width || Math.min(start[1], end[1]) > height
           || Math.max(start[0], end[0]) < 0 || Math.max(start[1], end[1]) < 0) continue;
-      context.strokeStyle = provisional ? "#555" : "#171717";
-      context.lineWidth = 1.5;
+      const highlighted = measurement === selectedMeasurement;
+      const color = highlighted ? CAD_SELECTED_COLOR : provisional ? "#555" : "#171717";
+      context.strokeStyle = color;
+      context.lineWidth = highlighted ? 2.5 : 1.5;
       context.setLineDash(provisional ? [3, 4] : [6, 4]);
-      pathLine(line);
+      pathLine(measurement.points);
       context.setLineDash([]);
-      context.fillStyle = context.strokeStyle;
+      context.fillStyle = color;
       for (const [x, y] of [start, end]) {
         context.beginPath();
         context.arc(x, y, 2.5, 0, Math.PI * 2);
         context.fill();
       }
       const [middleX, middleY] = mix(start, end, .5);
-      const label = formatLength(distance(...line));
+      const label = measurementText(measurement);
       const length = context.measureText(label).width + 12;
       const x = Math.max(3, Math.min(width - length - 3, middleX - length / 2));
       const initialY = Math.max(3, Math.min(height - 23, middleY - 27));
@@ -2527,14 +2754,46 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         y = available;
         break;
       }
-      labelRows.push({ x, y, length, label });
+      labelRows.push({ x, y, length, label, color, measurement });
     }
-    for (const { x, y, length, label } of labelRows) {
+    for (const { x, y, length, label, color } of labelRows) {
       context.fillStyle = "#fff";
       context.fillRect(x, y, length, 20);
-      context.fillStyle = "#171717";
+      context.fillStyle = color;
       context.fillText(label, x + 6, y + 15);
     }
+    measurementLabels = labelRows.filter(row => row.measurement !== preview);
+  }
+
+  function measurementAt(point) {
+    if (canvasFilter !== "all") return null;
+    for (let index = measurementLabels.length - 1; index >= 0; index--) {
+      const { x, y, length, measurement } = measurementLabels[index];
+      if (within(point, [x, y, x + length, y + 20])) return measurement;
+    }
+    let nearest = null;
+    let tolerance = 6;
+    for (const measurement of measurements) {
+      const gap = distance(point, projectToSegment(point, ...measurement.points.map(screen)));
+      if (gap > tolerance) continue;
+      nearest = measurement;
+      tolerance = gap;
+    }
+    return nearest;
+  }
+
+  function eraseMeasurements(points) {
+    const stroke = points.map(screen);
+    const erased = new Set(stroke.map(measurementAt).filter(Boolean));
+    if (stroke.length > 1) {
+      for (const measurement of measurements) {
+        const [a, b] = measurement.points.map(screen);
+        if (stroke.some((point, index) => index && intersection(stroke[index - 1], point, a, b))) erased.add(measurement);
+      }
+    }
+    if (!erased.size) return false;
+    changeMeasurements(measurements.filter(measurement => !erased.has(measurement)));
+    return true;
   }
 
   function drawEdge(entity, index) {
@@ -2611,13 +2870,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       .reduce((first, second) => first.miss <= second.miss ? first : second);
   }
 
-  function closestPolylineEdge(entity, point, maximum, straightOnly = false) {
+  function closestPolylineEdge(entity, point, maximum, edgeKind) {
     let found = null;
     let miss = maximum;
     const count = entity.points.length - Number(!entity.closed);
     for (let index = 0; index < count; index++) {
       const { start, end, arc } = polylineEdge(entity, index);
-      if (straightOnly && (arc || distance(start, end) <= EPSILON)) continue;
+      if (edgeKind === "straight" && (arc || distance(start, end) <= EPSILON) || edgeKind === "arc" && !arc) continue;
       const nearest = arc ? closestOnArc(point, arc) : projectToSegment(point, start, end);
       const gap = distance(point, nearest);
       if (gap <= miss && (!found || gap < miss)) {
@@ -2628,11 +2887,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     return found;
   }
 
-  function hit(point, accepted = () => true, tolerance = 8 / scale, preferNotch = true, straightOnly = false) {
+  function hit(point, accepted = () => true, tolerance = 8 / scale, preferNotch = true, edgeKind = null) {
     let miss = tolerance;
     let found = null;
     for (const entity of current.entities) {
-      if (!accepted(entity)) continue;
+      if (!canvasShows(entity) || !accepted(entity)) continue;
       const cached = geometry(entity);
       const { path, bounds } = cached;
       const [x, y] = point;
@@ -2648,7 +2907,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         const nearest = closestOnArc(point, entity);
         candidate = { miss: distance(point, nearest), point: nearest };
       } else if (entity.type === "polyline") {
-        candidate = closestPolylineEdge(entity, point, miss, straightOnly);
+        candidate = closestPolylineEdge(entity, point, miss, edgeKind);
       } else if (entity.type === "ellipse") {
         candidate = closestOnEllipse(point, entity, path);
       } else {
@@ -2660,6 +2919,15 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       }
     }
     return found;
+  }
+
+  function radiusMeasurementAt(point) {
+    const contact = hit(point, entity => inActiveGroup(entity) && !entity.notch
+      && (entity.type === "circle" || entity.type === "arc" || entity.type === "polyline" && entity.bulges?.some(Boolean)),
+    8 / scale, false, "arc");
+    if (!contact) return null;
+    const arc = contact.entity.type === "polyline" ? polylineEdge(contact.entity, contact.edge).arc : contact.entity;
+    return { points: [arc.center, contact.point], radius: arc.radius };
   }
 
   function pickAt(point) {
@@ -2690,7 +2958,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     Math.min(CAD_POINT_EPSILON, .25 / scale), false)) {
     const options = [axisGuide(origin, 0), axisGuide(origin, 1)];
     const contacts = contact ? [contact] : [];
-    if (contact?.entity.type === "polyline" && contact.edge != null) {
+    if (contact?.entity.type === "polyline" && contact.edge != null && !isUnifiedContour(contact.entity)) {
       const { entity, edge: index, point } = contact;
       const { start, end } = polylineEdge(entity, index);
       const count = entity.points.length - Number(!entity.closed);
@@ -2792,7 +3060,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         }
       };
       for (const entity of current.entities) {
-        if (entity.id === ignoredId) continue;
+        if (!canvasShows(entity) || entity.id === ignoredId) continue;
         const source = geometry(entity);
         if (entity.type === "spline") {
           const [left, bottom, right, top] = source.bounds;
@@ -2828,7 +3096,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     if (anchor && fields.perpendicular.checked) {
       for (const entity of current.entities) {
-        if (entity.id === ignoredId || entity.notch) continue;
+        if (!canvasShows(entity) || entity.id === ignoredId || entity.notch) continue;
         const points = entity.type === "line" ? [entity.start, entity.end] : entity.type === "polyline" ? entity.points : null;
         if (!points) continue;
         for (let index = 0; index < points.length - Number(!entity.closed); index++) {
@@ -2944,7 +3212,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   function toolPosition(raw, bypass, shift) {
     if (tool === "mirror" && mirrorMode === "edge") {
       clearSnapGuides();
-      const contact = hit(raw, entity => !entity.notch && (entity.type === "line" || entity.type === "polyline"), 10 / scale, false, true);
+      const contact = hit(raw, entity => !entity.notch && (entity.type === "line" || entity.type === "polyline"), 10 / scale, false, "straight");
       mirrorEdge = contactEdge(contact);
       return raw;
     }
@@ -3129,7 +3397,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function creation(points, closed, provisional = false) {
     const [start, middle, end] = points;
-    const common = { type: tool, layer: "0" };
+    const common = { type: tool, layer: "0", ...(drawingReference ? { reference: true } : {}) };
     const polygon = corners => ({ ...common, type: "polyline", points: corners, closed: true });
     switch (tool) {
       case "point": return start && { ...common, point: start, reference: true };
@@ -3142,6 +3410,12 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         const { middle: chordMiddle, normal } = arcFrame(start, middle);
         const arc = arcFromBulge(start, middle, dot(sub(end, chordMiddle), normal));
         return arc && { ...common, ...arc };
+      }
+      case "arc-three": {
+        if (!end || distance(start, end) <= CAD_POINT_EPSILON) return null;
+        const arc = arcThrough(start, middle, end);
+        if (!arc || arc.radius > MAX_COORDINATE || arc.center.some(value => Math.abs(value) > MAX_COORDINATE)) return null;
+        return { ...common, ...arc, type: "arc" };
       }
       case "rectangle":
       case "square": {
@@ -3195,7 +3469,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   function build(points, closed = false) {
     const entity = creation(points, closed);
     if (!entity) {
-      log(({ arc: "Задайте изгиб дуги на расстоянии от хорды.", triangle: "Вершины треугольника должны лежать вне одной прямой.",
+      log(({ arc: "Задайте изгиб дуги на расстоянии от хорды.", "arc-three": "Укажите три разные точки вне одной прямой.",
+        triangle: "Вершины треугольника должны лежать вне одной прямой.",
         polygon: "Укажите разные точки и целое число сторон от 3 до 100.", ellipse: "Укажите две ненулевые полуоси эллипса.",
       })[tool] || "Укажите разные точки.", true);
       return;
@@ -3225,8 +3500,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function applyRotation(degrees) {
-    if (degrees % 360 === 0) choose("select");
-    else applySelectionTransform(angleTransform(pending[0], degrees % 360));
+    const sweep = degrees % 360;
+    const [pivot] = pending;
+    if (!sweep) choose("select");
+    else if (copyMode) startTransformCopy(factor => angleTransform(pivot, sweep * factor));
+    else applySelectionTransform(angleTransform(pivot, sweep));
   }
 
   function advanceRotation(point, event) {
@@ -3351,6 +3629,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       log("Координаты должны быть в пределах ±1 000 000 000 мм.", true);
       return;
     }
+    if (pastePlacement) {
+      pasteAt(point);
+      return;
+    }
     if (tool === "rotate") {
       advanceRotation(point, event);
       return;
@@ -3369,16 +3651,25 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     resetDirectDistance();
     cursor = null;
+    if (tool === "measure-radius") {
+      const measurement = radiusMeasurementAt(point);
+      if (measurement) changeMeasurements([...measurements, measurement]);
+      else log("Щёлкните по дуге или окружности.", true);
+      return;
+    }
     if (tool === "measure") {
       if (pending.length) {
         if (distance(pending[0], point) <= CAD_POINT_EPSILON) {
           log("Укажите две разные точки.", true);
           return;
         }
-        measurements.push([pending[0], point]);
+        const measurement = { points: [pending[0], point] };
         pending = [];
-      } else pending = [point];
-      update();
+        changeMeasurements([...measurements, measurement]);
+      } else {
+        pending = [point];
+        update();
+      }
       return;
     }
     if (tool in DRAW) {
@@ -3447,8 +3738,11 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       return;
     }
     const pointTransform = placementTransform(pending[0], point);
-    if (pointTransform) applySelectionTransform(pointTransform);
-    else log("Точки должны различаться.", true);
+    if (!pointTransform) log("Точки должны различаться.", true);
+    else if (copyMode) {
+      const delta = sub(point, pending[0]);
+      startTransformCopy(factor => position => add(position, mul(delta, factor)));
+    } else applySelectionTransform(pointTransform);
   }
 
   function advanceArc(point, bypass) {
@@ -3496,36 +3790,142 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function applySelectionTransform(pointTransform) {
     const ids = familyIds(selected);
-    const newIds = tool === "copy" ? new Map(Array.from(ids, id => [id, newId()])) : null;
-    const copiedGroups = new Map();
-    const changed = Array.from(ids, id => {
-      const entity = byId.get(id);
+    const entities = current.entities.map(entity => {
+      if (!ids.has(entity.id)) return entity;
       const result = transform(entity, pointTransform, tool === "mirror");
-      if (newIds) {
-        result.id = newIds.get(id);
-        if (result.groupPath) result.groupPath = result.groupPath.map((group, index) => {
-          if (index < activeGroup.length) return group;
-          if (!copiedGroups.has(group)) copiedGroups.set(group, newId());
-          return copiedGroups.get(group);
-        });
-        if (result.parentId && newIds.has(result.parentId)) result.parentId = newIds.get(result.parentId);
-        else if (result.parentId) {
-          delete result.parentId;
-          if (activeGroup.length) result.groupPath = activeGroup;
-        }
-      } else if (result.parentId && !ids.has(result.parentId)) {
+      if (result.parentId && !ids.has(result.parentId)) {
         delete result.parentId;
         if (activeGroup.length) result.groupPath = activeGroup;
       }
       return result;
     });
-    const changedById = new Map(changed.map(entity => [entity.id, entity]));
-    const entities = newIds
-      ? [...current.entities, ...changed]
-      : current.entities.map(entity => changedById.get(entity.id) || entity);
-    const selection = newIds ? Array.from(selected, id => newIds.get(id)) : selected;
     choose("select");
-    commit(entities, { ids: selection });
+    commit(entities);
+  }
+
+  function copySource(ids) {
+    return { ids: new Set(ids), depth: activeGroup.length,
+      entities: Array.from(familyIds(ids), id => byId.get(id)) };
+  }
+
+  function storedPointCount(entities) {
+    return entities.reduce((count, entity) => count + (entity.points?.length ?? entity.fitPoints?.length
+      ?? entity.controlPoints?.length ?? (entity.type === "line" ? 2 : 1)), 0);
+  }
+
+  function buildCopies(source, count, transformAt, baseEntities = current.entities) {
+    if (!source.entities.length) return null;
+    if (baseEntities.length + count * source.entities.length > MAX_CAD_ENTITIES
+        || storedPointCount(baseEntities) + count * storedPointCount(source.entities) > MAX_CAD_POINTS) {
+      log("Столько копий не помещается в чертёж. Уменьшите количество.", true);
+      return null;
+    }
+    const entities = [];
+    const ids = [];
+    for (let index = 1; index <= count; index++) {
+      const pointTransform = transformAt(index);
+      const newIds = new Map(source.entities.map(entity => [entity.id, newId()]));
+      const groups = new Map();
+      for (const entity of source.entities) {
+        const result = transform(entity, pointTransform, false);
+        result.id = newIds.get(entity.id);
+        delete result.groupPath;
+        const parent = newIds.get(entity.parentId);
+        if (parent) result.parentId = parent;
+        else {
+          delete result.parentId;
+          const descendants = (entity.groupPath || []).slice(source.depth).map(group => {
+            if (!groups.has(group)) groups.set(group, newId());
+            return groups.get(group);
+          });
+          const groupPath = [...activeGroup, ...descendants];
+          if (groupPath.length > MAX_GROUP_DEPTH) {
+            log("Слишком много вложенных групп для вставки сюда.", true);
+            return null;
+          }
+          if (groupPath.length) result.groupPath = groupPath;
+        }
+        if (controls(result).some(point => point.some(value => !Number.isFinite(value) || Math.abs(value) > MAX_COORDINATE))) {
+          log("Часть копий выходит за пределы допустимых координат.", true);
+          return null;
+        }
+        entities.push(result);
+        if (source.ids.has(entity.id)) ids.push(result.id);
+      }
+    }
+    return { entities, ids };
+  }
+
+  function copyClipboard() {
+    if (running || gesture || offsetPreview || notchPreview) return false;
+    const source = copySource(new Set([...selected, ...selectedEdges.keys()]));
+    const bounds = selectionBounds(source.entities);
+    if (!bounds) return false;
+    cadClipboard = { ...source, entities: structuredClone(source.entities), anchor: bounds.slice(0, 2) };
+    log("Выделение скопировано.");
+    return true;
+  }
+
+  function beginPaste() {
+    if (!cadClipboard || running || gesture || offsetPreview || notchPreview) return false;
+    const target = cursor || center;
+    choose("paste");
+    pastePlacement = cadClipboard;
+    cursor = target;
+    update();
+    return true;
+  }
+
+  function pasteAt(target) {
+    const delta = sub(target, pastePlacement.anchor);
+    const copies = buildCopies(pastePlacement, 1, () => point => add(point, delta));
+    if (!copies) return;
+    choose("select");
+    commit([...current.entities, ...copies.entities], { ids: copies.ids });
+  }
+
+  function startTransformCopy(transformAt) {
+    const source = copySource(selected);
+    const base = current;
+    const copies = buildCopies(source, 1, transformAt);
+    if (!copies) return;
+    choose("select");
+    commit([...base.entities, ...copies.entities], { ids: copies.ids });
+    copyArray = { source, base, transformAt };
+    update();
+  }
+
+  function handleCopyArrayInput(event, key) {
+    if (!copyArray || running || event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return false;
+    const input = event.code === "KeyX" || key === "х" ? "x" : key;
+    if (/^[0-9x*/]$/.test(input)) {
+      if (arrayInput.length < 8) arrayInput += input;
+      log();
+    } else if (key === "backspace" && arrayInput) {
+      arrayInput = arrayInput.slice(0, -1);
+    } else if (key === "escape") {
+      copyArray = null;
+      arrayInput = "";
+      log();
+    } else if (key === "enter" && arrayInput) {
+      if (event.repeat) return true;
+      const command = /^([x*/])(\d+)$|^(\d+)([x*/])$/.exec(arrayInput);
+      const count = command ? Number(command[2] || command[3]) : 0;
+      if (count < 1 || count > MAX_ARRAY_COPIES) {
+        log(`Введите xN или /N, где N от 1 до ${MAX_ARRAY_COPIES}.`, true);
+      } else {
+        const { source, base, transformAt } = copyArray;
+        const divide = (command[1] || command[4]) === "/";
+        const copies = buildCopies(source, count, index => transformAt(divide ? index / count : index), base.entities);
+        if (copies) {
+          commit([...base.entities, ...copies.entities], { amend: true, ids: copies.ids, warnings: base.warnings });
+          copyArray = { source, base, transformAt };
+          log(`Создано копий: ${count}.`);
+        }
+      }
+    } else return false;
+    update();
+    return true;
   }
 
   async function perform(task) {
@@ -3543,7 +3943,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
   }
 
-  function editOnServer(operation, options) {
+  function editOnServer(operation, options, extendSelection = false) {
     return perform(async () => {
       const result = await request("/api/cad/edit", {
         method: "POST",
@@ -3553,8 +3953,49 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       });
       if (lifecycle.signal.aborted) return;
       const { entities, warnings = [], selectedIds = [], changed, diagnostics = [], diagnosticIds } = result;
-      if (operation === "notch-series") {
+      if (operation === "split-intersections") {
+        if (options.removeIds || options.removeSpan) {
+          if (changed) {
+            choose(tool === "erase" ? "erase" : "select");
+            commit(entities, { ids: [] });
+          }
+          return;
+        }
+        const id = selectedIds[0];
+        const edge = result.selectedEdgeIndex ?? undefined;
+        if (changed) {
+          const source = byId.get(options.id);
+          const picked = entities.find(entity => entity.id === id);
+          const edges = selectedEdges.get(source.id);
+          if (extendSelection && edges && picked?.type === "polyline") {
+            const extra = picked.points.length - source.points.length;
+            const shifted = new Set();
+            for (const index of edges) {
+              if (index === options.edgeIndex) {
+                for (let i = index; i <= index + extra; i++) shifted.add(i);
+              } else shifted.add(index > options.edgeIndex ? index + extra : index);
+            }
+            selectedEdges.set(source.id, shifted);
+          }
+          commit(entities);
+        }
+        const entity = byId.get(id);
+        if (entity) selectHit({ entity, edge }, extendSelection, true);
+      } else if (operation === "notch-series") {
         notchPreview = { entities, ids: selectedIds, warnings };
+      } else if (["join-outline", "split-outline", "notch-convert", "fillet"].includes(operation)) {
+        if (changed) commit(entities, { ids: selectedIds });
+        const message = {
+          "join-outline": "Сегменты соединены в одну траекторию.",
+          "split-outline": "Траектория разделена на сегменты.",
+          "notch-convert": `Преобразовано линий в надсечки: ${selectedIds.length}.`,
+          fillet: "Угол скруглён.",
+        }[operation];
+        log([message, ...warnings].join(" "));
+      } else if (operation === "notch-depth-all") {
+        if (changed) commit(entities);
+        const message = changed ? "Глубина всех надсечек изменена." : "У всех надсечек уже задана эта глубина.";
+        log([message, ...warnings].join(" "));
       } else if (operation === "trim-quick") {
         if (changed) commit(entities, { warnings: [...current.warnings, ...warnings], ids: [] });
         else if (warnings.length) log(warnings[0]?.message || String(warnings[0]));
@@ -3794,11 +4235,27 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function removeSelected() {
     if (running || gesture || offsetPreview || notchPreview) return;
+    if (selectedMeasurement) {
+      changeMeasurements(measurements.filter(measurement => measurement !== selectedMeasurement));
+      return;
+    }
     const ids = familyIds(selected);
     if (!ids.size) {
+      if (selectedEdges.size === 1) {
+        const [[id, edges]] = selectedEdges;
+        const [edgeIndex] = edges;
+        if (edges.size === 1 && straightEditableSpan(byId.get(id), edgeIndex)) {
+          void editOnServer("split-intersections", { id, edgeIndex, removeSpan: true });
+          return;
+        }
+      }
       if (selectedEdges.size) {
         log("Выбрано ребро. Для правки стыка откройте «Восстановить деталь». Чтобы удалить весь контур, выделите его двойным щелчком.");
       }
+      return;
+    }
+    if (current.entities.some(entity => ids.has(entity.id) && !entity.notch && ["line", "polyline"].includes(entity.type))) {
+      void editOnServer("split-intersections", { removeIds: [...ids] });
       return;
     }
     choose(tool === "erase" ? "erase" : "select");
@@ -3826,6 +4283,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   function onPointerDown(event) {
     if (!event.isPrimary && event.pointerType !== "mouse") return;
     if (gesture || ![0, 1, 2].includes(event.button)) return;
+    if (event.button === 0 && copyArray) {
+      copyArray = null;
+      arrayInput = "";
+    }
     flushPointerMove();
     canvas.focus({ preventScroll: true });
     const start = screenEvent(event);
@@ -3849,7 +4310,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         gesture = { type: "scale", start, pointerId: event.pointerId };
         update();
       } else if (tool !== "select" && tool !== "erase") {
-        const pickedPoint = tool.startsWith("notch") ? point : toolPosition(point, event.altKey, event.shiftKey);
+        const pickedPoint = tool.startsWith("notch") || tool === "measure-radius"
+          ? point : toolPosition(point, event.altKey, event.shiftKey);
         if (tool === "rectangle" && pending.length && rectangleEditing) {
           cursor = pickedPoint;
           updateDistanceDirection(point, event.shiftKey);
@@ -3873,7 +4335,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         draw();
       } else {
         const selection = gripOwner();
-        const grip = selection && Array.from(selectedGrips(selection)).find(([, p]) => distance(screen(p), start) <= 7);
+        const grip = selection && !(tool === "select" && measurementAt(start))
+          && Array.from(selectedGrips(selection)).find(([, p]) => distance(screen(p), start) <= 7);
         if (!event.shiftKey && !event.altKey && grip) {
           gesture = { type: "grip", id: selection.id, index: grip[0], start, pointerId: event.pointerId };
         } else {
@@ -3950,7 +4413,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     hover = !gesture && !offsetPreview && !notchPreview && picking ? pickAt(location)?.entity : null;
     if (gesture?.type === "scale" && gesture.parameters) {
       cursor = snap || location;
-    } else if ((picking || tool === "erase" || tool === "scale") && gesture?.type !== "grip") {
+    } else if ((picking || tool === "erase" || tool === "scale" || tool === "measure-radius") && gesture?.type !== "grip") {
       cursor = location;
       clearSnapGuides();
     } else if (gesture?.type !== "grip") cursor = toolPosition(location, event.altKey, event.shiftKey);
@@ -3993,8 +4456,39 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
   }
 
-  function selectHit(item, shift, segment) {
+  function straightEditableSpan(entity, edge) {
+    if (!entity || entity.notch || !editableInGroup(entity)) return null;
+    if (entity.type === "line") return { a: entity.start, b: entity.end };
+    if (entity.type !== "polyline" || edge == null || isUnifiedContour(entity)) return null;
+    const { start, end, arc } = polylineEdge(entity, edge);
+    return arc ? null : { a: start, b: end };
+  }
+
+  function selectCrossedSpan(item, shift) {
+    const span = straightEditableSpan(item?.entity, item?.edge);
+    if (!span) return false;
+    const { entity, edge, point } = item;
+    const box = geometryBounds([span.a, span.b]);
+    const crossed = current.entities.some(other => {
+      if (other.id === entity.id || other.notch || !editableInGroup(other)
+          || Boolean(other.reference) !== Boolean(entity.reference)
+          || !["line", "polyline", "arc", "circle"].includes(other.type)) return false;
+      const cached = geometry(other);
+      if (!boundsOverlap(cached.bounds, box)) return false;
+      cached.crossings ??= crossingSpans(other, cached.path, cached.bounds);
+      return cached.crossings.some(cutter => boundsOverlap(cutter.bounds, box) && snapCrossings(span, cutter)
+        .some(crossing => Math.min(distance(span.a, crossing), distance(span.b, crossing)) > CAD_POINT_EPSILON));
+    });
+    if (crossed) {
+      void editOnServer("split-intersections", { id: entity.id, edgeIndex: edge, point }, shift);
+    }
+    return crossed;
+  }
+
+  function selectHit(item, shift, pickSegment) {
+    selectedMeasurement = null;
     const id = item?.entity.id;
+    const segment = pickSegment && !isUnifiedContour(item?.entity);
     const group = item && groupAt(item.entity);
     const wasWhole = selected.has(id);
     const edges = selectedEdges.get(id);
@@ -4038,7 +4532,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const buckets = new Map();
     const ends = new Map();
     for (const entity of current.entities) {
-      if (!editableInGroup(entity) || entity.notch || Boolean(entity.reference) !== Boolean(seed.reference)
+      if (!canvasShows(entity) || !editableInGroup(entity) || entity.notch || Boolean(entity.reference) !== Boolean(seed.reference)
           || (entity.layer || "") !== (seed.layer || "")) continue;
       const pair = endpoints(entity);
       if (!pair) continue;
@@ -4117,12 +4611,14 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       }
     }
     if (!actions.join.hidden) groupCommands.push(menuControl(actions.join, "join"));
-    if (!actions["close-outline"].disabled) groupCommands.push(menuControl(actions["close-outline"], "close-outline"));
+    const connect = actions["close-outline"];
+    if (!connect.disabled) groupCommands.push(menuControl(connect, connect.dataset.icon));
+    if (!actions.fillet.disabled) groupCommands.push(menuControl(actions.fillet, "fillet"));
     if (!actions.ungroup.hidden) groupCommands.push(menuControl(actions.ungroup, "ungroup"));
     const pointCommands = [];
     if (editableInGroup(entity) && !entity.notch && ["line", "polyline", "spline"].includes(entity.type)) {
-      const target = { id: entity.id, point, ...(entity.type === "polyline" ? { edge } : {}) };
-      if (edge != null && !selectedEdges.get(entity.id)?.has(edge)) {
+      const canEditSegments = !isUnifiedContour(entity);
+      if (canEditSegments && edge != null && !selectedEdges.get(entity.id)?.has(edge)) {
         pointCommands.push({ label: "Выбрать сегмент", icon: "select", run: () => {
           selectHit(item, false, true);
           update();
@@ -4131,14 +4627,17 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       if (simplifiable(entity)) {
         pointCommands.push({ label: "Упростить контур", icon: "polyline", run: () => editOnServer("simplify", { ids: [entity.id] }) });
       }
-      pointCommands.push({ label: "Добавить точку", icon: "point", run: () => editOnServer("insert-points", target) });
-      pointCommands.push({ label: entity.type === "polyline" ? "Разбить сегмент…" : "Добавить несколько точек", icon: "polyline", run: () => {
-        insertPointsTarget = target;
-        fields.option.value = "3";
-        openParameters();
-      } });
+      if (canEditSegments) {
+        const target = { id: entity.id, point, ...(entity.type === "polyline" ? { edge } : {}) };
+        pointCommands.push({ label: "Добавить точку", icon: "point", run: () => editOnServer("insert-points", target) });
+        pointCommands.push({ label: entity.type === "polyline" ? "Разбить сегмент…" : "Добавить несколько точек", icon: "polyline", run: () => {
+          insertPointsTarget = target;
+          fields.option.value = "3";
+          openParameters();
+        } });
+      }
     }
-    return [groupCommands, pointCommands, [menuControl(buttons.move, "move"), menuControl(buttons.copy, "copy")]];
+    return [groupCommands, pointCommands, [menuControl(buttons.move, "move")]];
   }
 
   function drawingMenu() {
@@ -4213,7 +4712,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     if (!cancelled && completed.type === "erase") {
       addErasePoint(completed.points, world(end));
-      void editOnServer("trim-quick", { stroke: completed.points, tolerance: 8 / scale, groupPath: activeGroup });
+      if (canvasFilter === "all" && measurements.length && eraseMeasurements(completed.points)) return;
+      void editOnServer("trim-quick", {
+        stroke: completed.points, tolerance: 8 / scale, groupPath: activeGroup, preserveIntersections: true, canvasFilter,
+      });
       return;
     }
     if (!cancelled && completed.type === "grip" && dragged && completed.entities) {
@@ -4221,6 +4723,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       return;
     }
     if (!cancelled && completed.type === "marquee") {
+      selectedMeasurement = !dragged && tool === "select" ? measurementAt(end) : null;
+      if (selectedMeasurement) {
+        selected.clear();
+        selectedEdges.clear();
+        update();
+        return;
+      }
       if (dragged) {
         if (!completed.shift) {
           selected.clear();
@@ -4228,16 +4737,33 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
         }
         const box = geometryBounds([world(completed.start), world(end)]);
         const crossing = end[0] < completed.start[0];
+        const sides = crossing ? marqueeSides(box) : null;
         const groups = new Map();
         const include = id => { selectedEdges.delete(id); selected.add(id); };
         for (const entity of current.entities) {
-          if (!inActiveGroup(entity)) continue;
+          if (!canvasShows(entity) || !inActiveGroup(entity)) continue;
           const group = groupAt(entity);
-          const matches = enclosed(geometry(entity).path, box, crossing);
+          const cached = geometry(entity);
+          if (tool === "select" && !group && entity.type === "polyline" && !entity.notch && !isUnifiedContour(entity)) {
+            if (selected.has(entity.id) || !boundsOverlap(cached.bounds, box)) continue;
+            if (boundsInside(cached.bounds, box)) {
+              include(entity.id);
+              continue;
+            }
+            cached.crossings ??= crossingSpans(entity, cached.path, cached.bounds);
+            const edges = selectedEdges.get(entity.id) ?? new Set();
+            for (const [index, edge] of cached.crossings.entries()) {
+              if (edgeInMarquee(edge, box, sides)) edges.add(index);
+            }
+            if (edges.size === cached.crossings.length) include(entity.id);
+            else if (edges.size) selectedEdges.set(entity.id, edges);
+            continue;
+          }
+          const matches = enclosed(cached.path, box, sides);
           if (group) {
             if (!groups.has(group)) groups.set(group, { ids: [], matches: [] });
             const entry = groups.get(group);
-            if (!entity.parentId) entry.ids.push(entity.id);
+            if (!entity.parentId || canvasFilter === "notches") entry.ids.push(entity.id);
             entry.matches.push(matches);
           } else if (matches) include(entity.id);
         }
@@ -4245,7 +4771,9 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
           if (crossing ? matches.some(Boolean) : matches.every(Boolean)) ids.forEach(include);
         }
       } else {
-        selectHit(hit(world(end), inActiveGroup), completed.shift, event.altKey);
+        const item = hit(world(end), inActiveGroup);
+        if (tool === "select" && selectCrossedSpan(item, completed.shift)) return;
+        selectHit(item, completed.shift, event.altKey);
       }
     }
     update();
@@ -4286,7 +4814,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     fit: () => fit(offsetPreview ? previewEntities() : current.entities),
     "erase-selection": removeSelected,
     "repair-part": () => editOnServer("repair-part", { ids: [...new Set([...selected, ...selectedEdges.keys()])] }),
-    "close-outline": () => editOnServer("close-outline", { ids: selectedOutlines().map(entity => entity.id) }),
+    "close-outline": () => {
+      const command = connectionCommand();
+      if (command) return editOnServer(command.operation, command.options);
+    },
+    "notch-convert": () => {
+      const ids = selectedNotchLines().map(entity => entity.id);
+      if (ids.length) return editOnServer("notch-convert", { ids });
+    },
+    "notch-depth-all": () => openParameters("notch-depth-all"),
+    fillet: () => openParameters("fillet"),
     "show-repair-location": focusRepairLocation,
     "fix-repair-location": () => {
       const location = repairLocations[repairLocationIndex];
@@ -4306,8 +4843,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     },
     simplify: () => editOnServer("simplify", { ids: [...new Set([...selected, ...selectedEdges.keys()])]
       .filter(id => simplifiable(byId.get(id))) }),
-    "remove-measurement": () => { measurements.pop(); update(); },
-    "clear-measurements": () => { measurements.length = 0; pending = []; update(); },
+    "remove-measurement": () => changeMeasurements(measurements.slice(0, -1)),
+    "clear-measurements": () => { pending = []; changeMeasurements([]); },
     "apply-notches": () => {
       if (!notchPreview) return;
       const { entities, warnings, ids } = notchPreview;
@@ -4336,8 +4873,17 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   for (const [key, button] of Object.entries(actions)) {
     if (actionHandlers[key]) button.addEventListener("click", actionHandlers[key], listener);
   }
+  for (const button of filterButtons) {
+    button.addEventListener("click", () => selectCanvasFilter(button.dataset.canvasFilter), listener);
+  }
   for (const [key, button] of Object.entries(buttons)) {
     button.addEventListener("click", () => {
+      if (key === tool && hasDrawingMode(key)) {
+        drawingReference = !drawingReference;
+        update();
+        canvas.focus({ preventScroll: true });
+        return;
+      }
       choose(key);
       if (Object.hasOwn(TOOL_PARAMETERS, key) && TOOL_PARAMETERS[key][3] !== undefined) {
         fields.option.value = TOOL_PARAMETERS[key][3];
@@ -4349,20 +4895,25 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (!toolsPanel.hidden && !toolsPanel.contains(event.target) && !actions.tools.contains(event.target)) showTools(false);
     if (!contextMenu.contains(event.target)) closeContextMenu();
   }, listener);
-  const shortcutControls = { ...buttons, ...Object.fromEntries(["import", "save", "part", "join", "close-outline", "undo", "redo", "fit", "reference"]
+  const shortcutControls = { ...buttons, ...Object.fromEntries(["import", "save", "part", "join", "close-outline", "fillet",
+    "notch-convert", "notch-depth-all", "undo", "redo", "fit", "reference"]
     .filter(key => !actions[key].hidden).map(key => [key, actions[key]])) };
-  const defaultKeys = { select: "V", line: "L", polyline: "P", circle: "C", arc: "A", spline: "S", point: "Q",
-    rectangle: "R", square: "Shift+R", triangle: "T", polygon: "G", ellipse: "O", move: "M", copy: "Shift+C",
+  const defaultKeys = { select: "V", line: "L", polyline: "P", circle: "C", arc: "A", "arc-three": "Shift+A", spline: "S", point: "Q",
+    rectangle: "R", square: "Shift+R", triangle: "T", polygon: "G", ellipse: "O", move: "M",
     rotate: "Shift+T", scale: "K", mirror: "Shift+M", notch: "N", "notch-series": "Shift+N", "notch-edit": "Alt+N",
-    join: "J", offset: "F", erase: "E", fit: "Z", measure: "D" };
+    join: "J", offset: "F", erase: "E", fit: "Z", measure: "D", "measure-radius": "Shift+D" };
   mountCadShortcuts(container, {
     signal: lifecycle.signal,
-    commands: Object.entries(shortcutControls).map(([id, control]) => ({
-      id, label: control.getAttribute("aria-label") || control.textContent.trim() || "Режущий / вспомогательный контур",
+    commands: [...Object.entries(shortcutControls).map(([id, control]) => ({
+      id, label: id === "close-outline" ? "Соединить / Разъединить"
+        : control.getAttribute("aria-label") || control.textContent.trim() || "Режущий / вспомогательный контур",
       defaultKey: defaultKeys[id],
       builtInKeys: { undo: ["Ctrl+Z"], redo: ["Ctrl+Y", "Ctrl+Shift+Z"] }[id],
-    })),
+    })), { id: "copy", label: "Копировать в буфер", builtInKeys: ["Ctrl+C"] },
+    { id: "paste", label: "Вставить из буфера", builtInKeys: ["Ctrl+V"] }],
     activate(id) {
+      if (id === "copy") return copyClipboard();
+      if (id === "paste") return beginPaste();
       const control = shortcutControls[id];
       if (control.disabled || control.hidden || offsetPreview || notchPreview || running) return false;
       control.click();
@@ -4388,9 +4939,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       const imported = result.document || result;
       const { entities, warnings = [], diagnostics = [], diagnosticIds = [], repairSummary } = imported;
       fields.name.value = imported.name || file.name.replace(/\.[^.]+$/, "");
-      measurements.length = 0;
       choose("select");
-      commit(entities, { warnings, ids: [] });
+      commit(entities, { warnings, ids: [], nextMeasurements: [] });
       fit();
       views.warnings.open = !views.warnings.hidden;
       const summary = [`Импортировано объектов: ${entities.length}`, repairSummary].filter(Boolean).join(". ");
@@ -4417,6 +4967,26 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }, listener);
   function submitParameters(relocate = false) {
     const value = numberFrom(fields.option);
+    if (parameterCommand === "fillet") {
+      const selection = filletSelection();
+      if (!selection || !(value > CAD_POINT_EPSILON && value <= MAX_COORDINATE)) {
+        parameterError(selection ? "Введите положительный радиус в миллиметрах." : "Выделите две стороны угла.");
+        return;
+      }
+      filletRadius = fields.option.value;
+      closeParameters();
+      void editOnServer("fillet", { ...selection, radius: value });
+      return;
+    }
+    if (parameterCommand === "notch-depth-all") {
+      if (!(value > 0 && value <= MAX_COORDINATE)) {
+        parameterError("Введите положительную глубину надсечки.");
+        return;
+      }
+      closeParameters();
+      void editOnServer("notch-depth-all", { depth: value });
+      return;
+    }
     if (insertPointsTarget) {
       if (!Number.isInteger(value) || value < 2 || value > MAX_INSERT_POINTS) {
         parameterError(`Введите целое число от 2 до ${MAX_INSERT_POINTS}.`);
@@ -4470,7 +5040,9 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
   canvas.addEventListener("dblclick", event => {
     if (tool !== "select" || running || gesture || offsetPreview || notchPreview || event.shiftKey || event.altKey) return;
-    const item = hit(world(screenEvent(event)), inActiveGroup);
+    const point = screenEvent(event);
+    if (measurementAt(point)) return;
+    const item = hit(world(point), inActiveGroup);
     const group = item && groupAt(item.entity);
     if (group) enterGroup(group);
     else if (item && !item.entity.notch && item.entity.type !== "point") selectContour(contourIds(item.entity));
@@ -4557,6 +5129,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
     if (event.key === "Shift" && !event.repeat) redrawOrthogonal(true);
     if (event.key === "Alt" && !event.repeat) redrawOrthogonal(event.shiftKey, true);
+    if (event.key === "Control" && !event.repeat && !running && !gesture && (tool === "move" || tool === "rotate")) {
+      copyMode = !copyMode;
+      update();
+    }
   }, listener);
   canvas.addEventListener("keyup", event => {
     if (event.code === "Space") spacePressed = false;
@@ -4569,7 +5145,13 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     const target = event.target;
     if (target !== root.body && !container.contains(target)) return;
     if (target.closest?.("input, textarea, select, [role=textbox]") || target.isContentEditable) return;
-    const key = event.code === "KeyZ" ? "z" : event.code === "KeyY" ? "y" : event.key.toLowerCase();
+    const key = /^Key[CVYZ]$/.test(event.code) ? event.code.at(-1).toLowerCase() : event.key.toLowerCase();
+    if (!event.shiftKey && (key === "c" || key === "v")) {
+      if (event.repeat || !(key === "c" ? copyClipboard() : beginPaste())) return;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (key !== "z" && (key !== "y" || event.shiftKey)) return;
     event.preventDefault();
     event.stopPropagation();
@@ -4598,9 +5180,15 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       event.stopPropagation();
       return;
     }
+    if (pastePlacement && key === "enter" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing) {
+      if (!event.repeat) pasteAt(cursor || center);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const mirrorEnter = key === "enter" && tool === "mirror" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing;
     if (mirrorEnter && !event.repeat) applyMirror(cursor);
-    if (mirrorEnter || handleRotationInput(event, key) || handleDirectDistance(event, key)) {
+    if (mirrorEnter || handleCopyArrayInput(event, key) || handleRotationInput(event, key) || handleDirectDistance(event, key)) {
       event.preventDefault();
       event.stopPropagation();
     }

@@ -28,6 +28,118 @@ def square_edges(prefix, x=0):
 
 
 class DesignerCadTests(unittest.TestCase):
+    def test_fillet_two_straight_entities_creates_a_tangent_arc_in_the_closed_cut(self):
+        scope = {"layer": "Крой", "groupPath": ["detail"]}
+        a = {**line("a", [0, 0], [0, 20]), **scope}
+        b = {"id": "b", "type": "polyline", "closed": False, "points": [[20, 0], [0, 0]], **scope}
+        top = {**line("top", [0, 20], [20, 20]), **scope}
+        right = {**line("right", [20, 20], [20, 0]), **scope}
+        notch = {**line("mark", [0, 15], [2, 15]), "notch": True, "parentId": "a"}
+        reply = edit_design([a, b, top, right, notch], "fillet", {"ids": ["a", "b"], "radius": 5})
+        self.assertTrue(reply["changed"])
+        first, second, arc_id = reply["selectedIds"]
+        self.assertEqual((first, second), ("a", "b"))
+        shapes = {entity["id"]: entity for entity in reply["entities"]}
+        arc = shapes[arc_id]
+        self.assertEqual((arc["type"], arc["radius"], arc["layer"], arc["groupPath"]), ("arc", 5, "Крой", ["detail"]))
+        self.assertEqual(shapes["a"]["end"], a["end"])
+        self.assertEqual(shapes["b"]["points"][0], b["points"][0])
+        for endpoint, fixed, degrees in ((shapes["a"]["start"], a["end"], arc["startAngle"]),
+                                         (shapes["b"]["points"][1], b["points"][0], arc["startAngle"] + arc["sweep"])):
+            radial = [coordinate - center for coordinate, center in zip(endpoint, arc["center"])]
+            along = [far - near for far, near in zip(fixed, endpoint)]
+            self.assertAlmostEqual(math.hypot(*radial), 5)
+            self.assertAlmostEqual(sum(component * direction for component, direction in zip(radial, along)), 0)
+            angle = math.radians(degrees)
+            self.assertAlmostEqual(endpoint[0], arc["center"][0] + 5 * math.cos(angle))
+            self.assertAlmostEqual(endpoint[1], arc["center"][1] + 5 * math.sin(angle))
+        self.assertAlmostEqual(arc["sweep"], 90)
+        self.assertEqual(shapes["mark"], notch)
+        self.assertEqual(shapes["top"], top)
+        prepared = prepare_design(reply["entities"])
+        self.assertEqual(prepared["closedCount"], 1)
+        self.assertIn({"a", "b", arc_id, "top", "right"}, list(map(set, prepared["sourceIds"])))
+
+    def test_fillet_polyline_seam_keeps_existing_edges_bulges_and_id(self):
+        contour = {**square(), "bulges": [0, 0.2, 0, 0], "reference": True, "groupPath": ["detail"]}
+        reply = edit_design([contour], "fillet", {"edges": [{"id": "outline", "indices": [0, 3]}], "radius": 4})
+        self.assertEqual(reply["selectedIds"], ["outline"])
+        rounded, = reply["entities"]
+        for field in ("id", "type", "closed", "reference", "groupPath", "layer"):
+            self.assertEqual(rounded[field], contour[field])
+        self.assertEqual(rounded["points"][2:], contour["points"][1:])
+        for actual, expected in zip(rounded["points"][0] + rounded["points"][1], [0, 4, 4, 0]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(rounded["bulges"][0], math.tan(math.pi / 8))
+        self.assertEqual(rounded["bulges"][1:], contour["bulges"])
+        path, = prepare_design([{**rounded, "reference": False}])["paths"]
+        self.assertTrue(path["closed"])
+
+    def test_fillet_open_polyline_accepts_its_two_edges_and_keeps_its_endpoints(self):
+        contour = {**square(), "closed": False, "points": [[0, 0], [20, 0], [10, -10]]}
+        reply = edit_design([contour], "fillet", {"edges": [{"id": "outline", "indices": [1, 0]}], "radius": 3})
+        rounded, = reply["entities"]
+        self.assertFalse(rounded["closed"])
+        self.assertEqual([rounded["points"][0], rounded["points"][-1]], [contour["points"][0], contour["points"][-1]])
+        self.assertAlmostEqual(rounded["bulges"][1], math.tan(-3 * math.pi / 16))
+
+    def test_fillet_acute_and_obtuse_corners_keep_the_requested_radius(self):
+        radius = 5
+        before, corner = [-100, 0], [0, 0]
+        for degrees in (30, 75, 120, 150):
+            for direction in (-1, 1):
+                with self.subTest(interior=degrees, direction=direction):
+                    angle = math.radians(degrees)
+                    after = [-100 * math.cos(angle), direction * 100 * math.sin(angle)]
+                    sides = [line("first", before, corner), line("second", corner, after)]
+                    result = edit_design(sides, "fillet", {"ids": ["first", "second"], "radius": radius})
+                    first, second, arc = result["entities"]
+                    start, end = first["end"], second["start"]
+                    center = Point(arc["center"])
+                    self.assertEqual(arc["radius"], radius)
+                    self.assertAlmostEqual(arc["sweep"], direction * (180 - degrees))
+                    for point, side in zip((start, end), (LineString([before, corner]), LineString([corner, after]))):
+                        tangent = Point(point)
+                        self.assertAlmostEqual(side.distance(tangent), 0)
+                        self.assertAlmostEqual(side.distance(center), radius)
+                        self.assertAlmostEqual(center.distance(tangent), radius)
+                    self.assertEqual([first["start"], second["end"]], [before, after])
+
+                    contour = {**square(), "closed": False, "points": [before, corner, after], "joined": True}
+                    result = edit_design([contour], "fillet", {"ids": ["outline"], "radius": radius})
+                    rounded, = result["entities"]
+                    self.assertEqual(rounded["points"], [before, start, end, after])
+                    self.assertEqual(result["selectedIds"], ["outline"])
+                    self.assertTrue(rounded["joined"])
+                    self.assertAlmostEqual(rounded["bulges"][1], math.tan(direction * (math.pi - angle) / 4))
+
+    def test_fillet_short_acute_corner_reports_the_radius_limit(self):
+        sides = [line("a", [-12, 0], [0, 0]), line("b", [0, 0], [-12 * math.sqrt(3), 12])]
+        options = {"ids": ["a", "b"]}
+        with self.assertRaisesRegex(CadDesignError, r"радиус меньше 3\.21\d* мм"):
+            edit_design(sides, "fillet", {**options, "radius": 5})
+        result = edit_design(sides, "fillet", {**options, "radius": 3})
+        self.assertEqual(result["entities"][-1]["radius"], 3)
+
+    def test_fillet_rejects_bad_radius_non_corners_curves_and_cut_off_attachments(self):
+        a, b = line("a", [0, 20], [0, 0]), line("b", [0, 0], [20, 0])
+        options = {"ids": ["a", "b"], "radius": 5}
+        for radius in (0, -2, math.inf, math.nan, 20, True):
+            with self.subTest(radius=radius), self.assertRaises(CadDesignError):
+                edit_design([a, b], "fillet", {**options, "radius": radius})
+        for second in (line("b", [0, 0], [0, -20]), line("b", [1, 0], [20, 0]), {**b, "reference": True}):
+            with self.subTest(second=second), self.assertRaises(CadDesignError):
+                edit_design([a, second], "fillet", options)
+        for mark in ({**line("mark", [0, 2], [2, 2]), "notch": True, "parentId": "a"},
+                     {**line("mark", [2, 2], [0, 2]), "notch": True},
+                     line("branch", [0, 0], [-20, 0])):
+            with self.subTest(mark=mark), self.assertRaises(CadDesignError):
+                edit_design([a, b, mark], "fillet", options)
+        for contour, indices in ((square(), [0, 2]), ({**square(), "bulges": [0, 0.2, 0, 0]}, [0, 1]),
+                                 ({**square(), "joined": True}, [0, 1])):
+            with self.subTest(indices=indices), self.assertRaises(CadDesignError):
+                edit_design([contour], "fillet", {"edges": [{"id": "outline", "indices": indices}], "radius": 3})
+
     def test_groups_survive_server_edits_without_affecting_cut_paths(self):
         contour = square()
         loose = line("loose", [40, 0], [60, 0])
@@ -120,18 +232,160 @@ class DesignerCadTests(unittest.TestCase):
         self.assertEqual(set(map(tuple, contour["points"])),
                          {tuple(edge[side]) for edge in edges for side in ("start", "end")})
 
-    def test_close_outline_no_ops_or_rejects_ineligible_contours(self):
+    def test_close_outline_joins_existing_closed_polyline_without_changing_the_cut(self):
+        points = [[100 + 100 * math.cos(math.tau * i / 72), 40 + 40 * math.sin(math.tau * i / 72)]
+                  for i in range(72)]
+        contour = {**square(), "points": points, "joined": False}
+        options = {"ids": [contour["id"]]}
+
+        result = edit_design([contour], "close-outline", options)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], options["ids"])
+        self.assertEqual(validate_design(result["entities"]), [{**contour, "joined": True}])
+        self.assertEqual(prepare_design(result["entities"]), prepare_design([contour]))
+        path, = prepare_design(result["entities"])["paths"]
+        self.assertTrue(path["closed"])
+        self.assertIn("объединён в одну траекторию", result["warnings"][0])
+        edge_edit = {"id": contour["id"], "edge": 0, "point": [(a + b) / 2 for a, b in zip(*points[:2])]}
+        inserted, = edit_design([contour], "insert-points", edge_edit)["entities"]
+        self.assertEqual(len(inserted["points"]), 73)
+        with self.assertRaisesRegex(CadDesignError, "нельзя редактировать отдельные сегменты"):
+            edit_design(result["entities"], "insert-points", edge_edit)
+        repeated = edit_design(result["entities"], "close-outline", options)
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(repeated["entities"], result["entities"])
+
+    def test_split_outline_preserves_the_prepared_cut_and_reattaches_notches(self):
+        parent = {**square(), "bulges": [1, 0, 0, 0], "groupPath": ["detail"], "joined": True}
+        curved = {**line("curve-notch", [10, -10], [10, -9]), "notch": True, "parentId": parent["id"]}
+        corner = {**line("corner-notch", [20, 0], [19, 1]), "notch": True, "parentId": parent["id"]}
+        before = [parent, curved, corner]
+
+        result = edit_design(before, "split-outline", {"id": parent["id"]})
+
+        self.assertTrue(result["changed"])
+        arc, right, top, left, arc_notch, corner_notch = result["entities"]
+        self.assertEqual(result["selectedIds"], [edge["id"] for edge in (arc, right, top, left)])
+        self.assertEqual([edge["type"] for edge in (arc, right, top, left)], ["arc", "line", "line", "line"])
+        self.assertTrue(all(edge["layer"] == parent["layer"] and edge["groupPath"] == parent["groupPath"]
+                            for edge in (arc, right, top, left)))
+        self.assertAlmostEqual(arc["sweep"], 180)
+        self.assertEqual(right["start"], [20, 0])
+        self.assertEqual(right["end"], [20, 20])
+        self.assertEqual(arc_notch, {**curved, "parentId": arc["id"]})
+        self.assertEqual(corner_notch, {**corner, "parentId": right["id"]})
+        self.assertEqual(prepare_design(result["entities"])["paths"], prepare_design(before)["paths"])
+
+    def test_split_outline_keeps_reference_role_and_rejects_unsplittable_types(self):
+        reference = {**square(), "reference": True, "bulges": [-0.5, 0, 0, 0]}
+        result = edit_design([reference], "split-outline", {"id": reference["id"]})
+        self.assertTrue(all(entity["reference"] for entity in result["entities"]))
+        self.assertEqual(prepare_design(result["entities"])["paths"], [])
+        self.assertLess(result["entities"][0]["sweep"], 0)
+
+        circle = {"id": "circle", "type": "circle", "center": [0, 0], "radius": 7}
+        opened = {**square(), "closed": False}
+        for entity in (circle, opened):
+            with self.subTest(entity=entity["id"]), self.assertRaisesRegex(CadDesignError, "замкнутой полилинии"):
+                edit_design([entity], "split-outline", {"id": entity["id"]})
+
+    def test_join_outline_keeps_47_edges_open_and_preserves_closed_cut_after_split(self):
+        points = [[120 + 60 * math.cos(math.tau * i / 72), 80 + 40 * math.sin(math.tau * i / 72)]
+                  for i in range(72)]
+        source = {**square(), "points": points, "groupPath": ["panel"]}
+        on_selected = {**line("selected-notch", points[60], [points[60][0] - 1, points[60][1]]),
+                       "notch": True, "parentId": source["id"]}
+        on_remainder = {**line("remainder-notch", points[40], [points[40][0] + 1, points[40][1]]),
+                        "notch": True, "parentId": source["id"]}
+        original = [source, on_selected, on_remainder]
+        indices = [*range(52, 72), *range(27)]
+
+        result = edit_design(original, "join-outline", {"edges": [{"id": source["id"], "indices": indices}]})
+
+        self.assertTrue(result["changed"])
+        combined_id, = result["selectedIds"]
+        by_id = {entity["id"]: entity for entity in result["entities"]}
+        combined, remainder = by_id[combined_id], by_id[source["id"]]
+        self.assertTrue(combined["joined"])
+        self.assertFalse(combined["closed"])
+        self.assertEqual(combined["points"], [*points[52:], *points[:28]])
+        self.assertEqual(remainder["points"], points[27:53])
+        self.assertEqual(by_id[on_selected["id"]], {**on_selected, "parentId": combined_id})
+        self.assertEqual(by_id[on_remainder["id"]], on_remainder)
+
+        def perimeter(entities):
+            path, = (path for path in prepare_design(entities)["paths"] if path["closed"])
+            return LineString([*path["points"], path["points"][0]])
+
+        self.assertTrue(perimeter(original).equals(perimeter(result["entities"])))
+        split = edit_design(result["entities"], "split-outline", {"id": combined_id})
+        self.assertEqual(len(split["selectedIds"]), 47)
+        self.assertTrue(perimeter(original).equals(perimeter(split["entities"])))
+
+    def test_join_outline_preserves_arc_bulge_without_closing_the_chain(self):
+        base = line("base", [0, 0], [10, 0])
+        arc = {"id": "arc", "type": "arc", "layer": "0", "center": [10, 5], "radius": 5,
+               "startAngle": 270, "sweep": 90}
+        result = edit_design([base, arc], "join-outline", {"ids": [base["id"], arc["id"]]})
+        shape, = result["entities"]
+        self.assertTrue(result["changed"])
+        self.assertFalse(shape["closed"])
+        self.assertEqual(shape["points"][0], [0, 0])
+        self.assertAlmostEqual(math.dist(shape["points"][-1], [15, 5]), 0)
+        self.assertAlmostEqual(shape["bulges"][1], math.tan(math.pi / 8))
+        self.assertAlmostEqual(prepare_design([shape])["paths"][0]["points"][-1][0], 15)
+        split = edit_design(result["entities"], "split-outline", {"id": shape["id"]})
+        self.assertEqual([item["type"] for item in split["entities"]], ["line", "arc"])
+        self.assertAlmostEqual(split["entities"][-1]["sweep"], 90)
+
+    def test_join_outline_marks_a_whole_open_polyline_without_changing_geometry(self):
+        source = {**square(), "closed": False}
+        options = {"ids": [source["id"]]}
+        result = edit_design([source], "join-outline", options)
+        self.assertEqual(result["entities"], [{**source, "joined": True}])
+        self.assertEqual(result["selectedIds"], options["ids"])
+        self.assertTrue(result["changed"])
+        self.assertFalse(edit_design(result["entities"], "join-outline", options)["changed"])
+        with self.assertRaisesRegex(CadDesignError, "нельзя редактировать отдельные сегменты"):
+            edit_design(result["entities"], "insert-points", {"id": source["id"], "edge": 0, "point": [10, 0]})
+        opened = edit_design(result["entities"], "split-outline", {"id": source["id"]})
+        self.assertEqual(len(opened["selectedIds"]), 3)
+
+        edges = square_edges("edge")
+        natural = edit_design(edges, "join-outline", {"ids": [edge["id"] for edge in edges]})
+        outline, = natural["entities"]
+        self.assertTrue(outline["closed"])
+        self.assertEqual(outline["points"], square()["points"])
+
+        single = {**source, "points": source["points"][:2], "joined": True}
+        selected_edge = edit_design([single], "join-outline", {"edges": [{"id": single["id"], "indices": [0]}]})
+        self.assertFalse(selected_edge["changed"])
+        self.assertEqual(selected_edge["entities"], [single])
+
+    def test_join_outline_retains_both_open_remainders_and_rejects_disconnected_edges(self):
+        source = {**square(), "closed": False, "points": [[0, 0], [10, 0], [20, 0], [30, 0], [40, 0]]}
+        result = edit_design([source], "join-outline", {"edges": [{"id": source["id"], "indices": [1, 2]}]})
+        left, joined, right = result["entities"]
+        self.assertEqual(left["id"], source["id"])
+        self.assertEqual(left["points"], source["points"][:2])
+        self.assertEqual(joined["points"], source["points"][1:4])
+        self.assertEqual(right["points"], source["points"][3:])
+        with self.assertRaisesRegex(CadDesignError, "разрыв"):
+            edit_design([source], "join-outline", {"edges": [{"id": source["id"], "indices": [0, 2]}]})
+
+    def test_close_outline_closes_an_open_loop_or_rejects_ineligible_contours(self):
         contour = square()
         open_loop = {**contour, "closed": False, "points": [*contour["points"], contour["points"][0]]}
         result = edit_design([open_loop], "close-outline", {"ids": [contour["id"]]})
         self.assertTrue(result["changed"])
-        self.assertEqual(result["entities"], [contour])
+        self.assertEqual(result["entities"], [{**contour, "joined": True}])
 
         crossed = {**contour, "points": [[0, 0], [20, 20], [0, 20], [20, 0]]}
         branch = [*square_edges("piece"), line("branch", [0, 0], [-10, 0])]
         unrelated_groups = square_edges("grouped")
         unrelated_groups[0]["groupPath"] = ["other"]
-        for shapes in ([contour], [crossed], [line("short", [0, 0], [0.01, 0])], branch, unrelated_groups,
+        for shapes in ([crossed], [line("short", [0, 0], [0.01, 0])], branch, unrelated_groups,
                        [line("first", [0, 0], [0, 20]), line("second", [40, 0], [40, 20])]):
             with self.subTest(ids=[shape["id"] for shape in shapes]):
                 rejected = edit_design(shapes, "close-outline", {"ids": [shape["id"] for shape in shapes]})
@@ -977,6 +1231,115 @@ class DesignerCadTests(unittest.TestCase):
         self.assertEqual(result["entities"][-1], {**line("imported", [10, 0], [10, 3]), "layer": "Насечки",
                                                   "reference": True, "notch": True, "parentId": "outline"})
         self.assertEqual(result["selectedIds"], ["imported"])
+
+    def test_notch_convert_preserves_stroke_and_attaches_the_touching_endpoint(self):
+        parent = {**square(), "groupPath": ["piece"]}
+        stroke = {"id": "drawn", "type": "polyline", "layer": "Надсечки", "closed": False,
+                  "points": [[17, 5], [20, 7]], "groupPath": ["piece"], "bulges": [0, 0]}
+
+        result = edit_design([parent, stroke], "notch-convert", {"id": stroke["id"]})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], [stroke["id"]])
+        self.assertEqual(result["entities"][0], parent)
+        mark = result["entities"][1]
+        self.assertEqual(mark, {key: value for key, value in {**stroke, "points": stroke["points"][::-1],
+                                                            "notch": True, "parentId": parent["id"]}.items()
+                                if key != "groupPath"})
+        self.assertEqual([path.get("notch", False) for path in prepare_design(result["entities"])["paths"]],
+                         [False, True])
+        repeated = edit_design(result["entities"], "notch-convert", {"id": stroke["id"]})
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(repeated["entities"], result["entities"])
+
+    def test_notch_convert_leaves_ambiguous_or_reference_strokes_standalone(self):
+        source = line("drawn", [12, 0], [13, 2])
+        parents = [square(), {**square(), "id": "other"}]
+        result = edit_design([*parents, source], "notch-convert", {"id": source["id"]})
+        self.assertEqual(result["entities"][-1], {**source, "notch": True})
+        self.assertIn("неоднозначно", result["warnings"][0])
+
+        reference = {**source, "reference": True, "groupPath": ["guides"]}
+        result = edit_design([square(), reference], "notch-convert", {"id": source["id"]})
+        self.assertEqual(result["entities"][-1], {**reference, "notch": True})
+        self.assertEqual(len(prepare_design(result["entities"])["paths"]), 1)
+        invalid = {"id": "curved", "type": "polyline", "points": [[0, 0], [2, 0]], "closed": False,
+                   "bulges": [0.5, 0]}
+        with self.assertRaisesRegex(CadDesignError, "прямой отрезок"):
+            edit_design([invalid], "notch-convert", {"id": invalid["id"]})
+
+    def test_notch_convert_batch_cannot_use_another_selected_line_as_parent(self):
+        group = ["detail"]
+        parent = {**square(), "groupPath": group}
+        attached = {**line("attached", [7, 2], [7, 0]), "groupPath": group}
+        first = {**line("first", [7, 2], [8, 3]), "groupPath": group}
+        second = {**line("second", [8, 3], [9, 4]), "groupPath": group}
+        ids = [second["id"], attached["id"], first["id"]]
+
+        result = edit_design([parent, attached, first, second], "notch-convert", {"ids": ids})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], ids)
+        self.assertEqual(result["entities"], [parent,
+            {**line("attached", [7, 0], [7, 2]), "notch": True, "parentId": parent["id"]},
+            {**first, "notch": True}, {**second, "notch": True}])
+        self.assertEqual(result["warnings"], ["Отдельных насечек — 2: край детали не найден."])
+        no_op = edit_design(result["entities"], "notch-convert", {"ids": ids})
+        self.assertFalse(no_op["changed"])
+        self.assertEqual(no_op["selectedIds"], ids)
+
+    def test_notch_convert_batch_rejects_duplicate_or_ineligible_selection(self):
+        parent = square()
+        stroke = line("stroke", [7, 0], [7, 2])
+        for ids in ([stroke["id"], stroke["id"]], [stroke["id"], parent["id"]], [stroke["id"], "missing"]):
+            with self.subTest(ids=ids), self.assertRaises(CadDesignError):
+                edit_design([parent, stroke], "notch-convert", {"ids": ids})
+        self.assertNotIn("notch", stroke)
+
+    def test_notch_depth_all_preserves_bases_directions_identity_and_groups(self):
+        parent = {**square(), "groupPath": ["piece"]}
+        attached = {**line("pierce", [5, 0], [8, 4]), "notch": True, "parentId": parent["id"]}
+        loose = {"id": "loose", "type": "polyline", "layer": "0", "closed": False, "notch": True,
+                 "points": [[40, 20], [41, 21], [43, 24]], "bulges": [0.25, 0, 0], "groupPath": ["other"]}
+        reference = {**line("guide", [25, 0], [25, -2]), "notch": True, "reference": True}
+        draft = [parent, attached, loose, reference, line("cut", [50, 0], [55, 1])]
+
+        result = edit_design(draft, "notch-depth-all", {"depth": 10})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["selectedIds"], ["pierce", "loose", "guide"])
+        self.assertEqual(result["entities"], [parent, {**attached, "end": [11, 8]},
+                                             {**loose, "points": [[40, 20], [42, 22], [46, 28]]},
+                                             {**reference, "end": [25, -10]}, draft[-1]])
+        repeated = edit_design(result["entities"], "notch-depth-all", {"depth": 10})
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(repeated["entities"], result["entities"])
+
+    def test_notch_depth_all_keeps_the_touching_end_of_reversed_standalone_marks(self):
+        group = ["group"]
+        parent = {**square(), "groupPath": group}
+        stroke = {**line("reverse", [8, 2], [8, 0]), "notch": True, "groupPath": group}
+        polyline = {"id": "legacy", "type": "polyline", "layer": "0", "closed": False, "notch": True,
+                    "points": [[12, 2], [12, 1], [12, 0]], "groupPath": group}
+        unrelated = {**line("reference", [0, 2], [20, 2]), "reference": True, "groupPath": group}
+
+        result = edit_design([parent, unrelated, stroke, polyline], "notch-depth-all", {"depth": 4})
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["entities"], [parent, unrelated, {**stroke, "start": [8, 4]},
+                                              {**polyline, "points": [[12, 4], [12, 2], [12, 0]]}])
+
+    def test_notch_depth_all_refuses_a_crossing_or_unsupported_mark_atomically(self):
+        parent = {**square(), "points": [[0, 0], [4, 0], [4, 1], [0, 1]]}
+        mark = {**line("mark", [2, 0], [2, 0.5]), "notch": True, "parentId": parent["id"]}
+        first = {**line("free", [10, 0], [10, 0.5]), "notch": True}
+        with self.assertRaisesRegex(CadDesignError, "пересекает границу"):
+            edit_design([first, parent, mark], "notch-depth-all", {"depth": 2})
+        self.assertEqual(first["end"], [10, 0.5])
+        invalid = {**square(), "notch": True}
+        with self.assertRaisesRegex(CadDesignError, "открытой полилинией"):
+            edit_design([first, invalid], "notch-depth-all", {"depth": 2})
+        self.assertEqual(first["end"], [10, 0.5])
 
     def test_ambiguous_or_floating_unbound_notch_requires_explicit_attachment(self):
         mark = {**line("imported", [10, 0.02], [10, 2]), "notch": True}

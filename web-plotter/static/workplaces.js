@@ -63,20 +63,20 @@ function progressPercent(done, total) {
   return total ? Math.floor(done * 100 / total) : 0;
 }
 
-const dateParts = new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Moscow", year: "numeric", month: "2-digit", day: "2-digit" });
-const today = () => dateParts.format(new Date());
 const showDate = (value) => value.split("-").reverse().join(".");
 
 function orderDates(order) {
   const dates = el("span", "", "workplace-order-dates");
-  for (const [label, value] of [["Поставлен", order.placedOn], ["Выполнить до", order.dueOn]]) {
-    const item = el("span", el("span", label, "workplace-order-label"));
-    const date = value ? el("time", showDate(value)) : el("strong", label === "Поставлен" ? "Дата не указана" : "Срок не указан");
-    if (value) date.dateTime = value;
-    item.append(date);
-    dates.append(item);
-  }
+  const item = el("span", el("span", "Поставлен", "workplace-order-label"));
+  const date = order.placedOn ? el("time", showDate(order.placedOn)) : el("strong", "Дата не указана");
+  if (order.placedOn) date.dateTime = order.placedOn;
+  item.append(date);
+  dates.append(item);
   return dates;
+}
+
+function orderContext(order) {
+  return order.modelName ? `${order.modelName} · ${order.quantity} шт.` : "";
 }
 
 const ROLE_STORAGE_KEY = "plotter.workplace";
@@ -222,16 +222,21 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     return heading;
   }
 
-  function itemPicker(kinds, previous = [], { kit = false } = {}) {
+  function itemPicker(kinds, previous = [], { mode = "list" } = {}) {
+    const cards = mode !== "list";
+    const fabric = mode === "fabric";
+    const catalogLabel = fabric ? "Детали и комплекты" : "Каталог деталей";
+    const compositionLabel = fabric ? "Состав ткани" : "Детали в комплекте";
+    const destination = fabric ? "в состав ткани" : "в комплект";
     const chosen = new Map(previous.map(item => [item.id, item.quantity]));
-    const section = el("div", "", `workplace-picker${kit ? " registry-kit-picker" : ""}`);
+    const section = el("div", "", `workplace-picker${cards ? " registry-kit-picker" : ""}${fabric ? " workplace-fabric-picker" : ""}`);
     const browser = el("div", "", "workplace-picker-browser");
     const search = input("search", "", { placeholder: "Название или путь к папке" });
     const results = el("div", "", "workplace-picker-results");
-    const count = el("small", "", kit ? "registry-picked-count" : "");
+    const count = el("small", "", cards ? "registry-picked-count" : "");
     const selected = el("div", "", "registry-picked-list");
-    const composition = kit ? el("section", el("h3", "Детали в комплекте"), "registry-picked") : null;
-    const notice = kit ? el("span", "", "visually-hidden registry-kit-notice") : null;
+    const composition = cards ? el("section", el("h3", compositionLabel), "registry-picked") : null;
+    const notice = cards ? el("span", "", "visually-hidden registry-kit-notice") : null;
     const catalogNodes = new Map();
     const quantities = new Map();
     let dragging = null;
@@ -240,9 +245,13 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     directory.options[0].textContent = "Все папки";
     const inFolder = (entry) => !directory.value || trailOf(find(entry.parent)).some(parent => parent.id === directory.value);
     function itemText(entry) {
-      const text = el("span", el("strong", entry.name), kit ? "registry-node-text" : "");
+      const text = el("span", el("strong", entry.name), cards ? "registry-node-text" : "");
       const path = pathOf(find(entry.parent));
-      text.append(el("small", kit ? path : `${labels[entry.kind]} · ${path}`));
+      if (fabric) {
+        const meta = el("small", el("span", labels[entry.kind], "registry-kind"), "workplace-fabric-meta");
+        meta.append(el("span", path));
+        text.append(meta);
+      } else text.append(el("small", cards ? path : `${labels[entry.kind]} · ${path}`));
       return text;
     }
     function amountInput(entry, value, disabled = false) {
@@ -262,6 +271,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     function kitNode(entry, add) {
       const variant = add ? "registry-kit-choice" : "registry-picked-row";
       const node = el("div", "", `workplace-pick-row registry-kit-node ${variant}`);
+      node.dataset.kind = entry.kind;
       node.setAttribute("role", "listitem");
       const grip = el("span", "", "registry-node-grip");
       grip.setAttribute("aria-hidden", "true");
@@ -285,11 +295,11 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     function syncCatalogNode(id) {
       const card = catalogNodes.get(id);
       if (!card) return;
-      const inKit = chosen.has(id);
-      card.node.classList.toggle("is-in-kit", inKit);
-      card.node.draggable = !inKit;
-      card.add.hidden = inKit;
-      card.state.hidden = !inKit;
+      const included = chosen.has(id);
+      card.node.classList.toggle("is-in-kit", included);
+      card.node.draggable = !included;
+      card.add.hidden = included;
+      card.state.hidden = !included;
     }
 
     function changeKit(entry, add, restoreFocus = false) {
@@ -298,7 +308,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       else chosen.delete(entry.id);
       syncCatalogNode(entry.id);
       drawChosen();
-      notice.textContent = add ? `«${entry.name}» добавлена в комплект.` : `«${entry.name}» убрана из комплекта.`;
+      notice.textContent = add ? `Добавлено ${destination}: «${entry.name}».` : `Убрано: «${entry.name}».`;
       if (restoreFocus) {
         const target = add ? quantities.get(entry.id) : catalogNodes.get(entry.id)?.add || search;
         target?.focus();
@@ -328,7 +338,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
     function drawChosen() {
       count.textContent = `Выбрано: ${chosen.size}`;
-      if (!kit) return;
+      if (!cards) return;
       quantities.clear();
       selected.replaceChildren();
       for (const [id, quantity] of chosen) {
@@ -338,12 +348,13 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         quantities.set(id, amount);
         const remove = button("Убрать", () => changeKit(entry, false, true));
         remove.classList.add("registry-node-action");
-        remove.setAttribute("aria-label", `Убрать ${entry.name} из комплекта`);
+        remove.setAttribute("aria-label", `Убрать ${entry.name} ${fabric ? "из состава ткани" : "из комплекта"}`);
         row.append(amount, remove);
         selected.append(row);
       }
       if (!selected.children.length) {
-        selected.append(el("div", el("strong", "Перетащите сюда детали из каталога"), "registry-kit-empty"));
+        const empty = fabric ? "Добавьте детали или комплекты из каталога" : "Перетащите сюда детали из каталога";
+        selected.append(el("div", el("strong", empty), "registry-kit-empty"));
       }
     }
 
@@ -353,12 +364,12 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       results.replaceChildren();
       for (const entry of choices) {
         if (!inFolder(entry) || !pathOf(entry).toLocaleLowerCase().includes(needle)) continue;
-        if (kit) {
+        if (cards) {
           const node = kitNode(entry, true);
           const add = button("Добавить", () => changeKit(entry, true, true));
           add.classList.add("registry-node-action");
-          add.setAttribute("aria-label", `Добавить ${entry.name} в комплект`);
-          const state = el("span", "В комплекте", "registry-node-state");
+          add.setAttribute("aria-label", `Добавить ${entry.name} ${destination}`);
+          const state = el("span", fabric ? "В составе" : "В комплекте", "registry-node-state");
           node.append(add, state);
           catalogNodes.set(entry.id, { node, add, state });
           syncCatalogNode(entry.id);
@@ -381,17 +392,17 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     }
     search.oninput = drawMatches;
     directory.onchange = drawMatches;
-    if (kit) {
+    if (cards) {
       browser.setAttribute("role", "region");
-      browser.setAttribute("aria-label", "Каталог деталей");
+      browser.setAttribute("aria-label", catalogLabel);
       results.setAttribute("role", "list");
-      browser.append(el("h3", "Каталог деталей"),
-        el("p", "Перетащите карточку в комплект или нажмите «Добавить».", "registry-kit-hint"));
+      browser.append(el("h3", catalogLabel));
+      if (!fabric) browser.append(el("p", "Перетащите карточку в комплект или нажмите «Добавить».", "registry-kit-hint"));
     }
     browser.append(field("Фильтр по папке", directory), field("Поиск по реестру", search), results);
     section.append(browser);
-    if (kit) {
-      composition.setAttribute("aria-label", "Детали в комплекте");
+    if (cards) {
+      composition.setAttribute("aria-label", compositionLabel);
       selected.setAttribute("role", "list");
       notice.setAttribute("role", "status");
       composition.append(count, selected);
@@ -409,7 +420,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const name = input("text", old?.name ?? "", { required: true, maxLength: 255 });
     const parent = folderSelect(old ? old.parent : selectedFolder, old);
     const model = input("checkbox", "", { checked: old?.model === true });
-    const picker = kind === "kit" ? itemPicker(["part"], old?.members, { kit: true }) : null;
+    const picker = kind === "kit" ? itemPicker(["part"], old?.members, { mode: "kit" }) : null;
     const fields = el("div", "", "workplace-form-grid");
     fields.append(field("Название", name), field(kind === "folder" ? "Родительская папка" : "Папка записи", parent));
     if (kind === "folder") fields.append(field("Обозначить как изделие", model));
@@ -705,33 +716,13 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   }
 
   function orderDialog(old) {
-    const published = Boolean(old?.published);
     const number = input("text", old?.number ?? "", { required: true, maxLength: 255 });
-    const model = select([["", "Выберите папку изделия"], ...folders().filter(folder => folder.model).map(folder => [folder.id, pathOf(folder)])], old?.modelId);
-    model.required = true;
-    const amount = input("number", old?.quantity ?? 1, { min: 1, max: 50000, required: true });
-    const fields = el("div", field("Номер заказа", number), "workplace-form-grid");
-    if (!published) fields.append(field("Изделие", model), field("Количество изделий", amount));
-    if (!published && old?.cuts.length) {
-      model.disabled = true;
-      fields.append(el("p", "Чтобы сменить изделие, сначала удалите пункты раскроя.", "workplace-form-note"));
-      const notice = el("p", "После изменения количества раскладки по всем тканям нужно подготовить заново.", "workplace-form-note");
-      notice.hidden = true;
-      amount.oninput = () => { notice.hidden = amount.valueAsNumber === old.quantity; };
-      fields.append(notice);
-    }
-    const placedOn = input("date", old ? old.placedOn ?? "" : today(), { required: !old || Boolean(old.placedOn) });
-    const dueOn = input("date", old?.dueOn ?? "", { required: !old || Boolean(old.dueOn), min: placedOn.value });
-    placedOn.oninput = () => { dueOn.min = placedOn.value; };
     const notes = Object.assign(el("textarea"), { value: old?.notes ?? "", maxLength: 2000, rows: 3,
       placeholder: "Например, сначала раскроить подкладку" });
-    const dates = el("div", field("Дата постановки", placedOn), "workplace-date-fields");
-    dates.append(field("Срок выполнения", dueOn));
-    fields.append(dates, field("Комментарий для оператора", notes));
+    const fields = el("div", field("Номер заказа", number), "workplace-form-grid");
+    fields.append(field("Комментарий для оператора", notes));
     formDialog(old ? "Изменить наряд" : "Новый наряд", fields, "Сохранить", async () => {
-      const result = await post("/api/orders", { action: published ? "update-meta" : "save", number: number.value,
-        ...(!published ? { modelId: model.value, quantity: amount.valueAsNumber } : {}),
-        ...(placedOn.value ? { placedOn: placedOn.value } : {}), ...(dueOn.value ? { dueOn: dueOn.value } : {}), notes: notes.value,
+      const result = await post("/api/orders", { action: old ? "update-meta" : "save", number: number.value, notes: notes.value,
         ...(old ? { id: old.id, revision: old.revision } : {}) });
       selectedOrder = result.id;
       await render();
@@ -740,15 +731,12 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   function cutDialog(order, old) {
     const title = input("text", old?.name ?? "", { required: true, maxLength: 255, placeholder: "Например, Подкладка" });
-    const width = input("number", old?.widthMm ?? "", { min: 1, step: "any", required: true });
-    const picker = itemPicker(["part", "kit"], old?.members);
-    const content = el("div", field("Название ткани", title), "workplace-form-grid");
-    content.append(field("Рабочая ширина полотна, мм", width), el("strong", "Состав на одно изделие"), picker.section);
-    if (!old) content.append(el("p", "Если выбран один комплект и ширина и количество совпадут, в наряд скопируется его сохранённая раскладка.", "workplace-form-note"));
-    if (order.published) content.append(el("p", "Если изменить состав или ширину, подготовьте и отправьте эту раскладку оператору заново.", "workplace-form-note"));
-    formDialog(old ? "Изменить пункт раскроя" : "Добавить ткань", content, "Сохранить", async () => {
+    const picker = itemPicker(["part", "kit"], old?.members, { mode: "fabric" });
+    const content = el("div", field("Название ткани", title), "workplace-form-grid workplace-fabric-form");
+    content.append(picker.section);
+    formDialog(old ? "Изменить ткань" : "Добавить ткань", content, "Сохранить", async () => {
       await post("/api/orders", { action: "save-cut", orderId: order.id, orderRevision: order.revision, id: old?.id,
-        name: title.value, widthMm: width.valueAsNumber, members: picker.values() });
+        name: title.value, members: picker.values() });
       await render();
     });
   }
@@ -844,7 +832,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       await render();
       focusWorkplaceHeading();
     }), { primary: true }));
-    panel.append(workHeading(`Наряд № ${order.number}`, `${order.modelName} · ${order.quantity} шт.`, actions));
+    panel.append(workHeading(`Наряд № ${order.number}`, orderContext(order), actions));
     const overview = el("section", orderDates(order), "workplace-order-overview");
     if (order.notes) overview.append(el("p", order.notes, "workplace-order-notes"));
     panel.append(overview);
@@ -853,10 +841,11 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     for (const cut of order.cuts) {
       const row = el("article", "", "workplace-cut-row");
       const main = el("div", el("h2", cut.name));
-      main.append(el("p", `Полотно ${cut.widthMm} мм`));
+      main.append(el("p", cut.widthMm == null ? "Ширина задаётся в автораскладке" : `Полотно ${cut.widthMm} мм`));
       const tools = el("div", "", "workplace-actions");
       const released = cut.released !== false;
-      const state = draft ? cut.prepared ? "Готов к отправке" : "Требуется раскладка"
+      const draftState = cut.prepared ? "Готов к отправке" : cut.widthMm == null ? "Раскладка у оператора" : "Требуется раскладка";
+      const state = draft ? draftState
         : released ? states[cut.status] : "Конструктор обновляет раскладку";
       tools.append(el("span", state, `workplace-chip ${cut.status}`));
       if (operator && released) {
@@ -933,10 +922,12 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     for (const order of result.orders) {
       const card = el("article", "", "workplace-card");
       const identity = el("div", el("h2", `Наряд № ${order.number}`), "workplace-card-identity");
-      identity.append(el("p", `${order.modelName} · ${order.quantity} шт.`));
+      const detail = orderContext(order);
+      if (detail) identity.append(el("p", detail));
       const summary = el("div", "", "workplace-card-materials");
       summary.append(el("span", "Ткани", "workplace-order-label"));
-      summary.append(el("span", order.materials?.map(material => `${material.name} · ${material.widthMm} мм`).join(", ") || "Ткани не добавлены"));
+      const fabrics = order.materials?.map(material => material.widthMm == null ? material.name : `${material.name} · ${material.widthMm} мм`);
+      summary.append(el("span", fabrics?.join(", ") || "Ткани не добавлены"));
       const progress = el("div", order.published ? progressRow(order.done, order.total)
         : el("small", "Черновик", "workplace-chip"), "workplace-card-progress");
       const open = button("Открыть", execute(async () => { selectedOrder = order.id; await render(); }));
@@ -945,7 +936,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       if (order.notes) card.append(el("p", order.notes, "workplace-card-notes"));
       cards.append(card);
     }
-    if (!cards.children.length) cards.append(el("p", operator ? "Отправленные наряды появятся здесь." : "Создайте наряд для изделия из реестра.", "workplace-empty"));
+    if (!cards.children.length) cards.append(el("p", operator ? "Отправленные наряды появятся здесь." : "Создайте наряд и добавьте ткани.", "workplace-empty"));
     panel.append(cards);
   }
 

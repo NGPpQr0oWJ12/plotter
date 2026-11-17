@@ -778,6 +778,8 @@ class PlotterState:
             raise WorkspaceConflict("Пункт наряда недоступен для запуска.")
         draft = record["workspace"]
         if for_machine or for_export:
+            if not self.demo_mode and "widthMm" in record and record["widthMm"] is None:
+                raise WorkspaceConflict("Укажите ширину полотна и сохраните раскладку всех деталей.")
             self.verify_production_layout(draft, draft["optimization"].get("nesting", {}).get("widthMm"))
         job, filename = self.workspace_drawing(draft)
         if for_machine and isinstance(self.workspace, CompanionWorkspace) and not self.demo_mode:
