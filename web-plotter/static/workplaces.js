@@ -4,6 +4,7 @@ import { confirmAction } from "/confirm-action.js";
 const $ = (id) => document.getElementById(id);
 const labels = { folder: "Папка", drawing: "Чертёж", part: "Деталь", kit: "Комплект" };
 const states = { pending: "Ожидает", active: "В работе", done: "Выполнен" };
+const kitPartDragType = "application/x-plotter-kit-part";
 
 function registryIcon(kind) {
   const paths = {
@@ -227,15 +228,21 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const browser = el("div", "", "workplace-picker-browser");
     const search = input("search", "", { placeholder: "Название или путь к папке" });
     const results = el("div", "", "workplace-picker-results");
-    const count = el("small", "");
+    const count = el("small", "", kit ? "registry-picked-count" : "");
     const selected = el("div", "", "registry-picked-list");
+    const composition = kit ? el("section", el("h3", "Детали в комплекте"), "registry-picked") : null;
+    const notice = kit ? el("span", "", "visually-hidden registry-kit-notice") : null;
+    const catalogNodes = new Map();
+    const quantities = new Map();
+    let dragging = null;
     const choices = entries.filter(entry => kinds.includes(entry.kind));
     const directory = folderSelect("");
     directory.options[0].textContent = "Все папки";
     const inFolder = (entry) => !directory.value || trailOf(find(entry.parent)).some(parent => parent.id === directory.value);
     function itemText(entry) {
-      const text = el("span", el("strong", entry.name));
-      text.append(el("small", `${labels[entry.kind]} · ${pathOf(find(entry.parent))}`));
+      const text = el("span", el("strong", entry.name), kit ? "registry-node-text" : "");
+      const path = pathOf(find(entry.parent));
+      text.append(el("small", kit ? path : `${labels[entry.kind]} · ${path}`));
       return text;
     }
     function amountInput(entry, value, disabled = false) {
@@ -244,57 +251,153 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       amount.oninput = () => chosen.set(entry.id, amount.valueAsNumber);
       return amount;
     }
+
+    function clearDrag() {
+      dragging?.node.classList.remove("is-dragging");
+      dragging = null;
+      browser.classList.remove("is-drop-target");
+      composition.classList.remove("is-drop-target");
+    }
+
+    function kitNode(entry, add) {
+      const variant = add ? "registry-kit-choice" : "registry-picked-row";
+      const node = el("div", "", `workplace-pick-row registry-kit-node ${variant}`);
+      node.setAttribute("role", "listitem");
+      const grip = el("span", "", "registry-node-grip");
+      grip.setAttribute("aria-hidden", "true");
+      node.append(grip, itemText(entry));
+      node.draggable = true;
+      node.ondragstart = event => {
+        if (!node.draggable || !event.dataTransfer || event.target.closest("input, button")) {
+          event.preventDefault();
+          return;
+        }
+        clearDrag();
+        dragging = { entry, add, node };
+        event.dataTransfer.setData(kitPartDragType, entry.id);
+        event.dataTransfer.effectAllowed = add ? "copy" : "move";
+        node.classList.add("is-dragging");
+      };
+      node.ondragend = clearDrag;
+      return node;
+    }
+
+    function syncCatalogNode(id) {
+      const card = catalogNodes.get(id);
+      if (!card) return;
+      const inKit = chosen.has(id);
+      card.node.classList.toggle("is-in-kit", inKit);
+      card.node.draggable = !inKit;
+      card.add.hidden = inKit;
+      card.state.hidden = !inKit;
+    }
+
+    function changeKit(entry, add, restoreFocus = false) {
+      if (chosen.has(entry.id) === add) return;
+      if (add) chosen.set(entry.id, 1);
+      else chosen.delete(entry.id);
+      syncCatalogNode(entry.id);
+      drawChosen();
+      notice.textContent = add ? `«${entry.name}» добавлена в комплект.` : `«${entry.name}» убрана из комплекта.`;
+      if (restoreFocus) {
+        const target = add ? quantities.get(entry.id) : catalogNodes.get(entry.id)?.add || search;
+        target?.focus();
+      }
+    }
+
+    function enableKitDrop(target, add) {
+      const accepts = event => dragging?.add === add && event.dataTransfer?.types.includes(kitPartDragType);
+      target.ondragover = event => {
+        if (!accepts(event)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = add ? "copy" : "move";
+        target.classList.add("is-drop-target");
+      };
+      target.ondragleave = event => {
+        if (!target.contains(event.relatedTarget)) target.classList.remove("is-drop-target");
+      };
+      target.ondrop = event => {
+        if (!accepts(event)) return;
+        event.preventDefault();
+        const { entry } = dragging;
+        const dropped = event.dataTransfer.getData(kitPartDragType);
+        clearDrag();
+        if (dropped === entry.id) changeKit(entry, add);
+      };
+    }
+
     function drawChosen() {
       count.textContent = `Выбрано: ${chosen.size}`;
       if (!kit) return;
+      quantities.clear();
       selected.replaceChildren();
       for (const [id, quantity] of chosen) {
         const entry = find(id) ?? { id, name: "Недоступная деталь", kind: "part" };
-        const row = el("div", itemText(entry), "workplace-pick-row registry-picked-row");
-        const remove = button("Убрать", () => {
-          chosen.delete(id);
-          drawChosen();
-          drawMatches().get(id)?.focus({ preventScroll: true });
-          if (!browser.contains(document.activeElement)) search.focus({ preventScroll: true });
-        });
+        const row = kitNode(entry, false);
+        const amount = amountInput(entry, quantity);
+        quantities.set(id, amount);
+        const remove = button("Убрать", () => changeKit(entry, false, true));
+        remove.classList.add("registry-node-action");
         remove.setAttribute("aria-label", `Убрать ${entry.name} из комплекта`);
-        row.append(amountInput(entry, quantity), remove);
+        row.append(amount, remove);
         selected.append(row);
       }
-      if (!selected.children.length) selected.append(el("p", "Детали ещё не выбраны.", "workplace-empty"));
+      if (!selected.children.length) {
+        selected.append(el("div", el("strong", "Перетащите сюда детали из каталога"), "registry-kit-empty"));
+      }
     }
+
     function drawMatches() {
       const needle = search.value.trim().toLocaleLowerCase();
-      const toggles = new Map();
+      catalogNodes.clear();
       results.replaceChildren();
       for (const entry of choices) {
         if (!inFolder(entry) || !pathOf(entry).toLocaleLowerCase().includes(needle)) continue;
-        const row = el("label", "", `workplace-pick-row${kit ? " registry-kit-choice" : ""}`);
+        if (kit) {
+          const node = kitNode(entry, true);
+          const add = button("Добавить", () => changeKit(entry, true, true));
+          add.classList.add("registry-node-action");
+          add.setAttribute("aria-label", `Добавить ${entry.name} в комплект`);
+          const state = el("span", "В комплекте", "registry-node-state");
+          node.append(add, state);
+          catalogNodes.set(entry.id, { node, add, state });
+          syncCatalogNode(entry.id);
+          results.append(node);
+          continue;
+        }
+        const row = el("label", "", "workplace-pick-row");
         const toggle = input("checkbox", "", { checked: chosen.has(entry.id) });
-        const amount = kit ? null : amountInput(entry, chosen.get(entry.id) ?? 1, !toggle.checked);
+        const amount = amountInput(entry, chosen.get(entry.id) ?? 1, !toggle.checked);
         toggle.onchange = () => {
-          if (amount) amount.disabled = !toggle.checked;
-          if (toggle.checked) chosen.set(entry.id, amount?.valueAsNumber ?? 1);
+          amount.disabled = !toggle.checked;
+          if (toggle.checked) chosen.set(entry.id, amount.valueAsNumber);
           else chosen.delete(entry.id);
           drawChosen();
         };
-        row.append(toggle, itemText(entry));
-        if (amount) row.append(amount);
+        row.append(toggle, itemText(entry), amount);
         results.append(row);
-        toggles.set(entry.id, toggle);
       }
       if (!results.children.length) results.append(el("p", "Подходящих записей нет.", "workplace-empty"));
-      return toggles;
     }
     search.oninput = drawMatches;
     directory.onchange = drawMatches;
-    if (kit) browser.append(el("h3", "Добавить детали"));
+    if (kit) {
+      browser.setAttribute("role", "region");
+      browser.setAttribute("aria-label", "Каталог деталей");
+      results.setAttribute("role", "list");
+      browser.append(el("h3", "Каталог деталей"),
+        el("p", "Перетащите карточку в комплект или нажмите «Добавить».", "registry-kit-hint"));
+    }
     browser.append(field("Фильтр по папке", directory), field("Поиск по реестру", search), results);
     section.append(browser);
     if (kit) {
-      const composition = el("section", el("h3", "Детали в комплекте"), "registry-picked");
+      composition.setAttribute("aria-label", "Детали в комплекте");
+      selected.setAttribute("role", "list");
+      notice.setAttribute("role", "status");
       composition.append(count, selected);
-      section.append(composition);
+      section.append(composition, notice);
+      enableKitDrop(browser, false);
+      enableKitDrop(composition, true);
     } else section.append(count);
     drawMatches();
     drawChosen();
@@ -311,7 +414,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     fields.append(field("Название", name), field(kind === "folder" ? "Родительская папка" : "Папка записи", parent));
     if (kind === "folder") fields.append(field("Обозначить как изделие", model));
     if (picker) fields.append(picker.section);
-    if (old && kind !== "drawing") {
+    if (old) {
       const actions = el("div", "", "registry-property-actions");
       const remove = button("Удалить", execute(async () => {
         if (modal.querySelector('[type="submit"]').disabled) return;
@@ -534,11 +637,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         if (["part", "drawing"].includes(entry.kind)) tools.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id })))));
         if (entry.kind === "kit") tools.append(button("Раскладка комплекта", execute(() => kitLayoutDialog(entry)), { primary: true }));
         tools.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id })))));
-        if (entry.kind !== "drawing") {
-          const remove = button("Удалить", execute(() => deleteRegistryEntry(entry)));
-          remove.classList.add("registry-delete");
-          tools.append(button("Переместить", () => moveRegistryEntry(entry)), remove);
-        }
+        const remove = button("Удалить", execute(() => deleteRegistryEntry(entry)));
+        remove.classList.add("registry-delete");
+        tools.append(button("Переместить", () => moveRegistryEntry(entry)), remove);
         row.append(identity, tools);
         table.append(row);
       }
