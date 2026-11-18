@@ -297,6 +297,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(move["coordinateMove"], {"state": "moving", "x": 2004.8, "y": 53.64})
         self.assertEqual(self.commands(), [b"cmd(1036,200480,5364)\0"])
 
+    def test_coordinate_move_accepts_stable_readback_within_tolerance_even_if_job_index_is_busy(self):
+        reached = b"(0,0,1,0,0,48)\0"
+        near_target = b"(239999,2001,0,-26997,0)\0"
+        outside_tolerance = b"(239996,2001,0,-26997,0)\0"
+        busy = b"machine is busy\0"
+        self.replies(STATUS, START, JOB)
+        with patch("controller.monotonic", return_value=100.0) as clock, patch("controller.sleep"):
+            token = self.controller.control_session("arm", ready=True)["controlToken"]
+            self.replies(STATUS, START, START)
+            self.controller.move_x(2400, control_token=token)
+            for seconds, pose, expected in ((1, near_target, "moving"), (2, outside_tolerance, "moving"),
+                                            (3, near_target, "moving"), (4, near_target, "reached")):
+                clock.return_value = 100.0 + seconds
+                self.replies(reached, pose, busy)
+                live = self.controller.read_live()
+                self.assertEqual(live["coordinateMove"]["state"], expected)
+                self.assertEqual(live["busy"], pose == outside_tolerance)
+            self.controller.require_coordinate_move_idle()
+        self.assertEqual(self.commands(), [b"cmd(1036,240000,2000)\0"])
+
     def test_coordinate_move_rejects_invalid_target_unsafe_pose_and_active_event(self):
         self.replies(STATUS, START, JOB)
         token = self.controller.control_session("arm", ready=True)["controlToken"]

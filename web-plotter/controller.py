@@ -341,8 +341,13 @@ class Controller:
             result.update(self._position_payload(pose["fields"], issue_pilot=False))
         job = self._job_index_payload(self._query(client, b"idx\x00", JOB_INDEX_REPLY, "индекса задания"))
         if job["busy"]:
-            result.update(busy=True, message=job["message"])
-            return None, None
+            move = self._coordinate_move
+            # The job index can be unavailable after a standalone coordinate move.
+            if (move is None or sample is None or self._run.blocks_machine or self._job_receipt is not None
+                    or event in ACTIVE_CONTROLLER_EVENTS or event in FAULT_EVENTS
+                    or not self._clearance(sample[0]) or not positions_match(sample[0][:2], move.target)):
+                result.update(busy=True, message=job["message"])
+                return None, None
         for key in ("jobLoaded", "currentIndex", "indexLimit"):
             if key in job:
                 result[key] = job[key]
@@ -407,7 +412,8 @@ class Controller:
             move.state = "unconfirmed"
             move.sample = None
             return
-        if busy or sample is None or tuple(sample[0][:2]) != move.target or not self._clearance(sample[0]):
+        if (busy or sample is None or not positions_match(sample[0][:2], move.target)
+                or not self._clearance(sample[0])):
             move.sample = None
             return
         if move.sample and positions_match(move.sample[0], sample[0]):

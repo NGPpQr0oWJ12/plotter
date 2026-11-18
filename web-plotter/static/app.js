@@ -35,6 +35,7 @@ const focused = () => document.visibilityState === "visible" && document.hasFocu
 const demoSwitch = $("demo-switch");
 const newCutDialog = $("new-cut-dialog");
 const rollResetDialog = $("roll-reset-dialog");
+const moveToDialog = $("move-to-dialog");
 
 let demoMode = readStoredBoolean("plotter.demoMode");
 const companionAddress = "http://127.0.0.1:8767";
@@ -3028,6 +3029,8 @@ function operationAllowed(action, allowPending = false) {
   if (!live.responded || live.busy) return false;
   if (!live.positionFresh && action !== "home") return false;
   if (live.operations[action] === false) return false;
+  if (action === "move-to") return machine.coordinateMove === true && live.operations[action] === true
+    && !live.stopAvailable && activeRun?.followupFeedPending !== true && !switchingMachineMode && !appUpdateInProgress();
   if (action !== "cut") return true;
   return Boolean(!cutWidthPending() && !jobError && !drawingLocked() && !cutPlacementPreviewActive() && !simulation.active
     && currentUpload && cutPlan?.planId === currentUpload.planId && $("job-verified").checked);
@@ -3085,28 +3088,17 @@ function waitingForAutomaticAdvance() {
     && controllerRoll.planId === cutPlan?.planId && !controllerRoll.materialAdvanced;
 }
 
-function rollHeadPositioningState(roll = controllerRoll) {
-  if (!demoMode && machine.rollHeadPositioning === true && roll?.state === "advance") {
-    return roll.headPositioning ?? "pending";
-  }
-  return null;
-}
-
-function rollAdvanceAllowed() {
-  if (waitingForAutomaticAdvance()) return uploadAllowed({ forAdvance: true });
-  const state = rollHeadPositioningState();
-  return ["pending", "unconfirmed", "reached"].includes(state) && controllerRoll.planId === cutPlan?.planId
+function automaticRollPositioningAllowed() {
+  return !demoMode && machine.rollHeadPositioning === true && controllerRoll?.state === "advance"
+    && (controllerRoll.headPositioning ?? "pending") === "pending" && !rollPositioningAttempted
+    && controllerRoll.planId === cutPlan?.planId
     && !layoutPreparation() && !cutWidthPending() && !drawingLocked() && !cutPlacementPreviewActive()
-    && !simulation.active && !currentUpload && controlActive() && !busy() && !runInProgress()
-    && activeRun?.state !== "transferring" && activeRun?.followupFeedPending !== true
-    && !live.stopAvailable && !stopNeedsVerification && !coordinateMoveBlocksControl()
-    && live.responded && !live.busy && live.positionFresh;
+    && !simulation.active && !currentUpload && !busy() && operationAllowed("move-to");
 }
 
 function uploadAllowed({ forAdvance = false } = {}) {
   if (layoutPreparation() || layoutReadOnly()) return false;
-  const headPositioning = rollHeadPositioningState();
-  if (!forAdvance && (waitingForAutomaticAdvance() || (headPositioning && headPositioning !== "reached"))) return false;
+  if (waitingForAutomaticAdvance() && !forAdvance) return false;
   const autoRunOff = machine.autoRunReadback === true ? live.autoRunOff === true
     : needsManualAutoRunConfirmation() && live.autoRunOff !== false && $("manual-auto-run-off").checked;
   return machine.verifiedJobUpload === true && controlActive() && autoRunOff
@@ -3216,6 +3208,9 @@ function renderControls() {
     updateAttribute(button, "aria-pressed", String(held));
     updateControl(button, "disabled", !held && (!armed || locked || runInProgress() || activeRun?.state === "transferring" || !live.responded || live.busy || !available));
   }
+  const canMoveTo = operationAllowed("move-to");
+  updateControl($("move-to-button"), "disabled", !canMoveTo);
+  updateControl($("move-to-submit"), "disabled", !canMoveTo);
   const pause = $("pause-button");
   const stop = $("cancel-button");
   updateAttribute(pause, "data-operation", activeRun?.state === "paused" ? "resume-cut" : "pause-cut");
@@ -3249,8 +3244,6 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   renderPagePicker(displayedPlan, roll, importing || partMoving || !cutPlan || locked || Boolean(currentUpload));
   const directRoll = cutPlan?.mode === "roll" && cutPlan.canUpload && machine.directRoll === true;
   const waitingForAdvance = roll?.state === "advance";
-  const headPositioning = rollHeadPositioningState(roll);
-  const headMoving = headPositioning === "moving" || Boolean(headPositioning && pendingCommand === "advance-roll");
   const visibleUploadPage = uploadPageNumber(displayedPlan);
   const manualAutoRun = Boolean(visibleUploadPage && !currentUpload && !jobActive && needsManualAutoRunConfirmation());
   const canResetRoll = Boolean(controllerRoll && ["completed", "cancelled", "unknown", "ready", "advance"].includes(controllerRoll.state));
@@ -3269,16 +3262,12 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateText(uploadButton.querySelector("span"), transferring ? "Загрузка…" : "Старт");
   const canDownloadXiao = !widthPending && !jobError && cutPlan?.canPrepareXiao === true;
   const useXiao = canDownloadXiao && !currentUpload && !cutPlan.canUpload;
-  const demoAdvance = waitingForAutomaticAdvance();
-  const showAdvance = !widthPending && (demoAdvance || Boolean(headPositioning))
-    && !jobActive && !layoutPreparation() && !layoutReadOnly();
+  const showAdvance = !widthPending && waitingForAutomaticAdvance() && !jobActive && !layoutPreparation() && !layoutReadOnly();
   updateControl(advanceButton, "hidden", !showAdvance);
-  updateControl(advanceButton, "disabled", !showAdvance || !rollAdvanceAllowed());
-  updateText(advanceButton, headMoving ? "Позиционируем головку…" : demoAdvance
-    ? pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход"
-    : "Подтянуть ткань");
+  updateControl(advanceButton, "disabled", !showAdvance || !uploadAllowed({ forAdvance: true }));
+  updateText(advanceButton, pendingCommand === "advance-roll" ? "Подтягиваем полотно…" : "Подтянуть следующий проход");
   updateControl(uploadButton, "hidden", (!visibleUploadPage && !currentUpload && !transferring)
-    || (showAdvance && demoAdvance) || jobActive || ["cut", "new-cut"].includes(pendingCommand));
+    || showAdvance || jobActive || ["cut", "new-cut"].includes(pendingCommand));
   updateControl($("job-prepare-actions"), "hidden", uploadButton.hidden && advanceButton.hidden);
   const xiaoOpen = $("prepare-xiao-open");
   const xiaoDownload = $("prepare-xiao-download");
@@ -3298,8 +3287,6 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (stopPending) status = "Отправляем команду остановки…";
   else if (pendingCommand === "cut") status = "Запускаем раскрой…";
   else if (transferring) status = "Передача чертежа…";
-  else if (headMoving) status = `Позиционируем головку для протяжки ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
-  else if (headPositioning === "unconfirmed") status = `Положение головки для протяжки ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм не подтверждено.`;
   else if (inProgress) status = runLabels[live.externalMotion || activeRun?.state] || "Проверьте штатный пульт";
   else if (stopNeedsVerification) status = "Ожидаем подтверждение остановки";
   else if (widthPending && includedBounds) status = "Укажите ширину полотна и выполните автораскладку всех деталей.";
@@ -3313,12 +3300,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   else if (roll?.state === "completed") status = `Раскрой завершён · ${roll.completedPages} из ${roll.pages - (roll.firstPage ?? 1) + 1} проходов`;
   else if (cutProgress?.state === "completed" && cutProgress.planId === cutPlan.planId) status = "Раскрой завершён";
   else if (roll?.state === "cancelled" || roll?.state === "unknown") status = `Сверьте проход ${roll.page} и положение ткани перед продолжением.`;
-  else if (headPositioning === "pending") {
-    const action = rollPositioningAttempted ? "Нажмите «Подтянуть ткань», чтобы повторить позиционирование головки." : "Готовим головку.";
-    status = `Проход ${roll.page} завершён. Протяжка ткани на ${formatFeedDistance.format(roll.feedAfterMm)} мм. ${action}`;
-  }
-  else if (headPositioning === "reached") status = `Отпустите лапки, протяните ткань на ${formatFeedDistance.format(roll.feedAfterMm)} мм, совместите начало прохода ${roll.nextPage} с X = 0 и закрепите ткань. Затем нажмите «Старт».`;
-  else if (waitingForAdvance && showAdvance && demoAdvance) status = `Проход ${roll.page} завершён. Протяжка на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
+  else if (waitingForAdvance && showAdvance) status = `Проход ${roll.page} завершён. Протяжка на ${formatFeedDistance.format(roll.feedAfterMm)} мм.`;
   else if (waitingForAdvance && roll.materialAdvanced) status = `Полотно подтянуто. Проход ${roll.nextPage} готов к запуску.`;
   else if (waitingForAdvance) status = `Проход ${roll.page} завершён. Следующий проход — ${roll.nextPage}.`;
   else if (useXiao && cutPlan.uploadIssue) status = cutPlan.uploadIssue;
@@ -3541,9 +3523,7 @@ async function readLive() {
     else if (runInProgress()) delay = 500;
     if (!busy()) scheduleLiveRead(immediate ? 0 : delay);
   }
-  if (observed && rollHeadPositioningState() === "pending" && !rollPositioningAttempted) {
-    void advanceControllerRoll({ automatic: true });
-  }
+  if (observed && automaticRollPositioningAllowed()) void advanceControllerRoll({ automatic: true });
 }
 
 function applyPosition(response) {
@@ -3572,6 +3552,7 @@ function disarmControl(message = "") {
   const token = control?.token;
   control = null;
   closeUploadConfirmation();
+  if (moveToDialog.open) moveToDialog.close();
   clearCurrentUpload();
   if (token) void sendDisarm(token);
   if (token) setMachineError(message);
@@ -3768,7 +3749,7 @@ function rememberRunStatistics(run, plan) {
   } catch { /* Session storage is optional. */ }
 }
 
-async function runControllerOperation(action) {
+async function runControllerOperation(action, target) {
   if (!operationAllowed(action)) return;
   if (action === "cancel-cut") {
     await stopControllerCut();
@@ -3788,11 +3769,14 @@ async function runControllerOperation(action) {
   }
   if (action === "range" && managedCut) payload.cutId = managedCut.id;
   if (action === "acknowledge-run") payload.jobVerified = true;
+  if (action === "move-to") {
+    payload.x = target.x;
+    payload.y = target.y;
+  }
   setPending(action);
   try {
-    // Let an existing read release the UDP channel before these commands.
     // Stop/pause commands must never wait behind polling.
-    if (materialOperations.has(action)) {
+    if (materialOperations.has(action) || action === "move-to") {
       if (liveReading) await liveReading;
       if (control !== session || focusEpoch !== focus || !focused() || !operationAllowed(action, true)) {
         setMachineError("Условия управления изменились. Повторите команду на активном пульте.");
@@ -3809,7 +3793,7 @@ async function runControllerOperation(action) {
     renderVacuum();
     if (response.acknowledged || (response.sent && ["cut", "raise-clamp", "home", "set-zero"].includes(action))) clearCurrentUpload();
     renderRun();
-    if (!response.sent && !response.acknowledged) {
+    if (!response.sent && !response.acknowledged && !(action === "move-to" && coordinateMove?.state === "reached")) {
       setMachineError(response.message || "Контроллер отклонил команду.");
     }
   } catch (error) {
@@ -3858,6 +3842,26 @@ function closeUploadConfirmation() {
   if (uploadConfirmDialog.open) uploadConfirmDialog.close();
 }
 
+function openMoveToDialog() {
+  if (moveToDialog.open || !focused() || !operationAllowed("move-to")) return;
+  for (const [axis, limit] of [["x", machine.width], ["y", machine.height]]) {
+    const input = $("move-to-" + axis);
+    input.max = String(limit);
+    input.value = Number.isFinite(live.position?.[axis]) ? String(live.position[axis]) : "";
+  }
+  moveToDialog.showModal();
+}
+
+function submitMoveTo(event) {
+  event.preventDefault();
+  if (!moveToDialog.open || !focused() || !operationAllowed("move-to")) return;
+  const x = $("move-to-x").valueAsNumber;
+  const y = $("move-to-y").valueAsNumber;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > machine.width || y < 0 || y > machine.height) return;
+  moveToDialog.close();
+  void runControllerOperation("move-to", { x, y });
+}
+
 function matchesLaunchIntent(intent) {
   if (!intent || !focused() || focusEpoch !== intent.focus || stopRevision !== intent.stopRevision
       || control?.token !== intent.token || cutPlan?.planId !== intent.planId) return false;
@@ -3886,14 +3890,12 @@ function requestControllerLaunch() {
   $("upload-confirm-auto-run").hidden = !intent.checkAutoRun;
   $("upload-confirm-zero").hidden = !intent.checkZero;
   const target = demoMode ? "виртуального станка" : "станка";
-  const feed = controllerRoll?.state === "advance" ? controllerRoll.feedAfterMm ?? cutPlan.pages[page - 2]?.feedAfterMm : null;
+  const feed = controllerRoll?.state === "advance" ? cutPlan.pages[page - 2]?.feedAfterMm : null;
   const showFeed = intent.checkZero && Number.isFinite(feed) && feed > 0;
   $("upload-confirm-feed").hidden = !showFeed;
   if (showFeed) {
-    const distance = formatFeedDistance.format(feed);
-    const feedAction = demoMode ? `Имитируйте протяжку полотна на ${distance} мм.` : rollHeadPositioningState() === "reached"
-      ? `Убедитесь, что ткань протянута на ${distance} мм и закреплена.` : `Протяните полотно на ${distance} мм.`;
-    $("upload-confirm-feed-text").textContent = feedAction;
+    const feedAction = demoMode ? "Имитируйте протяжку полотна на" : "Протяните полотно на";
+    $("upload-confirm-feed-text").textContent = `${feedAction} ${formatFeedDistance.format(feed)} мм.`;
   }
   $("upload-confirm-zero-text").textContent = `Совместите начало прохода ${page} с нулём ${target}.`;
   $("upload-confirm-seam").hidden = !intent.checkZero || !cutPlan.pages[page - 1]?.incomingSeams?.length;
@@ -3961,10 +3963,9 @@ async function uploadControllerDrawing(intent) {
 }
 
 async function advanceControllerRoll({ automatic = false } = {}) {
-  if (!focused() || !rollAdvanceAllowed()) return;
-  const headPositioning = rollHeadPositioningState();
-  if (automatic && (headPositioning !== "pending" || rollPositioningAttempted)) return;
-  if (headPositioning) rollPositioningAttempted = true;
+  if (!focused() || !(automatic ? automaticRollPositioningAllowed()
+    : waitingForAutomaticAdvance() && uploadAllowed({ forAdvance: true }))) return;
+  if (automatic) rollPositioningAttempted = true;
   const { planId, nextPage: page } = controllerRoll;
   const payload = { action: "advance-roll", planId, page, controlToken: control.token,
     ...(managedCut ? { cutId: managedCut.id } : {}), ...(automatic ? { automatic: true } : {}) };
@@ -3972,13 +3973,12 @@ async function advanceControllerRoll({ automatic = false } = {}) {
   try {
     const result = await getJson("/api/controller-operation", jsonRequest(payload, AbortSignal.timeout(8000)));
     const matching = result.roll?.planId === planId && result.roll.nextPage === page;
-    if (matching && headPositioning) applyPosition(result);
-    const confirmed = headPositioning ? ["moving", "reached"].includes(result.roll?.headPositioning)
-      : result.roll?.materialAdvanced === true;
-    if (!matching || !confirmed) {
-      throw new Error(headPositioning ? "Позиционирование головки не подтверждено." : "Протяжка не подтверждена.");
+    if (automatic) {
+      if (matching) applyPosition(result);
+    } else {
+      if (!matching || result.roll.materialAdvanced !== true) throw new Error("Протяжка не подтверждена.");
+      applyJobStatus(result);
     }
-    if (!headPositioning) applyJobStatus(result);
   } catch (error) {
     setMachineError(messageFrom(error));
   } finally {
@@ -4356,6 +4356,9 @@ rollResetDialog.addEventListener("close", () => {
 });
 $("controller-upload-button").addEventListener("click", requestControllerLaunch);
 $("roll-advance-button").addEventListener("click", () => void advanceControllerRoll());
+$("move-to-button").addEventListener("click", openMoveToDialog);
+$("move-to-form").addEventListener("submit", submitMoveTo);
+$("move-to-cancel").addEventListener("click", () => moveToDialog.close());
 $("upload-confirm-cancel").addEventListener("click", closeUploadConfirmation);
 uploadConfirmDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
@@ -4420,6 +4423,7 @@ function loseFocus() {
   focusEpoch++;
   liveEpoch++;
   closeUploadConfirmation();
+  if (moveToDialog.open) moveToDialog.close();
   if (rollResetDialog.open) rollResetDialog.close("cancel");
   live.positionFresh = false;
   interruptControllerHold();

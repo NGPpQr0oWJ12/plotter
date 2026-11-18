@@ -694,7 +694,7 @@ class ServerFlowTests(unittest.TestCase):
         self.request("/api/controller-operation", {"action": "advance-roll", "page": 2}, HTTPStatus.CONFLICT)
         self.assertEqual(self.controller.mock_calls, [])
 
-    def test_roll_head_positions_at_exact_continuation_boundary_once_and_waits_for_arrival(self):
+    def test_roll_head_positions_once_and_next_pass_uses_controller_motion_check(self):
         workspace = drawing()
         workspace["paths"] = [
             {"layer": "Крой", "closed": True, "points": [[40, 50], [3100, 50], [3100, 70], [40, 70]]},
@@ -724,20 +724,20 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual((moving["roll"]["headPositioning"], moving["feedMm"]), ("moving", 2004.8))
         self.assertEqual(self.request("/api/controller-operation", command)["roll"]["headPositioning"], "moving")
         self.controller.move_x.assert_called_once_with(2004.8, control_token="control")
-        self.upload(plan, HTTPStatus.CONFLICT, page=2, advanceConfirmed=True)
+        self.controller.require_coordinate_move_idle.side_effect = ControllerError("Есть незавершённое перемещение.")
+        self.upload(plan, HTTPStatus.BAD_REQUEST, page=2, advanceConfirmed=True)
 
         report["coordinateMove"] = {**moving["coordinateMove"], "state": "unconfirmed"}
         self.assertEqual(self.request("/api/controller-live", {})["roll"]["headPositioning"], "unconfirmed")
         self.assertEqual(self.request("/api/controller-operation", command)["roll"]["headPositioning"], "unconfirmed")
-        self.controller.move_x.assert_called_once()
-        self.request("/api/controller-operation", {**command, "automatic": False})
-        report["coordinateMove"]["state"] = "reached"
-        reached = self.request("/api/controller-live", {})["roll"]
-        self.assertEqual(reached["headPositioning"], "reached")
-        self.assertFalse(reached["materialAdvanced"])
+        self.upload(plan, HTTPStatus.BAD_REQUEST, page=2, advanceConfirmed=True)
+
+        # The controller clears its motion block after the operator verifies a stop.
+        self.controller.require_coordinate_move_idle.side_effect = None
+        report["coordinateMove"] = None
         self.upload(plan, HTTPStatus.BAD_REQUEST, page=2)
         self.assertEqual(self.upload(plan, page=2, advanceConfirmed=True)["roll"]["page"], 2)
-        self.assertEqual(self.controller.move_x.call_count, 2)
+        self.controller.move_x.assert_called_once()
         self.controller.advance_material.assert_not_called()
 
     def test_demo_disallows_xiao_handoff_and_keeps_real_status(self):

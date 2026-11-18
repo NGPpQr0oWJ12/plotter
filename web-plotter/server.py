@@ -983,9 +983,6 @@ class PlotterState:
             if previous and previous.state == "advance":
                 if not advance_confirmed:
                     raise RequestError("Подтвердите протяжку ткани и положение рабочего нуля.")
-                if not self.demo_mode and previous.head_positioning != "reached":
-                    raise RequestError("Сначала дождитесь, пока головка встанет на границу следующего прохода.",
-                                       HTTPStatus.CONFLICT)
                 self.verify_roll_advance()
             elif previous:
                 self.verify_ready_roll()

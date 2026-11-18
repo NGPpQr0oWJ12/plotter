@@ -164,7 +164,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .jog.left { grid-area:2 / 1; }
 .jog.right { grid-area:2 / 3; }
 .jog.down { grid-area:3 / 2; }
-.jog-origin { grid-area:2 / 2; place-self:center; display:grid; place-items:center; width:28px; height:28px; border:1px solid #d2d2d2; border-radius:50%; background:#fff; color:#454545; pointer-events:none; }
+.jog-origin { grid-area:2 / 2; place-self:center; width:28px; min-height:28px; padding:0; border-color:#d2d2d2; border-radius:50%; color:#454545; }
 .jog-origin .icon { width:18px; height:18px; }
 .motion-controls .button:focus-visible { outline-color:#242424; outline-offset:2px; }
 .motion-controls .jog {
