@@ -13,6 +13,7 @@ from contour_packing import MAX_PARTS as MAX_CONTOUR_PARTS, ROUNDING_ALLOWANCE_M
 from cut_plan import roll_page_boundaries
 from machine import PlotterError, number
 from rect_packing import MAX_PARTITION_PARTS, max_rects_layout, partition_layout
+from workspace import part_path_labels
 from xiao_job import COORDINATE_OFFSET_MM
 
 
@@ -98,6 +99,8 @@ class Path:
     part_rotation: str | None
     part_angle: float
     notch: bool
+    part_name: str | None
+    product_name: str | None
 
 
 @dataclass(frozen=True)
@@ -140,7 +143,12 @@ def _paths(value):
         if len(set(vertices)) < (3 if closed else 2):
             raise PlotterError(f"Контур {index}: недостаточно различных точек.")
         notch = not closed and path.get("notch", layer.strip().casefold() in NOTCH_LAYER_WORDS)
-        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle, notch))
+        try:
+            labels = part_path_labels(path)
+        except ValueError as error:
+            raise PlotterError(f"Контур {index}: {error}") from error
+        paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle, notch,
+                          labels.get("partName"), labels.get("productName")))
     return paths
 
 
@@ -1359,6 +1367,10 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm, 
             points = [[base_x + u, base_y + v] for u, v in _project(relative, cosine, sine)]
             result[member] = {"points": points, "closed": path.closed, "layer": path.layer,
                               "notch": member in notches, "partAngle": (path.part_angle + angle) % 360, **metadata}
+            if path.part_name:
+                result[member]["partName"] = path.part_name
+            if path.product_name:
+                result[member]["productName"] = path.product_name
     if end_x + margin > MAX_ABS_COORDINATE_MM:
         raise PlotterError("Раскладка слишком длинная. Разбейте работу на несколько чертежей.")
     return {

@@ -13,6 +13,16 @@ function registryIcon(kind) {
     part: "M4 7l4-3h9l3 4v12H4ZM4 14h3m10 0h3",
     kit: "m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5",
     chevron: "m9 6 6 6-6 6",
+    open: "M3 18V6a2 2 0 0 1 2-2h4l2 3h7a2 2 0 0 1 2 2m-17 9 3-8h15l-3 9H5a2 2 0 0 1-2-1Z",
+    view: "M2.5 12c2.1-3.6 5.4-6 9.5-6s7.4 2.4 9.5 6c-2.1 3.6-5.4 6-9.5 6s-7.4-2.4-9.5-6Zm12 0a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z",
+    edit: "m4 16-.7 4.7 4.7-.7L20 8l-4-4Zm9.5-9.5 4 4",
+    properties: "M4 6h3m4 0h9M4 12h9m4 0h3M4 18h3m4 0h9M7 4h4v4H7Zm6 6h4v4h-4Zm-6 6h4v4H7Z",
+    move: "M3 9V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4m3 0h10m-3-3 3 3-3 3",
+    trash: "M4 6h16M9 6V4h6v2M6 6l1 14h10l1-14m-8 4v6m4-6v6",
+    layout: "M3 3h18v18H3Zm3 3h6v5H6Zm0 8h6v4H6Zm9-8h3v12h-3Z",
+    sewing: "M4 3h10l5 5v13H4Zm10 0v5h5m-12 4h9m-9 4h2m2 0h2m2 0h1",
+    zoom: "M16 10a6 6 0 1 1-12 0 6 6 0 0 1 12 0Zm-2 4 5 5m-12-9h6m-3-3v6",
+    close: "m6 6 12 12M18 6 6 18",
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("icon", "registry-icon");
@@ -31,8 +41,14 @@ function el(tag, content = "", className = "") {
   return node;
 }
 
-function button(title, action, { primary = false, disabled = false } = {}) {
-  const node = el("button", title, `button${primary ? " primary" : ""}`);
+function button(title, action, { primary = false, disabled = false, icon, iconOnly = false } = {}) {
+  const node = el("button", iconOnly ? "" : title, `button${primary ? " primary" : ""}`);
+  if (icon) node.prepend(registryIcon(icon));
+  if (iconOnly) {
+    node.classList.add("workplace-icon-action");
+    node.setAttribute("aria-label", title);
+    node.title = title;
+  }
   node.type = "button";
   node.disabled = disabled;
   node.addEventListener("click", action);
@@ -59,6 +75,31 @@ function select(options, selected) {
   return node;
 }
 
+function drawPartOutline(canvas, paths) {
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  let left = Infinity, bottom = Infinity, right = -Infinity, top = -Infinity;
+  for (const path of paths) {
+    for (const [x, y] of path.points) {
+      left = Math.min(x, left); right = Math.max(x, right);
+      bottom = Math.min(y, bottom); top = Math.max(y, top);
+    }
+  }
+  if (!Number.isFinite(left)) return null;
+  const scale = Math.min((canvas.width - 16) / (right - left || 1), (canvas.height - 16) / (top - bottom || 1));
+  const centerX = (left + right) / 2, centerY = (bottom + top) / 2;
+  const project = ([x, y]) => [canvas.width / 2 + (x - centerX) * scale, canvas.height / 2 - (y - centerY) * scale];
+  for (const path of paths) {
+    context.beginPath();
+    path.points.forEach((point, index) => context[index ? "lineTo" : "moveTo"](...project(point)));
+    if (path.closed) context.closePath();
+    context.strokeStyle = path.notch ? "#284994" : "#17252d";
+    context.stroke();
+  }
+  return project;
+}
+
 function progressPercent(done, total) {
   return total ? Math.floor(done * 100 / total) : 0;
 }
@@ -75,8 +116,13 @@ function orderDates(order) {
   return dates;
 }
 
+function orderProduct(order) {
+  return order?.designation || order?.modelName || "";
+}
+
 function orderContext(order) {
-  return order.modelName ? `${order.modelName} · ${order.quantity} шт.` : "";
+  const product = orderProduct(order);
+  return product ? `${product} · ${order.quantity} шт.` : "";
 }
 
 const ROLE_STORAGE_KEY = "plotter.workplace";
@@ -92,10 +138,11 @@ function storedFolders() {
   }
 }
 
-export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, openFile,
+export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, openFile, flushLayout,
   getActiveCut, onExit, layoutWidths }) {
   const page = $("workplace-page");
   const dock = $("workplace-dock");
+  const xiaoActions = $("xiao-handoff");
   const picker = $("role-picker");
   const pickerStatus = $("role-picker-status");
   const topbar = $("workplace-topbar");
@@ -109,6 +156,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   modal.setAttribute("aria-labelledby", "workplace-dialog-title");
   document.body.append(modal);
   let entries = [];
+  let sketchupDesign = false;
   let entriesById = new Map();
   const expandedFolders = storedFolders();
   let tab = null;
@@ -160,7 +208,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   }
 
   async function refreshRegistry() {
-    entries = (await get("/api/registry")).entries;
+    const registry = await get("/api/registry");
+    entries = registry.entries;
+    sketchupDesign = registry.sketchupDesign === true;
     entriesById = new Map(entries.map(entry => [entry.id, entry]));
     if (selectedFolder && !find(selectedFolder)) selectedFolder = null;
   }
@@ -183,7 +233,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     };
   }
 
-  function formDialog(title, content, submit, save) {
+  function formDialog(title, content, submit, save, { lockWhileSaving = false } = {}) {
     const heading = el("h2", title);
     heading.id = "workplace-dialog-title";
     const header = el("header", heading, "drawing-dialog-heading");
@@ -192,7 +242,8 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const error = el("p", "", "workplace-dialog-error");
     error.setAttribute("role", "alert");
     body.append(error);
-    const footer = el("footer", button("Отмена", () => modal.close()), "dialog-actions");
+    const cancel = button("Отмена", () => modal.close());
+    const footer = el("footer", cancel, "dialog-actions");
     const action = el("button", submit, "button primary");
     action.type = "submit";
     footer.append(action);
@@ -202,11 +253,22 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       if (action.disabled) return;
       error.textContent = "";
       action.disabled = true;
+      const preventCancel = event => event.preventDefault();
+      if (lockWhileSaving) {
+        cancel.disabled = true;
+        modal.addEventListener("cancel", preventCancel);
+      }
       try {
         await save();
         if (modal.contains(form)) modal.close("saved");
       } catch (failure) { error.textContent = failure.message; }
-      finally { action.disabled = false; }
+      finally {
+        action.disabled = false;
+        if (lockWhileSaving) {
+          cancel.disabled = false;
+          modal.removeEventListener("cancel", preventCancel);
+        }
+      }
     };
     modal.replaceChildren(header, form);
     modal.returnValue = "";
@@ -222,7 +284,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     return heading;
   }
 
-  function itemPicker(kinds, previous = [], { mode = "list" } = {}) {
+  function itemPicker(kinds, previous = [], { mode = "list", folder = null } = {}) {
     const cards = mode !== "list";
     const fabric = mode === "fabric";
     const catalogLabel = fabric ? "Детали и комплекты" : "Каталог деталей";
@@ -241,9 +303,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const quantities = new Map();
     let dragging = null;
     const choices = entries.filter(entry => kinds.includes(entry.kind));
-    const directory = folderSelect("");
-    directory.options[0].textContent = "Все папки";
-    const inFolder = (entry) => !directory.value || trailOf(find(entry.parent)).some(parent => parent.id === directory.value);
+    const directory = folderSelect(folder);
+    if (mode === "kit") {
+      directory.options[0].value = "root";
+      directory.add(new Option("Все папки", ""), 0);
+      directory.value = folder || "root";
+    } else directory.options[0].textContent = "Все папки";
+    const inFolder = (entry) => directory.value === "root" ? entry.parent == null
+      : !directory.value || trailOf(find(entry.parent)).some(parent => parent.id === directory.value);
     function itemText(entry) {
       const text = el("span", el("strong", entry.name), cards ? "registry-node-text" : "");
       const path = pathOf(find(entry.parent));
@@ -292,6 +359,13 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       return node;
     }
 
+    function kitTools(entry, ...buttons) {
+      const tools = el("div", "", "registry-node-tools");
+      if (!fabric && entry.kind === "part" && entry.revision != null) tools.append(partViewButton(entry));
+      tools.append(...buttons);
+      return tools;
+    }
+
     function syncCatalogNode(id) {
       const card = catalogNodes.get(id);
       if (!card) return;
@@ -304,7 +378,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
     function changeKit(entry, add, restoreFocus = false) {
       if (chosen.has(entry.id) === add) return;
-      if (add) chosen.set(entry.id, 1);
+      if (add) chosen.set(entry.id, entry.patternQuantity || 1);
       else chosen.delete(entry.id);
       syncCatalogNode(entry.id);
       drawChosen();
@@ -349,7 +423,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         const remove = button("Убрать", () => changeKit(entry, false, true));
         remove.classList.add("registry-node-action");
         remove.setAttribute("aria-label", `Убрать ${entry.name} ${fabric ? "из состава ткани" : "из комплекта"}`);
-        row.append(amount, remove);
+        row.append(amount, kitTools(entry, remove));
         selected.append(row);
       }
       if (!selected.children.length) {
@@ -370,7 +444,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           add.classList.add("registry-node-action");
           add.setAttribute("aria-label", `Добавить ${entry.name} ${destination}`);
           const state = el("span", fabric ? "В составе" : "В комплекте", "registry-node-state");
-          node.append(add, state);
+          node.append(kitTools(entry, add, state));
           catalogNodes.set(entry.id, { node, add, state });
           syncCatalogNode(entry.id);
           results.append(node);
@@ -397,7 +471,6 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       browser.setAttribute("aria-label", catalogLabel);
       results.setAttribute("role", "list");
       browser.append(el("h3", catalogLabel));
-      if (!fabric) browser.append(el("p", "Перетащите карточку в комплект или нажмите «Добавить».", "registry-kit-hint"));
     }
     browser.append(field("Фильтр по папке", directory), field("Поиск по реестру", search), results);
     section.append(browser);
@@ -412,7 +485,18 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     } else section.append(count);
     drawMatches();
     drawChosen();
-    return { section, values: () => Array.from(chosen, ([id, quantity]) => ({ id, quantity })) };
+    return {
+      section,
+      values: () => Array.from(chosen, ([id, quantity]) => ({ id, quantity })),
+      setFolder(value) {
+        const followsFolder = directory.value === (folder || "root");
+        folder = value;
+        if (followsFolder) {
+          directory.value = folder || "root";
+          drawMatches();
+        }
+      },
+    };
   }
 
   function recordDialog(kind, old, onSaved) {
@@ -420,11 +504,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     const name = input("text", old?.name ?? "", { required: true, maxLength: 255 });
     const parent = folderSelect(old ? old.parent : selectedFolder, old);
     const model = input("checkbox", "", { checked: old?.model === true });
-    const picker = kind === "kit" ? itemPicker(["part"], old?.members, { mode: "kit" }) : null;
+    const picker = kind === "kit" ? itemPicker(["part"], old?.members, { mode: "kit", folder: parent.value }) : null;
     const fields = el("div", "", "workplace-form-grid");
     fields.append(field("Название", name), field(kind === "folder" ? "Родительская папка" : "Папка записи", parent));
     if (kind === "folder") fields.append(field("Обозначить как изделие", model));
-    if (picker) fields.append(picker.section);
+    if (picker) {
+      fields.append(picker.section);
+      parent.onchange = () => picker.setFolder(parent.value);
+    }
     if (old) {
       const actions = el("div", "", "registry-property-actions");
       const remove = button("Удалить", execute(async () => {
@@ -441,7 +528,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           throw error;
         }
         restore();
-      }));
+      }), { icon: "trash", iconOnly: true });
       remove.classList.add("registry-delete");
       const move = button("Перенести в другую папку", () => {
         if (modal.querySelector('[type="submit"]').disabled) return;
@@ -451,9 +538,10 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           onMoved: (moved) => {
             record = { ...record, parent: moved.parent, revision: moved.revision };
             parent.value = record.parent ?? "";
+            picker?.setFolder(parent.value);
           },
         });
-      });
+      }, { icon: "move", iconOnly: true });
       actions.append(move, remove);
       if (picker) {
         const open = button("Раскладка комплекта", execute(async () => {
@@ -463,7 +551,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
             throw new Error("Сохраните свойства комплекта перед открытием раскладки.");
           }
           await kitLayoutDialog(record, suspendDialog(open));
-        }));
+        }), { icon: "layout", iconOnly: true });
         actions.prepend(open);
       }
       fields.append(actions);
@@ -557,6 +645,24 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     if (returnTo) modal.addEventListener("close", () => { if (modal.returnValue !== "saved") returnTo(); }, { once: true });
   }
 
+  function restoreRegistryBackup() {
+    const archive = input("file", "", { accept: ".rar,application/vnd.rar,application/x-rar-compressed", required: true });
+    const content = el("div", field("Резервная копия (.rar)", archive), "workplace-form-grid");
+    content.append(el("p", "Восстановление заменит текущий реестр содержимым архива. Перед заменой скачайте копию текущего реестра.", "workplace-form-note"));
+    formDialog("Восстановить бэкап", content, "Заменить реестр", async () => {
+      const response = await fetch("/api/registry-backup", {
+        method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: archive.files[0],
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || "Не удалось восстановить резервную копию реестра.");
+      }
+      registrySearch = "";
+      await render();
+      status.textContent = "Реестр восстановлен.";
+    }, { lockWhileSaving: true });
+  }
+
   function renderRegistry() {
     revealFolder(selectedFolder);
     const search = input("search", registrySearch, { placeholder: "Название или путь к папке" });
@@ -644,13 +750,19 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         identity.dataset.kind = entry.kind;
         identity.append(title);
         const tools = el("div", "", "registry-row-actions");
-        if (entry.kind === "folder") tools.append(button("Открыть", () => browseFolder(entry.id, true)));
-        if (["part", "drawing"].includes(entry.kind)) tools.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id })))));
-        if (entry.kind === "kit") tools.append(button("Раскладка комплекта", execute(() => kitLayoutDialog(entry)), { primary: true }));
-        tools.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id })))));
-        const remove = button("Удалить", execute(() => deleteRegistryEntry(entry)));
+        if (entry.kind === "folder") tools.append(button("Открыть", () => browseFolder(entry.id, true), { icon: "open", iconOnly: true }));
+        if (entry.kind === "part") tools.append(partViewButton(entry));
+        if (["part", "drawing"].includes(entry.kind)) {
+          tools.append(button("Редактировать", execute(async () => openCad(await get("/api/registry", { id: entry.id }))), { icon: "edit", iconOnly: true }));
+        }
+        if (entry.kind === "kit") {
+          tools.append(button("Раскладка комплекта", execute(() => kitLayoutDialog(entry)), { icon: "layout", iconOnly: true, primary: true }));
+          tools.append(button("Карта пошива", execute(() => sewingMap(entry)), { icon: "sewing", iconOnly: true }));
+        }
+        tools.append(button("Свойства", execute(async () => recordDialog(entry.kind, await get("/api/registry", { id: entry.id }))), { icon: "properties", iconOnly: true }));
+        const remove = button("Удалить", execute(() => deleteRegistryEntry(entry)), { icon: "trash", iconOnly: true });
         remove.classList.add("registry-delete");
-        tools.append(button("Переместить", () => moveRegistryEntry(entry)), remove);
+        tools.append(button("Переместить", () => moveRegistryEntry(entry), { icon: "move", iconOnly: true }), remove);
         row.append(identity, tools);
         table.append(row);
       }
@@ -658,11 +770,56 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     }
     search.oninput = () => { registrySearch = search.value; drawMatches(); };
     panel.append(workHeading("Реестр лекал", "", [
+      button("Скачать бэкап", execute(() => downloadAttachment("/api/registry-backup", "Реестр Plotter.rar", "Не удалось скачать бэкап реестра."))),
+      button("Восстановить бэкап", restoreRegistryBackup),
       button("Папка", () => recordDialog("folder", null)), button("Комплект", () => recordDialog("kit", null)),
       button("Новый чертёж", () => openCad(null), { primary: true }),
     ]), columns);
     drawTree();
     drawMatches();
+  }
+
+  function partViewButton(entry) {
+    return button("Просмотр", () => openPartDrawing(entry), { icon: "view", iconOnly: true });
+  }
+
+  function openPartDrawing(entry) {
+    const dialog = el("dialog", "", "plotter-dialog workplace-dialog registry-drawing-dialog");
+    dialog.setAttribute("aria-label", `Просмотр детали «${entry.name}»`);
+    const close = button("Закрыть", () => dialog.close(), { icon: "close", iconOnly: true });
+    close.autofocus = true;
+    const status = el("p", "Загружаем контур…", "registry-drawing-status");
+    status.setAttribute("role", "status");
+    const sheet = new Image();
+    sheet.alt = `Контур детали «${entry.name}» с габаритами, насечками и штампом`;
+    sheet.className = "registry-drawing-sheet";
+    sheet.hidden = true;
+    const body = el("div", status, "registry-drawing-body");
+    body.tabIndex = 0;
+    body.setAttribute("role", "region");
+    body.setAttribute("aria-label", "Контур и штамп детали");
+    body.append(sheet);
+    const zoom = button("Увеличить", () => {
+      const enlarged = dialog.classList.toggle("is-enlarged");
+      const label = enlarged ? "Вписать" : "Увеличить";
+      zoom.setAttribute("aria-label", label);
+      zoom.title = label;
+      body.scrollTo(0, 0);
+    }, { icon: "zoom", iconOnly: true });
+    zoom.hidden = true;
+    const actions = el("header", zoom, "registry-drawing-actions");
+    actions.append(close);
+    sheet.addEventListener("load", () => {
+      status.hidden = true;
+      sheet.hidden = false;
+      zoom.hidden = false;
+    }, { once: true });
+    sheet.addEventListener("error", () => { status.textContent = "Не удалось загрузить контур детали."; }, { once: true });
+    dialog.append(actions, body);
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    document.body.append(dialog);
+    dialog.showModal();
+    sheet.src = `/api/part-preview.svg?${new URLSearchParams({ id: entry.id })}`;
   }
 
   function openCad(document) {
@@ -677,24 +834,169 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       await render();
       focusWorkplaceHeading();
     });
-    const savePart = ({ entities }) => new Promise((resolve, reject) => {
-      const title = input("text", "", { required: true, maxLength: 255 });
+    const savePart = ({ entities, pattern, partLegend }) => new Promise((resolve, reject) => {
       const parent = folderSelect(record?.parent ?? selectedFolder);
+      const previous = () => pattern && entries.find(item => item.kind === "part" &&
+        item.patternId === pattern.id && item.parent === (parent.value || null));
+      const title = input("text", previous()?.name || (pattern ? pattern.number + " · " + pattern.name : ""),
+        { required: true, maxLength: 255 });
       const content = el("div", field("Название детали", title), "workplace-form-grid");
       content.append(field("Папка", parent));
+      const legendEnabled = input("checkbox", "", { checked: Boolean(partLegend) });
+      const developer = input("text", partLegend?.developer || "", { maxLength: 255 });
+      const comments = el("textarea");
+      comments.value = partLegend?.comments || "";
+      comments.maxLength = 2000;
+      const legendFields = el("div", "", "workplace-form-grid registry-part-legend-form");
+      legendFields.append(field("Разработчик", developer), field("Дата составления", input("text", partLegend?.date || "", { readOnly: true })),
+        field("Особые комментарии", comments));
+      legendFields.hidden = !legendEnabled.checked;
+      legendEnabled.onchange = () => { legendFields.hidden = !legendEnabled.checked; };
+      content.append(field("Добавить легенду детали", legendEnabled), legendFields);
+      const update = el("small");
+      const showUpdate = () => { update.textContent = previous() ? "Обновится сохранённая деталь в этой папке." : ""; };
+      if (pattern) {
+        content.append(update);
+        if (pattern.checkSewing) content.append(el("p", "Линия стачивания менялась в 2D. Сверьте парные кромки и насечки."));
+        parent.onchange = showUpdate;
+        showUpdate();
+      }
       modal.addEventListener("close", () => { if (modal.returnValue !== "saved") reject(new Error("Сохранение детали отменено.")); }, { once: true });
       formDialog(record?.kind === "part" ? "Сохранить как новую деталь" : "Сохранить деталь", content, "Сохранить", async () => {
-        const part = await post("/api/registry", { action: "save", kind: "part", parent: parent.value || null, name: title.value, entities });
+        const old = previous();
+        const part = await post("/api/registry", { action: "save", kind: "part", parent: parent.value || null,
+          name: title.value, entities, ...(pattern ? { pattern } : {}),
+          ...(legendEnabled.checked ? { partLegend: { developer: developer.value, comments: comments.value } } : {}),
+          ...(old ? { id: old.id, revision: old.revision } : {}) });
         await refreshRegistry();
         resolve(part);
       });
     });
-    cad = mountCadEditor(host, { document, request, onBack: back, onSavePart: savePart, onSaveDocument: async (value) => {
+    cad = mountCadEditor(host, { document, request, sketchupDesign: sketchupDesign && document?.kind !== "part",
+      onBack: back, onSavePart: savePart, onSaveDocument: async (value) => {
       record = await post("/api/registry", { action: "save", kind: record?.kind ?? "drawing", parent: record ? record.parent : selectedFolder,
         ...(record ? { id: record.id, revision: record.revision } : {}), ...value });
       await refreshRegistry();
       return record;
     } });
+  }
+
+  async function downloadAttachment(endpoint, fallbackName, failureMessage) {
+    const response = await fetch(endpoint, { cache: "no-store" });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      throw new Error(data?.error || failureMessage);
+    }
+    const filename = /filename\*=UTF-8''([^;]+)/i.exec(response.headers.get("Content-Disposition") || "")?.[1];
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename ? decodeURIComponent(filename) : fallbackName;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function downloadSewingPdf(params) {
+    return downloadAttachment(`/api/sewing-map.pdf?${new URLSearchParams(params)}`, "Карта пошива.pdf", "Не удалось скачать карту пошива.");
+  }
+
+  async function sewingMap(entry) {
+    const dialog = el("dialog", "", "plotter-dialog workplace-dialog sewing-map-dialog");
+    const heading = el("h2", "Карта пошива · " + entry.name);
+    heading.id = "sewing-map-title";
+    dialog.setAttribute("aria-labelledby", heading.id);
+    const loading = el("p", "Загружаем детали…");
+    loading.setAttribute("role", "status");
+    const body = el("div", loading, "drawing-dialog-body sewing-map-body");
+    body.tabIndex = 0;
+    body.setAttribute("role", "region");
+    body.setAttribute("aria-label", "Детали комплекта");
+    body.setAttribute("aria-busy", "true");
+    const sheet = el("div", "", "sewing-map-sheet");
+    const downloadError = el("small", "", "workplace-dialog-error");
+    downloadError.setAttribute("role", "alert");
+    const savedLayout = select([["", "Без раскладки"]], "");
+    const layoutField = field("Раскладка в PDF", savedLayout);
+    layoutField.hidden = true;
+    const layouts = [];
+    const download = button("Скачать PDF", async () => {
+      download.disabled = true;
+      downloadError.textContent = "";
+      try {
+        const chosen = savedLayout.value === "" ? null : layouts[Number(savedLayout.value)];
+        await downloadSewingPdf({ kitId: entry.id, ...(chosen ? { widthMm: chosen.widthMm, quantity: chosen.quantity } : {}) });
+      } catch (error) { downloadError.textContent = error.message; }
+      finally { download.disabled = false; }
+    }, { primary: true, disabled: true });
+    const close = button("Закрыть", () => dialog.close());
+    close.autofocus = true;
+    const footer = el("footer", close, "dialog-actions");
+    footer.append(layoutField, downloadError, download);
+    dialog.append(el("header", heading, "drawing-dialog-heading"), body, footer);
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    document.body.append(dialog);
+    dialog.showModal();
+    try {
+      const kit = await get("/api/registry", { id: entry.id });
+      if (!dialog.open) return;
+      const parts = await Promise.all(kit.members.map(async member =>
+        ({ ...await get("/api/registry", { id: member.id }), amount: member.quantity })));
+      if (!dialog.open) return;
+      heading.textContent = "Карта пошива · " + kit.name;
+      for (const layout of kit.layouts?.filter((item) => item.valid) ?? []) {
+        savedLayout.add(new Option(`${layout.widthMm} мм · ${layout.quantity} компл.`, String(layouts.length)));
+        layouts.push(layout);
+      }
+      layoutField.hidden = !layouts.length;
+      if (!parts.some(part => part.pattern?.sewing?.length)) {
+        sheet.append(el("p", "В комплекте нет сохранённых швов.", "sewing-map-note"));
+      }
+      const numbers = new Set(parts.map(part => part.pattern?.number));
+      for (const part of parts) {
+        const pattern = part.pattern;
+        const title = pattern ? pattern.number + " · " + pattern.name : part.name;
+        const article = el("article", "", "sewing-map-part");
+        const outline = el("canvas");
+        outline.width = 360; outline.height = 220;
+        outline.setAttribute("role", "img");
+        outline.setAttribute("aria-label", "Контур детали " + title);
+        const context = outline.getContext("2d");
+        if (context) context.lineWidth = 2;
+        const project = drawPartOutline(outline, part.paths || []);
+        if (project) {
+          for (const mark of (part.entities || []).filter(item => item.type === "point" && item.layer.startsWith("Метка "))) {
+            const [x, y] = project(mark.point);
+            context.fillStyle = "#284994";
+            context.fillRect(x - 3, y - 3, 6, 6);
+            context.font = "20px sans-serif";
+            context.fillText(mark.layer.slice(6), Math.min(x + 8, 270), Math.max(y - 8, 20), 90);
+          }
+        }
+        const side = ({ left: "левая", right: "правая" })[pattern?.side];
+        const details = el("div", el("h3", title));
+        details.append(el("p", [pattern?.fabricName, side, part.amount + " шт."].filter(Boolean).join(" · "), "sewing-map-meta"));
+        if (pattern?.checkSewing) details.append(el("strong", "Проверьте сопряжения после правки в 2D."));
+        for (const seam of pattern?.sewing || []) {
+          details.append(el("p", seam.name + " → " + seam.other + (seam.method === "closure" ? " · застёжка" : "") +
+            (seam.marks.length ? " · " + seam.marks.join(", ") : "") +
+            (numbers.has(seam.other) ? "" : " · ответная деталь отсутствует в комплекте")));
+        }
+        article.append(details, outline);
+        sheet.append(article);
+      }
+      body.replaceChildren(sheet);
+      download.disabled = false;
+    } catch (error) {
+      if (dialog.open) {
+        const message = el("p", error.message, "workplace-dialog-error");
+        message.setAttribute("role", "alert");
+        body.replaceChildren(message);
+      }
+    } finally {
+      body.removeAttribute("aria-busy");
+    }
   }
 
   function openLayoutPart(document, { onBack, onSaveDocument }) {
@@ -717,13 +1019,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   function orderDialog(old) {
     const number = input("text", old?.number ?? "", { required: true, maxLength: 255 });
+    const designation = input("text", old?.designation ?? "", { maxLength: 255, placeholder: "Например, Диван Астон, левый модуль" });
     const notes = Object.assign(el("textarea"), { value: old?.notes ?? "", maxLength: 2000, rows: 3,
       placeholder: "Например, сначала раскроить подкладку" });
     const fields = el("div", field("Номер заказа", number), "workplace-form-grid");
-    fields.append(field("Комментарий для оператора", notes));
+    fields.append(field("Что кроим", designation), field("Комментарий для оператора", notes));
     formDialog(old ? "Изменить наряд" : "Новый наряд", fields, "Сохранить", async () => {
       const result = await post("/api/orders", { action: old ? "update-meta" : "save", number: number.value, notes: notes.value,
-        ...(old ? { id: old.id, revision: old.revision } : {}) });
+        designation: designation.value, ...(old ? { id: old.id, revision: old.revision } : {}) });
       selectedOrder = result.id;
       await render();
     });
@@ -746,8 +1049,11 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     if (result === false) return;
     currentLayout = next;
     const mode = next.kitId ? "kit" : result?.demo ? "demo" : next.mode;
+    const order = result?.order || next.order;
+    const fabric = result?.name || next.name;
+    const caption = next.id ? [order?.number && `Наряд № ${order.number}`, orderProduct(order), fabric].filter(Boolean).join(" · ") : "";
     const heading = el("strong", mode === "kit" ? `Раскладка комплекта · ${result?.name || next.name}`
-      : result?.name || "Самостоятельный раскрой");
+      : caption || fabric || "Самостоятельный раскрой");
     if (mode === "design" || mode === "preview") heading.append(` · ${mode === "design" ? "Подготовка" : "Предпросмотр"}`);
     if (mode === "demo") heading.append(" · Демо");
     const error = el("span", "", "workplace-dock-error");
@@ -758,6 +1064,15 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       focusWorkplaceHeading();
     }));
     dock.replaceChildren(back, heading, error);
+    dock.append(button("Скачать карту пошива", execute(async () => {
+      if (mode !== "kit" && flushLayout && !await flushLayout()) {
+        throw new Error("Сохраните раскладку перед скачиванием карты пошива.");
+      }
+      const params = mode === "kit" ? { kitId: next.kitId, widthMm: result.widthMm, quantity: result.quantity }
+        : next.id ? { cutId: next.id, mode } : { workspace: 1 };
+      await downloadSewingPdf(params);
+    })));
+    dock.append(xiaoActions);
     if (mode === "design") {
       dock.append(button("Предпросмотр", execute(() => showLayout({ ...next, mode: "preview", editable: true }))));
     } else if (mode === "preview") {
@@ -780,7 +1095,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       if (mode === "operator") dock.append(button("Отметить раскрой выполненным", execute(async () => {
         if (!await confirmAction({
           title: "Отметить раскрой выполненным?",
-          message: `Подтвердите, что раскрой «${result.name}» фактически выполнен.`,
+          message: `Подтвердите, что раскрой «${fabric}» фактически выполнен.`,
           confirmLabel: "Отметить выполненным",
         })) return;
         await finishRegisteredCut();
@@ -839,6 +1154,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     if (operator || order.published) panel.append(progressRow(done, order.cuts.length));
     const list = el("div", "", "workplace-cut-list");
     for (const cut of order.cuts) {
+      const layout = { id: cut.id, order, name: cut.name };
       const row = el("article", "", "workplace-cut-row");
       const main = el("div", el("h2", cut.name));
       main.append(el("p", cut.widthMm == null ? "Ширина задаётся в автораскладке" : `Полотно ${cut.widthMm} мм`));
@@ -850,18 +1166,18 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       tools.append(el("span", state, `workplace-chip ${cut.status}`));
       if (operator && released) {
         tools.append(button(cut.status === "pending" ? "Приступить" : cut.status === "active" ? "Продолжить" : "Просмотреть",
-          execute(() => showLayout({ id: cut.id, mode: "operator" })), { primary: cut.status !== "done" }));
-        tools.append(button("Демо", execute(() => showLayout({ id: cut.id, mode: "demo" }))));
+          execute(() => showLayout({ ...layout, mode: "operator" })), { primary: cut.status !== "done" }));
+        tools.append(button("Демо", execute(() => showLayout({ ...layout, mode: "demo" }))));
       } else if (!operator && (draft || cut.status === "pending")) {
         tools.append(button("Изменить ткань и состав", () => cutDialog(order, cut)));
         if (draft || !released) {
-          tools.append(button("Раскладка", execute(() => showLayout({ id: cut.id, mode: "design" })), { primary: true }));
+          tools.append(button("Раскладка", execute(() => showLayout({ ...layout, mode: "design" })), { primary: true }));
           if (!draft) tools.append(button("Отправить раскладку", execute(async () => {
             await post("/api/orders", { action: "publish-cut", id: cut.id, orderId: order.id, orderRevision: order.revision });
             await render();
           }), { primary: true }));
         } else {
-          tools.append(button("Предпросмотр", execute(() => showLayout({ id: cut.id, mode: "preview" }))));
+          tools.append(button("Предпросмотр", execute(() => showLayout({ ...layout, mode: "preview" }))));
         }
         tools.append(button("Удалить ткань", execute(async () => {
           if (!await confirmAction({
@@ -873,7 +1189,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           await render();
           focusWorkplaceHeading();
         })));
-      } else if (!operator) tools.append(button("Предпросмотр", execute(() => showLayout({ id: cut.id, mode: "preview" }))));
+      } else if (!operator) tools.append(button("Предпросмотр", execute(() => showLayout({ ...layout, mode: "preview" }))));
       row.append(main, tools);
       list.append(row);
     }
@@ -915,7 +1231,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       : [button("Новый наряд", () => orderDialog(null), { primary: true })];
     if (operator) actions.unshift(button("Продолжить раскрой", execute(async () => {
       const id = await getActiveCut();
-      await showLayout(id ? { mode: "operator", id } : { mode: "standalone" });
+      const order = id && result.orders.find(order => order.materials?.some(material => material.id === id));
+      const material = order?.materials.find(material => material.id === id);
+      await showLayout(id ? { mode: "operator", id, order, name: material?.name } : { mode: "standalone" });
     })));
     panel.append(workHeading(operator ? "Наряды на раскрой" : "Наряды", "", actions));
     const cards = el("div", "", "workplace-cards");

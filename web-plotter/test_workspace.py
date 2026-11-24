@@ -118,8 +118,8 @@ class WorkspaceStoreTests(unittest.TestCase):
     def test_part_numbers_and_rotation_survive_reordering_and_restart(self):
         layout = draft()
         contour, mark = layout["paths"]
-        contour.update(partNumber=12, partRotation="none", partAngle=275.25)
-        mark.update(partNumber=12, partAngle=275.25)
+        contour.update(partNumber=12, partRotation="none", partAngle=275.25, partName="Царга", productName="Диван")
+        mark.update(partNumber=12, partAngle=275.25, partName="Царга", productName="Диван")
         layout["paths"].reverse()
         saved = self.store.write(0, layout)
         self.assertEqual(WorkspaceStore(self.path).read(), saved)
@@ -129,6 +129,9 @@ class WorkspaceStoreTests(unittest.TestCase):
         current = self.store.write(0, draft())
         for updates in (
             ({"partNumber": True}, {}),
+            ({"partName": "Царга"}, {}),
+            ({"partNumber": 1, "productName": "\nДиван"}, {}),
+            ({"partNumber": 1, "partName": "Царга"}, {"partNumber": 1, "partName": "Сиденье"}),
             ({"partNumber": 0}, {}),
             ({"partNumber": None}, {}),
             ({"partNumber": 1 << 53}, {}),

@@ -2,6 +2,11 @@
 
 const $ = (id) => document.getElementById(id);
 const svg = $("drawing-svg");
+const partLegend = $("part-legend");
+const partLegendList = $("part-legend-list");
+const partLegendSearch = $("part-legend-search");
+const partLegendContent = $("part-legend-content");
+const partLegendToggle = $("part-legend-toggle");
 const svgNamespace = "http://www.w3.org/2000/svg";
 const formatNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
 const formatFeedDistance = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 3 });
@@ -114,6 +119,8 @@ let source = null;
 let placed = [];
 let pathBoxes = [];
 let drawingParts = new Map();
+const partLegendRows = new Map();
+const partLegendProducts = new Map();
 let drawingPartsReady = true;
 let partDiscovery = null;
 let menuPartNumber = null;
@@ -681,14 +688,24 @@ function trackedCanvasRun() {
   return cutProgress;
 }
 
+function canShowNextLaunchPass(section = canvasSection()) {
+  return Boolean(cutPlan && section && section.page.number < cutPlan.pages.length
+    && section.kind !== "current" && section.kind !== "next" && !currentUpload
+    && !drawingLocked({ editing: false }) && !busy() && !cutPlacementPreviewActive());
+}
+
 function updateCanvasSection() {
   const plan = cutPlan ?? pendingCanvasPlan;
   const section = canvasSection(plan);
   const tools = $("canvas-section-tools");
   updateControl(tools, "hidden", !section);
+  const passNavigation = $("launch-pass-navigation");
+  updateControl(passNavigation, "hidden", !section || plan.pages.length < 2);
   if (section) {
     const page = section.page;
     updateText($("section-focus"), `Проход ${page.number} из ${plan.pages.length}`);
+    updateText($("launch-view-page"), `На схеме: ${page.number} из ${plan.pages.length}`);
+    updateControl($("launch-next-pass"), "disabled", !canShowNextLaunchPass(section));
     updateControl($("section-focus"), "disabled", !cutPlan);
     const locked = !cutPlan || section.kind === "current" || section.kind === "next";
     updateControl($("section-prev"), "disabled", locked || page.number === 1);
@@ -1644,6 +1661,7 @@ function renderPaths() {
     notchMarkers.delete(index);
   }
   renderedPaths = placed.slice();
+  renderPartHighlight();
 }
 
 function syncPlacementFields() {
@@ -1675,6 +1693,8 @@ function indexDrawingParts() {
     const part = drawingParts.get(id);
     part.indices.push(index);
     part.rotation = path.partRotation === "quarter" ? "any" : path.partRotation ?? part.rotation;
+    part.name ||= path.partName;
+    part.product ||= path.productName;
     part.box.minX = Math.min(part.box.minX, box.minX);
     part.box.minY = Math.min(part.box.minY, box.minY);
     part.box.maxX = Math.max(part.box.maxX, box.maxX);
@@ -1683,6 +1703,7 @@ function indexDrawingParts() {
       part.activeBox = part.activeBox ? unionPlacementBoxes(part.activeBox, box) : box;
     }
   }
+  renderPartLegend();
 }
 
 function partMembers(index) {
@@ -1871,6 +1892,130 @@ function partRotationText(rotation) {
   return "поворот по общим настройкам";
 }
 
+function renderPartHighlight() {
+  const outlines = new Map();
+  const shapes = $("path-layer").children;
+  for (const index of selection) {
+    const shape = shapes[index]?.firstElementChild;
+    if (!shape) continue;
+    const classes = `part-highlight${shape.classList.contains("outside") ? " is-outside" : ""}${excluded.has(index) ? " is-excluded" : ""}`;
+    if (!outlines.has(classes)) outlines.set(classes, []);
+    outlines.get(classes).push(shape.getAttribute("d"));
+  }
+  $("part-highlight-layer").replaceChildren(...Array.from(outlines, ([classes, paths]) =>
+    element("path", { d: paths.join(" "), class: classes, "vector-effect": "non-scaling-stroke" })));
+}
+
+function selectedPartNumbers() {
+  return new Set(Array.from(selection, (index) => placed[index]?.partNumber));
+}
+
+function setPartLegendExpanded(expanded) {
+  const label = expanded ? "Свернуть детали" : "Развернуть детали";
+  updateAttribute(partLegendToggle, "aria-expanded", String(expanded));
+  updateAttribute(partLegendToggle, "aria-label", label);
+  updateControl(partLegendToggle, "title", label);
+  updateText($("part-legend-toggle-label"), expanded ? label : "Детали");
+  updateControl($("part-legend-heading"), "hidden", !expanded);
+  updateControl(partLegendContent, "hidden", !expanded);
+  partLegend.classList.toggle("is-collapsed", !expanded);
+}
+
+function renderPartLegend() {
+  partLegend.hidden = !drawingParts.size;
+  partLegendRows.clear();
+  partLegendProducts.clear();
+  const query = partLegendSearch.value.trim().toLocaleLowerCase().replace(/^№\s*/, "");
+  const partsByProduct = new Map();
+  for (const part of [...drawingParts.values()].sort((a, b) => a.number - b.number)) {
+    const product = part.product || "";
+    if (!partsByProduct.has(product)) partsByProduct.set(product, []);
+    partsByProduct.get(product).push(part);
+  }
+  const lists = document.createDocumentFragment();
+  for (const [product, parts] of partsByProduct) {
+    const visible = parts.filter((part) => !query || `${part.number} ${part.name || ""} ${product}`.toLocaleLowerCase().includes(query));
+    if (!visible.length) continue;
+    const list = document.createElement("ul");
+    const addButton = () => {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      item.append(button);
+      list.append(item);
+      return button;
+    };
+    if (product) {
+      const button = addButton();
+      button.className = "part-legend-product";
+      button.textContent = product;
+      button.onclick = () => selectLegendParts(parts);
+      partLegendProducts.set(button, parts);
+    }
+    for (const part of visible) {
+      const button = addButton();
+      const number = document.createElement("strong");
+      number.className = "part-legend-number";
+      number.textContent = `№${part.number}`;
+      button.append(number);
+      if (part.name) button.append(document.createTextNode(part.name));
+      button.onclick = () => selectLegendParts([part]);
+      partLegendRows.set(part.number, button);
+    }
+    lists.append(list);
+  }
+  if (query && !partLegendRows.size) {
+    const empty = document.createElement("p");
+    empty.textContent = "Детали не найдены";
+    lists.append(empty);
+  }
+  updateText($("part-legend-count"), query ? `${partLegendRows.size} / ${drawingParts.size}` : String(drawingParts.size));
+  partLegendList.replaceChildren(lists);
+  updatePartLegendSelection();
+}
+
+function updatePartLegendSelection(reveal = false) {
+  if (partLegend.hidden) return;
+  const active = selectedPartNumbers();
+  const revealRow = reveal && !partLegendContent.hidden && active.size === 1;
+  if (revealRow && partLegendSearch.value && !partLegendRows.has(active.values().next().value)) {
+    partLegendSearch.value = "";
+    renderPartLegend();
+  }
+  for (const [number, row] of partLegendRows) updateAttribute(row, "aria-pressed", String(active.has(number)));
+  for (const [row, parts] of partLegendProducts) {
+    updateAttribute(row, "aria-pressed", String(parts.every((part) => active.has(part.number))));
+  }
+  if (!revealRow) return;
+  const row = partLegendRows.get(active.values().next().value)?.getBoundingClientRect();
+  if (!row) return;
+  const list = partLegendList.getBoundingClientRect();
+  if (row.bottom > list.bottom) partLegendList.scrollTop += row.bottom - list.bottom;
+  else if (row.top < list.top) partLegendList.scrollTop += row.top - list.top;
+}
+
+function selectLegendParts(parts) {
+  if (drag || drawingLocked() && !layoutReadOnly() && !runInProgress()) return;
+  setSelection(new Set(parts.flatMap((part) => part.indices)));
+  if (!camera || !selectedBounds || runInProgress() || simulation.active) return;
+  const box = svgBox(selectedBounds);
+  const insets = { left: overlayWidth("launch-controls"), right: overlayWidth("canvas-controls") };
+  const units = camera.width / Math.max(1, svg.clientWidth);
+  if (box.x >= camera.x + insets.left * units && box.x + box.width <= camera.x + camera.width - insets.right * units
+      && box.y >= camera.y && box.y + box.height <= camera.y + camera.height) return;
+  const focus = newCamera({ ...box, width: Math.max(1, box.width), height: Math.max(1, box.height) }, insets);
+  const width = Math.max(camera.width, focus.width), height = Math.max(camera.height, focus.height);
+  cameraMode = "manual";
+  camera = { x: focus.x - (width - focus.width) / 2, y: focus.y - (height - focus.height) / 2, width, height };
+  drawCamera();
+}
+
+partLegendSearch.addEventListener("input", renderPartLegend);
+partLegendToggle.addEventListener("click", () => setPartLegendExpanded(partLegendContent.hidden));
+partLegend.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && selection.size && event.target !== partLegendSearch) setSelection(new Set());
+});
+
 function renderPartLabels() {
   const layer = $("part-label-layer");
   if (drag?.labels) return;
@@ -1880,7 +2025,7 @@ function renderPartLabels() {
     return;
   }
   const units = camera.width / svg.clientWidth;
-  const selectedParts = new Set([...selection].map((index) => placed[index]?.partNumber));
+  const selectedParts = selectedPartNumbers();
   const visible = [];
   for (const part of drawingParts.values()) {
     const { minX, maxX, minY, maxY } = part.box;
@@ -1916,9 +2061,9 @@ function renderPartLabels() {
     }
     const { node } = entry;
     const marker = complete ? "complete" : part.rotation;
-    if (entry.marker !== marker || !node.firstChild) {
+    if (entry.marker !== marker || entry.name !== part.name || !node.firstChild) {
       const title = element("title");
-      title.textContent = `Деталь ${label} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
+      title.textContent = `${label} · ${part.name || "Деталь"} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
       const text = element("text", { x: 6, y: 15.5 });
       text.textContent = label;
       node.replaceChildren(title, element("rect", { width, height: 22, rx: 5, class: "part-label-bg" }), text);
@@ -1929,6 +2074,7 @@ function renderPartLabels() {
           x: width - 17, y: 5, width: 12, height: 12 }));
       }
       entry.marker = marker;
+      entry.name = part.name;
     }
     entry.center = center;
     entry.units = units;
@@ -1947,25 +2093,30 @@ function positionPartLabel({ node, units, halfWidth }, point) {
   updateAttribute(node, "transform", `translate(${x - halfWidth * units} ${y - 11 * units}) scale(${units})`);
 }
 
-function updateSelection() {
+function updateSelection(revealLegend = false) {
   selectedBounds = bounds([...selection].map((index) => placed[index]));
   const allExcluded = selection.size > 0 && [...selection].every((index) => excluded.has(index));
   const exclude = $("exclude-button");
   exclude.textContent = allExcluded ? "Вернуть" : "Исключить";
   exclude.title = allExcluded ? "Вернуть выделенные контуры в задание" : "Исключить выделенные контуры из задания";
   syncPlacementFields();
+  renderPartHighlight();
   renderPartLabels();
+  updatePartLegendSelection(revealLegend);
 }
 
 function setSelection(indices) {
   indices = expandToWholeParts(indices);
-  if (indices.size === selection.size && [...indices].every((index) => selection.has(index))) return;
+  if (indices.size === selection.size && [...indices].every((index) => selection.has(index))) {
+    updatePartLegendSelection(true);
+    return;
+  }
   endFreeRotation();
   const groups = $("path-layer").children;
   for (const index of selection) if (!indices.has(index)) groups[index]?.firstElementChild.classList.remove("selected");
   for (const index of indices) if (!selection.has(index)) groups[index].firstElementChild.classList.add("selected");
   selection = indices;
-  updateSelection();
+  updateSelection(true);
   renderSelectionControls(drawingLocked());
 }
 
@@ -2644,6 +2795,9 @@ function applyWorkspace(response) {
   const saved = response.workspace;
   clearSavedMeasurements();
   selection = new Set();
+  partLegendSearch.value = "";
+  partLegendList.scrollTop = 0;
+  setPartLegendExpanded(true);
   drawingUndo.length = drawingRedo.length = 0;
   source = saved?.source || null;
   placed = saved?.paths || [];
@@ -2820,6 +2974,8 @@ async function loadDrawing(file) {
     if (!box) throw new Error("В файле нет контуров.");
     clearSavedMeasurements();
     source = imported;
+    partLegendSearch.value = "";
+    setPartLegendExpanded(true);
     placed = imported.paths.map((path) => translatePath(path, 20 - box.minX, 20 - box.minY));
     excluded = new Set();
     selection = new Set();
@@ -3229,6 +3385,37 @@ function renderControls() {
     ? "Подтверждаю остановку виртуального станка" : "Подтверждаю остановку на пульте");
 }
 
+function launchOrderLabel() {
+  const orderNumber = managedCut?.order?.number?.trim();
+  return orderNumber ? `Наряд № ${orderNumber}` : "";
+}
+
+function launchLayoutName() {
+  const order = managedCut?.order;
+  const product = order?.designation?.trim() || order?.modelName?.trim();
+  const names = [product, managedCut?.name?.trim()].filter(Boolean);
+  return [...new Set(names)].join(" · ");
+}
+
+function importedLayoutName(filename) {
+  if (filename === "registry.dxf") return "Детали из реестра";
+  return filename || "";
+}
+
+function xiaoDownloadName(filename) {
+  const title = managedCut ? [launchOrderLabel(), launchLayoutName()].filter(Boolean).join(" — ") : importedLayoutName(filename);
+  const clean = title.replace(/\.(dxf|dwg)$/i, "").replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, " ")
+    .replace(/\s+/g, " ").trim();
+  const encoder = new TextEncoder();
+  let bytes = 0, base = "";
+  for (const character of clean) {
+    bytes += encoder.encode(character).length;
+    if (bytes > 220) break;
+    base += character;
+  }
+  return (base.replace(/[. ]+$/g, "") || "Раскрой") + " — раскладка.dxf";
+}
+
 function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inProgress = runInProgress(),
   transferring = pendingCommand === "upload" || activeRun?.state === "transferring",
   jobActive = inProgress || stopPending || Boolean(live.stopAvailable), armed = controlActive() } = {}) {
@@ -3250,7 +3437,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateControl($("manual-auto-run"), "hidden", !manualAutoRun);
   updateControl($("manual-auto-run-off"), "disabled", importing || partMoving || !cutPlan || locked || !live.responded || live.busy);
   updateControl($("roll-reset"), "hidden", !canResetRoll || jobActive);
-  updateControl($("job-pass-frame"), "hidden", $("job-page-field").hidden && $("roll-reset").hidden);
+  updateControl($("job-pass-frame"), "hidden", $("job-page-field").hidden && $("launch-pass-navigation").hidden && $("roll-reset").hidden);
   updateControl($("roll-reset"), "disabled", !armed || locked || importing || live.busy || !live.positionFresh || stopNeedsVerification || coordinateMoveBlocksControl());
   updateText($("roll-reset"), roll?.state === "ready" && !roll.completedPages && !cutPlan?.hasContinuations
     ? "Сменить начальный проход" : "Начать раскрой заново");
@@ -3278,7 +3465,7 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   updateControl(xiaoDownload, "title", !canDownloadXiao ? jobError || cutPlanError || "Дождитесь проверки раскладки."
     : partMoving ? "Завершите перемещение детали." : "");
   updateText(xiaoOpen, xiaoHandoff === "open" ? "Открываем…" : "Открыть в Xiao");
-  updateText(xiaoDownload, xiaoHandoff === "download" ? "Готовим DXF…" : "Скачать DXF");
+  updateText(xiaoDownload, xiaoHandoff === "download" ? "Готовим DXF…" : "Скачать DXF для Xiao");
   updateControl($("xiao-handoff"), "hidden", widthPending || !includedBounds);
   updateControl($("xiao-result"), "hidden", !xiaoResult);
   updateText($("xiao-result"), xiaoResult || "");
@@ -3327,14 +3514,17 @@ function renderLayoutActions({ importing = drawingLocked(), locked = busy(), inP
   statusLabel.classList.toggle("has-layout", Boolean(includedBounds));
   updateControl(uploadButton, "title", uploadButton.disabled ? status : "Подтвердить и запустить раскрой");
   const identity = $("job-identity");
-  updateText(identity, source?.filename || "");
+  const orderLabel = launchOrderLabel();
+  const title = managedCut ? (launchLayoutName() || orderLabel || "Раскрой") : importedLayoutName(source?.filename);
+  updateText(identity, title);
   updateControl(identity, "title", identity.textContent);
   updateControl(identity, "hidden", !identity.textContent);
   const detail = $("job-detail");
   const dimensions = includedBounds
     ? `${number(includedBounds.maxY - includedBounds.minY)} × ${number(includedBounds.maxX - includedBounds.minX)} мм` : "";
-  const passes = $("job-page-field").hidden && displayedPlan?.pages.length ? ` · проходов: ${displayedPlan.pages.length}` : "";
-  updateText(detail, dimensions ? dimensions + passes : "");
+  const passes = $("job-page-field").hidden && $("launch-pass-navigation").hidden && displayedPlan?.pages.length
+    ? `проходов: ${displayedPlan.pages.length}` : "";
+  updateText(detail, [orderLabel !== title ? orderLabel : "", dimensions, passes].filter(Boolean).join(" · "));
   updateControl(detail, "hidden", !detail.textContent);
 }
 
@@ -4098,6 +4288,7 @@ async function prepareXiaoDrawing(openInXiao) {
   if (cutWidthPending() || xiaoHandoff || jobError || drawingLocked() || cutPlacementPreviewActive() || !cutPlan?.canPrepareXiao
       || (openInXiao && $("prepare-xiao-open").disabled)) return;
   const { planId, exportPlanId, filename } = cutPlan;
+  const downloadName = openInXiao ? null : xiaoDownloadName(filename);
   xiaoHandoff = openInXiao ? "open" : "download";
   xiaoResult = null;
   renderControls();
@@ -4117,7 +4308,7 @@ async function prepareXiaoDrawing(openInXiao) {
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
-      link.download = filename.replace(/\.(dxf|dwg)$/i, "") + " — раскладка.dxf";
+      link.download = downloadName;
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       xiaoResult = demoMode ? "DXF скачан."
@@ -4346,6 +4537,9 @@ $("job-page").addEventListener("change", (event) => {
   previewCutPage = null;
   resetTransferChecklist();
   renderControls();
+});
+$("launch-next-pass").addEventListener("click", () => {
+  if (canShowNextLaunchPass()) navigateCanvasSection(1);
 });
 $("manual-auto-run-off").addEventListener("change", renderControls);
 $("roll-reset").addEventListener("click", openRollResetDialog);
@@ -5254,7 +5448,7 @@ function cancelCanvasGesture({ refreshActions = true } = {}) {
   drag = null;
   if (gesture.frame != null) cancelAnimationFrame(gesture.frame);
   renderManualGuides();
-  svg.classList.remove("dragging", "moving-contours");
+  svg.classList.remove("dragging", "moving-contours", "rotating-contours");
   $("selection-marquee").setAttribute("hidden", "");
   if (["move", "rotate"].includes(gesture.type) && gesture.moved) {
     const groups = $("path-layer").children;
@@ -5327,6 +5521,7 @@ svg.addEventListener("pointermove", (event) => {
         drag.offset = [0, 0];
         svg.classList.add("moving-contours");
       }
+      if (drag.type === "rotate") svg.classList.add("rotating-contours");
       if (placementPreviewActive()) {
         const numbers = new Set([...selection].map((index) => placed[index].partNumber));
         drag.labels = [...numbers].map((number) => partLabels.get(number)).filter(Boolean);
@@ -5396,6 +5591,12 @@ svg.addEventListener("lostpointercapture", (event) => {
     clearMeasurement();
     renderMeasurement();
   }
+});
+svg.addEventListener("click", (event) => {
+  if (!camera || !drawingPartsReady || !drawingLocked() || !(layoutReadOnly() || runInProgress())
+      || event.button !== 0 || event.target.closest("[data-canvas-page]")) return;
+  const index = contourAt(event, drawingPoint(event));
+  setSelection(new Set(index === null ? [] : partMembers(index)));
 });
 svg.addEventListener("pointerleave", () => {
   if (!measureMode || measurePointer) return;
@@ -5582,7 +5783,7 @@ async function openLayoutPart(part) {
     closePartMenu();
     layout.hidden = true;
     renderControls();
-    const name = `Деталь №${part.number}`;
+    const name = `№${part.number} · ${part.name || "Деталь"}`;
     workplaces.openLayoutPart({ name, entities: layoutPartEntities(originals) }, {
       onBack() {
         layout.hidden = false;
@@ -5603,6 +5804,8 @@ async function openLayoutPart(part) {
           path: {
             ...path, notch: Boolean(path.notch), partNumber: part.number,
             ...(part.rotation ? { partRotation: part.rotation } : {}),
+            ...(part.name ? { partName: part.name } : {}),
+            ...(part.product ? { productName: part.product } : {}),
             ...(originals[0].partAngle !== undefined ? { partAngle: originals[0].partAngle } : {}),
           },
           excluded: allExcluded || Boolean(result.sourceIds?.[index]?.length && result.sourceIds[index].every(id => {
@@ -5704,7 +5907,8 @@ async function navigateLayout(next, { resume = false } = {}) {
     } else if (interactive) {
       response = await getJson(workspaceQuery(next.id, next.mode));
       if (response.status !== "done" || next.mode === "demo") {
-        response = await getJson("/api/cut-context", jsonRequest({ action: "select", cutId: next.id }));
+        const context = await getJson("/api/cut-context", jsonRequest({ action: "select", cutId: next.id }));
+        response = { ...response, ...context, order: context.order ?? response.order };
         hardwareCutId = next.id;
       }
     } else if (next.id) {
@@ -5727,7 +5931,8 @@ async function navigateLayout(next, { resume = false } = {}) {
     $("workplace-page").hidden = true;
     managedCut = next.mode === "kit"
       ? { ...next, widthMm: response.widthMm, quantity: response.quantity, saved: response.saved && response.valid }
-      : next.id ? { ...next, name: response.name, status: response.status, cutRevision: response.cutRevision, widthMm: response.widthMm } : null;
+      : next.id ? { ...next, name: response.name ?? next.name, order: response.order ?? next.order,
+        status: response.status, cutRevision: response.cutRevision, widthMm: response.widthMm } : null;
     if (interactive && oldHardwareCut !== hardwareCutId) {
       clearCurrentUpload();
       activeRun = null;
@@ -5793,6 +5998,7 @@ async function releaseRegisteredCut() {
 
 void import("/workplaces.js").then(({ mountWorkplaces }) => {
   workplaces = mountWorkplaces({ navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, onExit: disarmControl,
+    flushLayout: persistWorkspace,
     layoutWidths: () => ({ defaultWidthMm: defaultFabricWidthMm(), maxWidthMm: machine.height }),
     request: (url, options) => fetch(url, { cache: "no-store", ...options }).then(async response => {
       const data = await response.json();

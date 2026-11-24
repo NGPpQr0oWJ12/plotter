@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/workplaces.css">
   <link rel="stylesheet" href="/designer-cad.css">
+  <link rel="stylesheet" href="/designer-3d.css">
   <link rel="stylesheet" href="/plotter-monochrome.css">
   <script src="/simulation.js" defer></script>
   <script src="/app.js" defer></script>
@@ -100,8 +101,15 @@
   </main>
   <main class="workplace-page" id="workplace-page" hidden></main>
   <main class="workspace" id="layout-workplace" hidden>
-    <div class="workplace-dock" id="workplace-dock" hidden></div>
+    <div class="workplace-dock" id="workplace-dock" hidden>
+      <div class="layout-xiao-actions" id="xiao-handoff" hidden>
+        <button class="button" id="prepare-xiao-download" type="button" disabled>Скачать DXF для Xiao</button>
+        <button class="button" id="prepare-xiao-open" type="button" hidden disabled>Открыть в Xiao</button>
+        <p class="help-copy" id="xiao-result" role="status" hidden></p>
+      </div>
+    </div>
     <section class="drawing" aria-label="Раскладка">
+      <div class="drawing-main">
       <div class="drawing-viewport" id="viewport">
         <div class="canvas-stage">
           <div class="canvas-cut-status" id="canvas-cut-status" hidden>
@@ -147,6 +155,7 @@
             <g id="page-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="path-layer"></g>
             <g id="notch-layer" pointer-events="none" aria-hidden="true"></g>
+            <g id="part-highlight-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="live-trace-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="simulation-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="page-annotation-layer" pointer-events="none"></g>
@@ -208,6 +217,10 @@
                 <select id="job-page" aria-label="Проходы"></select>
                 <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg>
               </div>
+              <div class="launch-pass-navigation" id="launch-pass-navigation" role="group" aria-label="Просмотр проходов" hidden>
+                <span id="launch-view-page"></span>
+                <button class="button" id="launch-next-pass" type="button" aria-label="Дальше по проходам на схеме" disabled>Дальше<svg class="icon" aria-hidden="true"><use href="#i-arrow-right"/></svg></button>
+              </div>
               <button class="button roll-reset" id="roll-reset" type="button" hidden disabled>Начать раскрой заново</button>
             </div>
             <div class="launch-actions">
@@ -229,14 +242,6 @@
           </section>
         </div>
         <div class="canvas-controls" id="canvas-controls">
-          <section class="file-panel" id="xiao-handoff" aria-labelledby="file-title" hidden>
-            <h2 id="file-title">DXF для Xiao</h2>
-            <div class="file-actions">
-              <button class="button" id="prepare-xiao-download" type="button" disabled>Скачать DXF</button>
-              <button class="button" id="prepare-xiao-open" type="button" hidden disabled>Открыть в Xiao</button>
-            </div>
-            <p class="help-copy" id="xiao-result" role="status" hidden></p>
-          </section>
           <div class="drawing-actions" id="drawing-actions" role="group" aria-label="Инструменты раскладки">
             <button class="button primary" id="nest-button" type="button" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-nest"/></svg>Автораскладка</button>
             <button class="button" id="optimize-button" type="button" title="Оптимизировать маршрут реза" aria-haspopup="dialog" disabled><svg class="icon" aria-hidden="true"><use href="#i-route"/></svg>Оптимизировать</button>
@@ -265,6 +270,17 @@
           </section>
         </div>
         <div class="drop-overlay" id="drop-overlay" hidden><svg class="icon"><use href="#i-upload"/></svg><strong>Отпустите файл здесь</strong></div>
+      </div>
+        <aside class="part-legend" id="part-legend" aria-labelledby="part-legend-title" hidden>
+          <header>
+            <div class="part-legend-heading" id="part-legend-heading"><h2 id="part-legend-title">Детали раскладки</h2><span id="part-legend-count"></span></div>
+            <button class="button part-legend-toggle" id="part-legend-toggle" type="button" aria-expanded="true" aria-controls="part-legend-content" aria-label="Свернуть детали" title="Свернуть детали"><span id="part-legend-toggle-label">Свернуть детали</span><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+          </header>
+          <div id="part-legend-content" class="part-legend-content">
+            <input id="part-legend-search" type="search" placeholder="Номер или название" aria-label="Поиск детали">
+            <div id="part-legend-list" class="part-legend-list"></div>
+          </div>
+        </aside>
       </div>
       <div class="workspace-dock">
         <section class="layout-panel" aria-labelledby="layout-title">

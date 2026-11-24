@@ -1,23 +1,32 @@
+from base64 import b64decode, b64encode
+from binascii import Error as Base64Error
 from collections import defaultdict
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
+import gzip
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path
 import re
 import sqlite3
+from sys import float_info
 from uuid import uuid4
+from zlib import error as CompressionError
 
-from cad import MAX_ENTITIES, MAX_POINTS, POINT_EPSILON_MM
-from designer_cad import prepare_design, validate_design
+from cad import MAX_ABS_COORDINATE_MM, MAX_ENTITIES, MAX_POINTS, POINT_EPSILON_MM
+from designer_cad import center_part_geometry, prepare_design, validate_design
 from machine import PlotterError
 from nesting import validate_placed_parts
-from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, validate_workspace
+from registry_archive import MAX_REGISTRY_JSON
+from sketchup_design import MAX_MODEL_BYTES, markup
+from workspace import MAX_REVISION, MAX_WORKSPACE_BYTES, PART_LABEL_FIELDS, WorkspaceConflict, drawing_paths, validate_workspace
 
 
 SCHEMA_VERSION = 1
 MAX_QUANTITY = 50_000
+REGISTRY_BACKUP_VERSION = 1
 MOSCOW_TIME = timezone(timedelta(hours=3))
 KIT_LAYOUT_SCHEMA = """
     CREATE TABLE IF NOT EXISTS kit_layouts (
@@ -26,6 +35,15 @@ KIT_LAYOUT_SCHEMA = """
         basis TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kit_id, width_mm, quantity)
     )
 """
+MODEL_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS sketchup_models (
+        id TEXT PRIMARY KEY, expires INTEGER NOT NULL, data BLOB NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS drawing_models (
+        drawing_id TEXT PRIMARY KEY REFERENCES registry(id) ON DELETE CASCADE,
+        model_id TEXT NOT NULL REFERENCES sketchup_models(id), markup TEXT NOT NULL
+    )""",
+)
 
 
 class RecordNotFound(PlotterError):
@@ -40,6 +58,20 @@ def name(value, label="название"):
     if not isinstance(value, str) or not 0 < len(value.strip()) <= 255 or any(ord(c) < 32 for c in value):
         raise ValueError(f"Укажите {label} (до 255 символов).")
     return value.strip()
+
+
+def part_legend(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"developer", "comments", "date"}:
+        raise ValueError("Некорректная легенда детали.")
+    developer, comments = value.get("developer", ""), value.get("comments", "")
+    if not isinstance(developer, str) or len(developer) > 255 or any(ord(ch) < 32 for ch in developer):
+        raise ValueError("Укажите разработчика длиной до 255 символов.")
+    if (not isinstance(comments, str) or len(comments) > 2000
+            or any(ord(ch) < 32 and ch not in "\r\n\t" for ch in comments)):
+        raise ValueError("Особые отметки должны содержать до 2000 символов.")
+    return {"developer": developer.strip(), "date": datetime.now(MOSCOW_TIME).strftime("%m.%Y"), "comments": comments}
 
 
 def quantity(value):
@@ -67,6 +99,42 @@ def object_value(value):
     return value
 
 
+def pattern_record(value):
+    value = object_value(value)
+    direction, side = value.get("direction", "free"), value.get("side", "")
+    if direction not in ("free", "grain", "nap") or side not in ("", "left", "right"):
+        raise ValueError("Проверьте сторону детали и направление ткани.")
+    sewing = value.get("sewing", [])
+    if not isinstance(sewing, list) or len(sewing) > 800:
+        raise ValueError("В карте швов слишком много записей.")
+    edges = []
+    for edge in sewing:
+        edge = object_value(edge)
+        marks = edge.get("marks", [])
+        mark_ids = edge.get("markIds", [])
+        if not isinstance(marks, list) or len(marks) > 100:
+            raise ValueError("Проверьте обозначения насечек.")
+        if not isinstance(mark_ids, list) or mark_ids and len(mark_ids) != len(marks):
+            raise ValueError("Проверьте соответствие номеров насечек.")
+        method = edge.get("method", "stitch")
+        if method not in ("stitch", "closure"):
+            raise ValueError("Некорректный способ соединения кромок.")
+        edges.append({"name": name(edge.get("name"), "название шва"),
+                      "other": name(edge.get("other"), "номер сопряжённой детали"),
+                      "marks": [name(mark, "обозначение насечки") for mark in marks],
+                      "markIds": [name(mark, "идентификатор насечки") for mark in mark_ids], "method": method})
+    signature = value.get("seamSignature")
+    if signature is not None and (not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature)):
+        raise ValueError("Некорректная версия линии стачивания.")
+    return {"id": name(value.get("id"), "идентификатор лекала"),
+            "number": name(value.get("number"), "номер детали"),
+            "name": name(value.get("name"), "название детали"),
+            "fabricName": name(value["fabricName"], "название ткани") if value.get("fabricName") else "",
+            "direction": direction, "side": side, "quantity": quantity(value.get("quantity", 1)), "sewing": edges,
+            **({"seamSignature": signature} if signature else {}),
+            **({"checkSewing": True} if value.get("checkSewing") is True else {})}
+
+
 def key(value):
     if not isinstance(value, str) or len(value) != 32 or any(c not in "0123456789abcdef" for c in value):
         raise ValueError("Неверный идентификатор записи.")
@@ -76,6 +144,149 @@ def key(value):
 def check_revision(value, revision):
     if type(value) is not int or value != revision:
         raise WorkspaceConflict("Запись изменилась в другой вкладке. Заново откройте её.")
+
+
+def backup_revision(value, previous=None):
+    if type(value) is not int or not 1 <= value <= MAX_REVISION:
+        raise ValueError("Некорректная версия записи в резервной копии реестра.")
+    if previous is not None:
+        return backup_revision(max(value, previous) + 1)
+    return value
+
+
+def backup_object(value, fields):
+    if not isinstance(value, dict) or value.keys() != fields:
+        raise ValueError("Некорректная структура резервной копии реестра.")
+    return value
+
+
+def backup_list(value):
+    if not isinstance(value, list) or len(value) > MAX_ENTITIES:
+        raise ValueError("Превышен предел количества записей резервной копии реестра.")
+    return value
+
+
+def tree_order(records):
+    children = defaultdict(list)
+    for identifier, record in records.items():
+        parent = record.get("parent")
+        if parent is not None and (not isinstance(parent, str) or parent not in records):
+            raise ValueError("Резервная копия содержит ссылку на отсутствующего родителя.")
+        children[parent].append(identifier)
+    ordered = children[None].copy()
+    for identifier in ordered:
+        ordered.extend(children[identifier])
+    if len(ordered) != len(records):
+        raise ValueError("Резервная копия содержит циклическую иерархию.")
+    return ordered
+
+
+def validate_registry_entry(record):
+    kind = record["kind"]
+    data = object_value(record["data"])
+    if kind == "folder":
+        if data.keys() - {"model"} or type(data.get("model", False)) is not bool:
+            raise ValueError("Некорректная папка в резервной копии реестра.")
+    elif kind == "kit":
+        backup_object(data, {"members"})
+        members = backup_list(data["members"])
+        identifiers = set()
+        for member in members:
+            backup_object(member, {"id", "quantity"})
+            identifiers.add(key(member["id"]))
+            quantity(member["quantity"])
+        if not members or len(identifiers) != len(members):
+            raise ValueError("Некорректный состав комплекта в резервной копии реестра.")
+    elif kind in ("drawing", "part"):
+        allowed = {"entities", "warnings"} | ({"patterns"} if kind == "drawing" else {"paths", "pattern", "partLegend"})
+        if data.keys() - allowed:
+            raise ValueError("Некорректные свойства чертежа или детали в резервной копии реестра.")
+        entities = validate_design(data.get("entities"))
+        warnings = data.get("warnings", [])
+        if (not isinstance(warnings, list) or len(warnings) > 32
+                or any(not isinstance(warning, str) or len(warning) > 16_384 for warning in warnings)):
+            raise ValueError("Некорректные предупреждения чертежа в резервной копии реестра.")
+        if kind == "drawing" and "patterns" in data:
+            groups = {entity["groupPath"][1] for entity in entities
+                      if len(entity.get("groupPath", [])) >= 2 and entity["groupPath"][0] == "Лекала 3D"}
+            for identifier, pattern in object_value(data["patterns"]).items():
+                if identifier not in groups:
+                    raise ValueError("Лекало ссылается на отсутствующую группу чертежа.")
+                pattern_record(pattern)
+        if kind == "part":
+            paths = drawing_paths(data.get("paths"))
+            if (not any(path["closed"] for path in paths)
+                    or any(abs(value) > MAX_ABS_COORDINATE_MM for path in paths for point in path["points"] for value in point)):
+                raise ValueError("Некорректные контуры детали в резервной копии реестра.")
+            if "pattern" in data and pattern_record(data["pattern"])["direction"] != "free":
+                if not any(entity["layer"] == "Долевая" and entity.get("reference") and entity["type"] == "line" for entity in entities):
+                    raise ValueError("Для направленной ткани нужна линия долевой.")
+            if "partLegend" in data:
+                legend = backup_object(data["partLegend"], {"developer", "date", "comments"})
+                if not isinstance(legend["date"], str) or not re.fullmatch(r"(?:0[1-9]|1[0-2])\.[0-9]{4}", legend["date"]):
+                    raise ValueError("Некорректная дата легенды в резервной копии реестра.")
+                part_legend(legend)
+    else:
+        raise ValueError("Неизвестный тип записи в резервной копии реестра.")
+
+
+def backup_model(data):
+    try:
+        blob = b64decode(data, validate=True)
+        with gzip.GzipFile(fileobj=BytesIO(blob)) as stream:
+            raw = stream.read(MAX_MODEL_BYTES + 1)
+        if len(raw) > MAX_MODEL_BYTES:
+            raise ValueError("Модель SketchUp превышает допустимый размер.")
+        model = object_value(json.loads(raw))
+    except (Base64Error, OSError, EOFError, CompressionError, UnicodeError, RecursionError, ValueError) as error:
+        raise ValueError("Повреждённая модель SketchUp в резервной копии реестра.") from error
+
+    def coordinates(value, count):
+        return isinstance(value, list) and len(value) == count and all(
+            type(axis) in (int, float) and -float_info.max <= axis <= float_info.max for axis in value)
+
+    def indices(value, count, size):
+        return isinstance(value, list) and len(value) == count and all(type(index) is int and 0 <= index < size for index in value)
+
+    def text(value):
+        return isinstance(value, str) and bool(value)
+
+    bounds = model.get("bounds")
+    if (not text(model.get("name")) or not isinstance(bounds, list) or len(bounds) != 2
+            or not all(coordinates(point, 3) for point in bounds) or any(low > high for low, high in zip(*bounds))):
+        raise ValueError("Некорректная модель SketchUp в резервной копии реестра.")
+    nodes = {}
+    for node in backup_list(model.get("nodes")):
+        node = object_value(node)
+        identifier = node.get("id")
+        vertices, triangles, faces, edges = (node.get(field) for field in ("vertices", "triangles", "faces", "edges"))
+        if (not text(identifier) or identifier in nodes or not text(node.get("name"))
+                or type(node.get("visible", True)) is not bool or not all(isinstance(items, list) for items in (vertices, triangles, faces, edges))
+                or len(triangles) != len(faces) or not all(coordinates(point, 3) for point in vertices) or not all(map(text, faces))
+                or "transform" in node and not coordinates(node["transform"], 16)
+                or any(not indices(item, 3, len(vertices)) for item in triangles)
+                or any(not indices(item, 2, len(vertices)) for item in edges)):
+            raise ValueError("Некорректная геометрия SketchUp в резервной копии реестра.")
+        if "faceLoops" in node:
+            for loops in object_value(node["faceLoops"]).values():
+                if not isinstance(loops, list) or any(not isinstance(loop, list) or len(loop) < 3
+                        or not indices(loop, len(loop), len(vertices)) for loop in loops):
+                    raise ValueError("Некорректный контур грани SketchUp в резервной копии реестра.")
+        if "faceFlags" in node:
+            for flags in object_value(node["faceFlags"]).values():
+                if type(object_value(flags).get("visible", True)) is not bool:
+                    raise ValueError("Некорректная видимость грани SketchUp в резервной копии реестра.")
+        if "edgeFlags" in node and (not isinstance(node["edgeFlags"], list) or len(node["edgeFlags"]) != len(edges)
+                                    or any(any(type(object_value(flag).get(field, False)) is not bool
+                                               for field in ("visible", "soft", "smooth")) for flag in node["edgeFlags"])):
+            raise ValueError("Некорректные свойства рёбер SketchUp в резервной копии реестра.")
+        if (identifier == "root") != (node.get("parent") is None):
+            raise ValueError("Некорректный корень модели SketchUp в резервной копии реестра.")
+        nodes[identifier] = node
+    tree_order(nodes)
+    if not any(node["triangles"] for node in nodes.values()):
+        raise ValueError("В модели SketchUp из резервной копии отсутствуют поверхности.")
+    return blob
 
 
 def order_date(value, label):
@@ -99,8 +310,11 @@ def order_metadata(payload, previous=None):
     notes = payload.get("notes", previous.get("notes", ""))
     if not isinstance(notes, str) or len(notes) > 2000 or any(ord(ch) < 32 and ch not in "\r\n\t" for ch in notes):
         raise ValueError("Введите примечание длиной до 2000 символов.")
+    designation = payload.get("designation", previous.get("designation", ""))
+    if not isinstance(designation, str) or len(designation) > 255 or any(ord(ch) < 32 for ch in designation):
+        raise ValueError("Введите обозначение изделия длиной до 255 символов.")
     return {"number": name(payload.get("number", previous.get("number")), "номер заказа"),
-            "placedOn": placed, "dueOn": due, "notes": notes}
+            "placedOn": placed, "dueOn": due, "notes": notes, "designation": designation.strip()}
 
 
 def row_data(row):
@@ -130,12 +344,58 @@ def new_workspace(paths, filename, width=None):
     })
 
 
+def paths_by_part(paths):
+    groups = defaultdict(list)
+    for path in paths:
+        groups[path.get("partNumber")].append(path)
+    return groups
+
+
+def same_part_geometry(originals, actual):
+    if len(actual) != len(originals):
+        return False
+    angle = actual[0].get("partAngle", 0)
+    cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    source_x, source_y = originals[0]["points"][0]
+    placed_x, placed_y = actual[0]["points"][0]
+    for before, after in zip(originals, actual):
+        if (after.get("partAngle", 0) != angle or before["closed"] != after["closed"]
+                or before["layer"] != after["layer"] or bool(before.get("notch")) != bool(after.get("notch"))
+                or len(before["points"]) != len(after["points"])):
+            return False
+        for (x, y), (u, v) in zip(before["points"], after["points"]):
+            x, y = x - source_x, y - source_y
+            rotated = (x * cosine - y * sine, x * sine + y * cosine)
+            if math.dist(rotated, (u - placed_x, v - placed_y)) > 10 * POINT_EPSILON_MM:
+                return False
+    return True
+
+
+def restore_part_labels(workspace, source, *, check_geometry=False):
+    originals = paths_by_part(source)
+    labels = {}
+    for number, actual in paths_by_part(workspace["paths"]).items():
+        if number is None:
+            continue
+        present = {field: path[field] for path in actual for field in PART_LABEL_FIELDS if field in path}
+        if "partName" in present:
+            labels[number] = present
+            continue
+        if number not in originals:
+            continue
+        original = originals[number]
+        if check_geometry and not same_part_geometry(original, actual):
+            continue
+        labels[number] = {field: path[field] for path in original for field in PART_LABEL_FIELDS if field in path}
+    return {**workspace, "paths": [{**labels.get(path.get("partNumber"), {}), **path} for path in workspace["paths"]]}
+
+
+def missing_part_labels(workspace):
+    return any("partNumber" in path and "partName" not in path for path in workspace["paths"])
+
+
 def check_kit_geometry(source, draft):
-    expected, placed = defaultdict(list), defaultdict(list)
-    for path in source:
-        expected[path["partNumber"]].append(path)
-    for path in draft["paths"]:
-        placed[path.get("partNumber")].append(path)
+    expected, placed = paths_by_part(source), paths_by_part(draft["paths"])
 
     message = "Раскладка должна содержать все исходные резы комплекта. Меняйте только положение и угол деталей."
     if draft["excluded"] or placed.keys() != expected.keys():
@@ -145,19 +405,10 @@ def check_kit_geometry(source, draft):
         if len(actual) != len(originals):
             raise ValueError(message)
         angle = actual[0].get("partAngle", 0)
-        cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-        source_x, source_y = originals[0]["points"][0]
-        placed_x, placed_y = actual[0]["points"][0]
-        for before, after in zip(originals, actual):
-            if (after.get("partAngle", 0) != angle or before["closed"] != after["closed"]
-                    or before["layer"] != after["layer"] or bool(before.get("notch")) != bool(after.get("notch"))
-                    or len(before["points"]) != len(after["points"])):
-                raise ValueError(message)
-            for (x, y), (u, v) in zip(before["points"], after["points"]):
-                x, y = x - source_x, y - source_y
-                rotated = (x * cosine - y * sine, x * sine + y * cosine)
-                if math.dist(rotated, (u - placed_x, v - placed_y)) > 10 * POINT_EPSILON_MM:
-                    raise ValueError(message)
+        if originals[0].get("partRotation") == "none" and abs(math.remainder(angle, 360)) > .001:
+            raise ValueError("Кромка направленной ткани должна идти вдоль рулона.")
+        if not same_part_geometry(originals, actual):
+            raise ValueError(message)
 
 
 class ProductionStore:
@@ -217,6 +468,197 @@ class ProductionStore:
             raise RecordNotFound("Запись в реестре не найдена.")
         return row_data(row)
 
+    @staticmethod
+    def model_attachment(db, drawing_id):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='drawing_models'").fetchone() is None:
+            return {}
+        row = db.execute("SELECT model_id, markup FROM drawing_models WHERE drawing_id=?", (drawing_id,)).fetchone()
+        return {"model3d": {"id": row["model_id"], "state": json.loads(row["markup"])}} if row else {}
+
+    def stage_model(self, model):
+        data = json.dumps(model, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+        model_id = uid()
+        with self.connect(write=True) as db:
+            for statement in MODEL_SCHEMA:
+                db.execute(statement)
+            db.execute("DELETE FROM sketchup_models WHERE expires < unixepoch() AND NOT EXISTS "
+                       "(SELECT 1 FROM drawing_models WHERE model_id=sketchup_models.id)")
+            db.execute("INSERT INTO sketchup_models VALUES (?, unixepoch() + 86400, ?)",
+                       (model_id, gzip.compress(data, compresslevel=3)))
+        return model_id
+
+    def model(self, model_id):
+        model_id = key(model_id)
+        with self.connect() as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='sketchup_models'").fetchone():
+                row = db.execute("SELECT data FROM sketchup_models WHERE id=? AND "
+                                 "(expires >= unixepoch() OR EXISTS "
+                                 "(SELECT 1 FROM drawing_models WHERE model_id=?))", (model_id, model_id)).fetchone()
+                if row:
+                    return bytes(row["data"])
+        raise RecordNotFound("Модель не найдена. Импортируйте файл SketchUp ещё раз.")
+
+    def export_registry(self):
+        with self.connect() as db:
+            entries = [{**dict(row), "data": json.loads(row["data"])}
+                       for row in db.execute("SELECT * FROM registry ORDER BY id")]
+            layouts = []
+            bases = {}
+            for slot in db.execute("SELECT * FROM kit_layouts ORDER BY kit_id, width_mm, quantity"):
+                kit_id = slot["kit_id"]
+                if kit_id not in bases:
+                    bases[kit_id] = self.kit_layout_basis(db, self.layout_kit(db, kit_id))
+                layouts.append({"kitId": kit_id, "widthMm": slot["width_mm"], "quantity": slot["quantity"],
+                                "revision": slot["revision"], "basis": slot["basis"], "valid": slot["basis"] == bases[kit_id],
+                                "workspace": json.loads(slot["data"])})
+            models, links = [], []
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawing_models'").fetchone():
+                links = [{"drawingId": row["drawing_id"], "modelId": row["model_id"], "markup": json.loads(row["markup"])}
+                         for row in db.execute("SELECT * FROM drawing_models ORDER BY drawing_id")]
+                models = [{"id": row["id"], "data": b64encode(row["data"]).decode("ascii")}
+                          for row in db.execute("SELECT id, data FROM sketchup_models WHERE EXISTS "
+                                                "(SELECT 1 FROM drawing_models WHERE model_id=sketchup_models.id) ORDER BY id")]
+            return {"version": REGISTRY_BACKUP_VERSION, "entries": entries, "kitLayouts": layouts,
+                    "models": models, "drawingModels": links}
+
+    @staticmethod
+    def check_registry_restore_references(db, records, revisions):
+        for row in db.execute("SELECT data FROM orders"):
+            model_id = json.loads(row["data"]).get("modelId")
+            if model_id is None:
+                continue
+            entry = records.get(model_id)
+            if not entry or entry["kind"] != "folder" or entry["data"].get("model") is not True:
+                raise WorkspaceConflict("Резервная копия не содержит изделие из существующего наряда.")
+        for row in db.execute("SELECT data FROM cuts"):
+            for member in json.loads(row["data"]).get("members", []):
+                identifier = member["id"]
+                entry = records.get(identifier)
+                previous = revisions.get(identifier)
+                if not entry or entry["kind"] not in ("part", "kit") or (previous and entry["kind"] != previous["kind"]):
+                    raise WorkspaceConflict("Резервная копия изменяет тип или удаляет деталь или комплект из существующего раскроя.")
+
+    def restore_registry(self, snapshot):
+        backup_object(snapshot, {"version", "entries", "kitLayouts", "models", "drawingModels"})
+        if type(snapshot["version"]) is not int or snapshot["version"] != REGISTRY_BACKUP_VERSION:
+            raise ValueError("Версия резервной копии реестра не поддерживается.")
+        total_bytes = 0
+
+        def account(size):
+            nonlocal total_bytes
+            total_bytes += size
+            if total_bytes > MAX_REGISTRY_JSON:
+                raise ValueError("Резервная копия реестра превышает допустимый размер.")
+
+        records, contents = {}, {}
+        for record in backup_list(snapshot["entries"]):
+            backup_object(record, {"id", "kind", "parent", "name", "revision", "data"})
+            identifier = key(record["id"])
+            if identifier in records:
+                raise ValueError("Резервная копия содержит повторяющийся идентификатор записи.")
+            backup_revision(record["revision"])
+            record = {**record, "name": name(record["name"])}
+            validate_registry_entry(record)
+            data = encode(record["data"])
+            account(len(data.encode("utf-8")) + len(record["name"].encode("utf-8")) + 128)
+            records[identifier], contents[identifier] = record, data
+        ordered = tree_order(records)
+        for record in records.values():
+            parent = record["parent"]
+            if parent is not None and records[parent]["kind"] != "folder":
+                raise ValueError("Родителем записи реестра должна быть папка.")
+            if record["kind"] == "kit" and any(records.get(member["id"], {}).get("kind") != "part"
+                                                for member in record["data"]["members"]):
+                raise ValueError("Комплект ссылается на отсутствующую деталь резервной копии.")
+
+        slots = {}
+        for slot in backup_list(snapshot["kitLayouts"]):
+            backup_object(slot, {"kitId", "widthMm", "quantity", "revision", "basis", "valid", "workspace"})
+            kit_id, amount = key(slot["kitId"]), quantity(slot["quantity"])
+            width = slot["widthMm"]
+            if type(width) not in (int, float) or not 1 <= width <= 1_000_000:
+                raise ValueError("Некорректная ширина раскладки комплекта в резервной копии.")
+            selector = kit_id, width, amount
+            if (selector in slots or records.get(kit_id, {}).get("kind") != "kit" or type(slot["valid"]) is not bool
+                    or not isinstance(slot["basis"], str) or not re.fullmatch(r"[0-9a-f]{64}", slot["basis"])):
+                raise ValueError("Некорректная запись раскладки комплекта в резервной копии.")
+            backup_revision(slot["revision"])
+            draft = validate_workspace(slot["workspace"])
+            filename = self.kit_layout_filename(records[kit_id], slot["basis"], amount)
+            if (not draft or draft["source"]["filename"] != filename
+                    or draft["optimization"].get("nesting", {}).get("widthMm") != width):
+                raise ValueError("Некорректная раскладка комплекта в резервной копии.")
+            account(len(encode(draft).encode("utf-8")) + 200)
+            slots[selector] = {**slot, "workspace": draft}
+
+        models, links = {}, {}
+        for model in backup_list(snapshot["models"]):
+            backup_object(model, {"id", "data"})
+            identifier = key(model["id"])
+            if identifier in models or not isinstance(model["data"], str):
+                raise ValueError("Некорректная запись модели SketchUp в резервной копии.")
+            account(len(model["data"]) + 64)
+            models[identifier] = backup_model(model["data"])
+        for link in backup_list(snapshot["drawingModels"]):
+            backup_object(link, {"drawingId", "modelId", "markup"})
+            drawing_id, model_id = key(link["drawingId"]), key(link["modelId"])
+            if drawing_id in links or records.get(drawing_id, {}).get("kind") != "drawing" or model_id not in models:
+                raise ValueError("Некорректная связь чертежа с моделью SketchUp в резервной копии.")
+            state = markup(link["markup"])
+            account(len(state.encode("utf-8")) + 120)
+            links[drawing_id] = (model_id, state)
+        if set(models) != {model_id for model_id, _ in links.values()}:
+            raise ValueError("Резервная копия содержит модель SketchUp без чертежа.")
+
+        with self.connect(write=True) as db:
+            revisions = {row["id"]: row for row in db.execute("SELECT id, kind, revision FROM registry")}
+            self.check_registry_restore_references(db, records, revisions)
+            slot_revisions = {(row["kit_id"], row["width_mm"], row["quantity"]): row["revision"]
+                              for row in db.execute("SELECT kit_id, width_mm, quantity, revision FROM kit_layouts")}
+            for statement in MODEL_SCHEMA:
+                db.execute(statement)
+            attached = {row["model_id"] for row in db.execute("SELECT DISTINCT model_id FROM drawing_models")}
+            for identifier, blob in models.items():
+                existing = db.execute("SELECT data FROM sketchup_models WHERE id=?", (identifier,)).fetchone()
+                if existing and identifier not in attached and blob != existing["data"]:
+                    raise WorkspaceConflict("Модель из копии совпадает по идентификатору с временной моделью в текущем реестре.")
+            db.execute("DELETE FROM drawing_models")
+            db.execute("DELETE FROM kit_layouts")
+            for identifier in ordered:
+                record = records[identifier]
+                old = revisions.get(identifier)
+                db.execute("INSERT INTO registry VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                           "kind=excluded.kind, parent=excluded.parent, name=excluded.name, "
+                           "revision=excluded.revision, data=excluded.data",
+                           (identifier, record["kind"], record["parent"], record["name"],
+                            backup_revision(record["revision"], old["revision"] if old else None), contents[identifier]))
+            db.execute("PRAGMA defer_foreign_keys=ON")
+            db.executemany("DELETE FROM registry WHERE id=?", ((identifier,) for identifier in revisions.keys() - records.keys()))
+            for selector, slot in slots.items():
+                kit_id, width, amount = selector
+                kit = self.layout_kit(db, kit_id)
+                current_basis = self.kit_layout_basis(db, kit)
+                draft, basis = slot["workspace"], slot["basis"]
+                if slot["valid"]:
+                    paths = self.expand_parts(db, [{"id": kit_id, "quantity": amount}])
+                    check_kit_geometry(paths, draft)
+                    verify_arrangement(draft, width)
+                    basis = current_basis
+                    draft["source"]["filename"] = self.kit_layout_filename(kit, basis, amount)
+                elif basis == current_basis:
+                    raise ValueError("Статус сохранённой раскладки комплекта в резервной копии некорректен.")
+                db.execute("INSERT INTO kit_layouts VALUES (?, ?, ?, ?, ?, ?)",
+                           (*selector, backup_revision(slot["revision"], slot_revisions.get(selector)), basis, encode(draft)))
+            db.executemany("DELETE FROM sketchup_models WHERE id=?", ((identifier,) for identifier in attached - models.keys()))
+            for identifier, blob in models.items():
+                db.execute("INSERT INTO sketchup_models VALUES (?, 0, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                           (identifier, blob))
+            db.executemany("INSERT INTO drawing_models VALUES (?, ?, ?)",
+                           ((drawing_id, model_id, state) for drawing_id, (model_id, state) in links.items()))
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise WorkspaceConflict("Резервная копия оставляет несвязанные записи в текущем реестре.")
+        return {"entries": len(records)}
+
     def registry(self, record_id=None):
         with self.connect() as db:
             if record_id is not None:
@@ -227,20 +669,26 @@ class ProductionStore:
                     basis = self.kit_layout_basis(db, entry) if slots else None
                     entry["layouts"] = [{"widthMm": slot["width_mm"], "quantity": slot["quantity"],
                                          "revision": slot["revision"], "valid": slot["basis"] == basis} for slot in slots]
+                elif entry["kind"] == "drawing":
+                    entry.update(self.model_attachment(db, entry["id"]))
                 return entry
-            rows = db.execute("SELECT id, kind, parent, name, revision, "
-                              "CASE WHEN kind = 'folder' THEN data ELSE '{}' END AS data FROM registry")
+            rows = db.execute("SELECT id, kind, parent, name, revision, CASE WHEN kind = 'folder' THEN data "
+                              "WHEN kind = 'part' AND json_type(data, '$.pattern') = 'object' THEN "
+                              "json_object('patternId', json_extract(data, '$.pattern.id'), "
+                              "'patternQuantity', json_extract(data, '$.pattern.quantity')) "
+                              "ELSE '{}' END AS data FROM registry")
             return {"entries": sorted(map(row_data, rows), key=lambda r: (r["name"].casefold(), r["id"]))}
 
-    def save_registry(self, payload):
+    def save_registry(self, payload, *, allow_3d=False):
         record_id = payload.get("id")
         parent = payload.get("parent")
+        moving = payload.get("action") == "move"
         with self.connect(write=True) as db:
             old = None
             if record_id is not None:
                 old = self.registry_record(db, record_id)
                 check_revision(payload.get("revision"), old["revision"])
-            if payload.get("action") == "move":
+            if moving:
                 if old is None:
                     raise ValueError("Выберите запись для перемещения.")
                 payload = {"kind": old["kind"], "name": old["name"], "model": old.get("model")}
@@ -266,7 +714,7 @@ class ProductionStore:
             elif kind == "kit":
                 data = {"members": self.members(db, payload.get("members", old and old["members"]), ("part",))}
             elif old is not None and "entities" not in payload:
-                data = {field: old[field] for field in ("entities", "warnings", "paths") if field in old}
+                data = {field: old[field] for field in ("entities", "warnings", "paths", "pattern", "patterns") if field in old}
             else:
                 entities = validate_design(payload.get("entities"))
                 warnings = payload.get("warnings", [])
@@ -274,11 +722,33 @@ class ProductionStore:
                         or any(not isinstance(w, str) or len(w) > 16_384 for w in warnings)):
                     raise ValueError("Неверные предупреждения чертежа.")
                 data = {"entities": entities, "warnings": warnings}
+                if kind == "drawing" and "patterns" in payload:
+                    patterns = object_value(payload["patterns"])
+                    groups = {item["groupPath"][1] for item in entities if len(item.get("groupPath", [])) >= 2
+                              and item["groupPath"][0] == "Лекала 3D"}
+                    data["patterns"] = {identifier: pattern_record(record) for identifier, record in patterns.items()
+                                        if identifier in groups}
                 if kind == "part":
+                    pattern = payload.get("pattern", old.get("pattern") if old else None)
+                    if pattern:
+                        data["pattern"] = pattern_record(pattern)
+                        if data["pattern"]["direction"] != "free":
+                            if not any(item["layer"] == "Долевая" and item.get("reference") and item["type"] == "line"
+                                       for item in entities):
+                                raise ValueError("Для направленной ткани нужна линия долевой.")
                     prepared = prepare_design(entities)
                     if not any(path["closed"] for path in prepared["paths"]):
                         raise ValueError("Для детали выделите замкнутую кромку и её внутренние контуры.")
                     data.update(paths=prepared["paths"], warnings=prepared["warnings"][:32])
+            if kind == "part":
+                old_legend = old.get("partLegend") if old else None
+                legend = old_legend if moving else part_legend(payload.get("partLegend", old_legend))
+                if legend is not None:
+                    data["partLegend"] = legend
+                if not moving:
+                    if "entities" not in payload:
+                        prepared = prepare_design(data["entities"])
+                    data["entities"], data["paths"] = center_part_geometry(data["entities"], prepared)
             revision = 1 if old is None else old["revision"] + 1
             if old is None:
                 db.execute("INSERT INTO registry VALUES (?, ?, ?, ?, ?, ?)",
@@ -286,7 +756,25 @@ class ProductionStore:
             else:
                 db.execute("UPDATE registry SET name=?, parent=?, revision=?, data=? WHERE id=?",
                            (title, parent, revision, encode(data), record_id))
-            return self.registry_record(db, record_id)
+            if (kind == "part" and old and old["paths"] != data["paths"]
+                    and same_part_geometry(old["paths"], data["paths"])):
+                self.preserve_centered_kit_layouts(db, old)
+            if "model3d" in payload:
+                if not allow_3d or kind != "drawing":
+                    raise ValueError("Модель можно сохранить в локальном чертеже.")
+                attachment = object_value(payload["model3d"])
+                model_id = key(attachment.get("id"))
+                state = markup(attachment.get("state"))
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='sketchup_models'").fetchone() is None:
+                    raise RecordNotFound("Сначала импортируйте модель SketchUp.")
+                row = db.execute("SELECT 1 FROM sketchup_models WHERE id=? AND "
+                                 "(expires >= unixepoch() OR EXISTS "
+                                 "(SELECT 1 FROM drawing_models WHERE model_id=?))", (model_id, model_id)).fetchone()
+                if row is None:
+                    raise RecordNotFound("Модель не найдена. Импортируйте файл SketchUp ещё раз.")
+                db.execute("INSERT INTO drawing_models VALUES (?, ?, ?) ON CONFLICT(drawing_id) DO UPDATE "
+                           "SET model_id=excluded.model_id, markup=excluded.markup", (record_id, model_id, state))
+            return {**self.registry_record(db, record_id), **self.model_attachment(db, record_id)}
 
     def delete_registry(self, payload):
         record_id = key(payload.get("id"))
@@ -319,8 +807,23 @@ class ProductionStore:
             members[record_id] = quantity(members.get(record_id, 0) + quantity(member.get("quantity")))
         return [{"id": record_id, "quantity": amount} for record_id, amount in members.items()]
 
-    def expand_parts(self, db, members, multiplier=1):
+    def expand_parts(self, db, members, multiplier=1, *, part_records=None):
         paths, part_number, point_count = [], 0, 0
+        products = {None: None}
+
+        def product_name(parent):
+            ancestors = []
+            while parent not in products:
+                folder = self.registry_record(db, parent)
+                if folder.get("model") is True:
+                    products[parent] = folder["name"]
+                    break
+                ancestors.append(parent)
+                parent = folder["parent"]
+            title = products[parent]
+            products.update(dict.fromkeys(ancestors, title))
+            return title
+
         for member in members:
             entry = self.registry_record(db, member["id"])
             repeats = quantity(member["quantity"] * multiplier)
@@ -332,12 +835,30 @@ class ProductionStore:
                 point_count += amount * sum(len(path["points"]) for path in contours)
                 if len(paths) + amount * len(contours) > MAX_ENTITIES or point_count > MAX_POINTS:
                     raise ValueError("Слишком много деталей в одном раскрое. Разделите раскладку.")
+                directed = part.get("pattern", {}).get("direction", "free") != "free"
+                if directed:
+                    grain = next(item for item in part["entities"] if item["layer"] == "Долевая"
+                                 and item.get("reference") and item["type"] == "line")
+                    x1, y1 = grain["start"]
+                    x2, y2 = grain["end"]
+                    length = math.hypot(x2 - x1, y2 - y1)
+                    if length <= POINT_EPSILON_MM:
+                        raise ValueError("Линия долевой слишком короткая.")
+                    cosine, sine = (x2 - x1) / length, (y2 - y1) / length
+                    contours = [{**path, "points": [[x * cosine + y * sine, y * cosine - x * sine]
+                                                    for x, y in path["points"]]} for path in contours]
                 min_x = min(x for path in contours for x, _ in path["points"])
                 min_y = min(y for path in contours for _, y in path["points"])
-                normalized = [{**path, "points": [[x - min_x, y - min_y] for x, y in path["points"]]}
-                              for path in contours]
+                labels = {"partName": part["name"]}
+                product = product_name(part["parent"])
+                if product:
+                    labels["productName"] = product
+                normalized = [{**path, "points": [[x - min_x, y - min_y] for x, y in path["points"]],
+                               **labels, **({"partRotation": "none"} if directed else {})} for path in contours]
                 for _ in range(amount):
                     part_number += 1
+                    if part_records is not None:
+                        part_records[part_number] = part
                     paths.extend({**path, "partNumber": part_number} for path in normalized)
         return paths
 
@@ -346,12 +867,36 @@ class ProductionStore:
             members = self.members(db, values, ("part", "kit"))
             return {"paths": self.expand_parts(db, members)}
 
-    def kit_layout_basis(self, db, kit):
+    def kit_layout_basis(self, db, kit, previous_part=None):
         digest = hashlib.sha256(encode(kit["members"]).encode("utf-8"))
         for member in kit["members"]:
-            part = self.registry_record(db, member["id"])
+            part = previous_part if previous_part and previous_part["id"] == member["id"] else self.registry_record(db, member["id"])
             digest.update(encode(part["paths"]).encode("utf-8"))
         return digest.hexdigest()
+
+    def preserve_centered_kit_layouts(self, db, previous_part):
+        kits = db.execute("SELECT DISTINCT registry.* FROM registry JOIN kit_layouts ON kit_layouts.kit_id=registry.id, "
+                          "json_each(registry.data, '$.members') AS member "
+                          "WHERE registry.kind='kit' AND json_extract(member.value, '$.id')=?", (previous_part["id"],)).fetchall()
+        for row in kits:
+            kit = row_data(row)
+            old_basis = self.kit_layout_basis(db, kit, previous_part)
+            basis = self.kit_layout_basis(db, kit)
+            slots = db.execute("SELECT width_mm, quantity, data FROM kit_layouts WHERE kit_id=? AND basis=?",
+                               (kit["id"], old_basis)).fetchall()
+            for slot in slots:
+                amount = slot["quantity"]
+                try:
+                    draft = validate_workspace(json.loads(slot["data"]))
+                    if not draft:
+                        continue
+                    paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
+                    check_kit_geometry(paths, draft)
+                except (ValueError, PlotterError):
+                    continue
+                draft["source"]["filename"] = self.kit_layout_filename(kit, basis, amount)
+                db.execute("UPDATE kit_layouts SET basis=?, data=? WHERE kit_id=? AND width_mm=? AND quantity=?",
+                           (basis, encode(draft), kit["id"], slot["width_mm"], amount))
 
     def layout_kit(self, db, record_id):
         kit = self.registry_record(db, record_id)
@@ -382,6 +927,9 @@ class ProductionStore:
             valid = slot is not None and slot["basis"] == basis
             if valid:
                 draft = json.loads(slot["data"])
+                if missing_part_labels(draft):
+                    paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
+                    draft = restore_part_labels(draft, paths)
             else:
                 paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
                 draft = new_workspace(paths, self.kit_layout_filename(kit, basis, amount), width)
@@ -401,6 +949,7 @@ class ProductionStore:
             paths = self.expand_parts(db, [{"id": kit["id"], "quantity": amount}])
             check_kit_geometry(paths, draft)
             verify_layout(draft, width)
+            draft = restore_part_labels(draft, paths)
             revision += 1
             db.execute("INSERT INTO kit_layouts VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(kit_id, width_mm, quantity) "
                        "DO UPDATE SET revision=excluded.revision, basis=excluded.basis, data=excluded.data",
@@ -431,8 +980,20 @@ class ProductionStore:
                 verify_layout(draft, slot["width_mm"])
             except ValueError:
                 continue
+            draft = restore_part_labels(draft, paths)
             return {**draft, "source": {**draft["source"], "filename": filename}}
         return None
+
+    @staticmethod
+    def order_details(db, order):
+        details = {"placedOn": None, "dueOn": None, "notes": "", "modelId": None, "modelName": None, "quantity": 1,
+                   "designation": "", **order}
+        if not details["modelName"] and isinstance(details["modelId"], str):
+            model = db.execute("SELECT name FROM registry WHERE id=? AND kind='folder' AND json_extract(data, '$.model')=1",
+                               (details["modelId"],)).fetchone()
+            if model:
+                details["modelName"] = model["name"]
+        return details
 
     @staticmethod
     def order_header(db, order_id):
@@ -440,7 +1001,7 @@ class ProductionStore:
         order = row_data(row) if row is not None else None
         if order is None or order.get("deleted"):
             raise RecordNotFound("Наряд не найден.")
-        return {"placedOn": None, "dueOn": None, "notes": "", "modelId": None, "modelName": None, "quantity": 1, **order}
+        return ProductionStore.order_details(db, order)
 
     @staticmethod
     def cut_record(db, cut_id):
@@ -464,8 +1025,7 @@ class ProductionStore:
                 return {**header, "cuts": self.cuts(db, order_id)}
             entries = (row_data(row) for row in db.execute(
                 "SELECT * FROM orders WHERE published >= ? ORDER BY rowid DESC", (int(published_only),)))
-            orders = {order["id"]: {"placedOn": None, "dueOn": None, "notes": "", "modelId": None,
-                                   "modelName": None, "quantity": 1, **order,
+            orders = {order["id"]: {**self.order_details(db, order),
                                    "materials": [], "total": 0, "done": 0, "active": 0}
                       for order in entries if not order.get("deleted")}
             for row in db.execute("SELECT cuts.* FROM cuts JOIN orders ON orders.id=cuts.order_id "
@@ -617,15 +1177,27 @@ class ProductionStore:
     def put_workspace(self, db, cut_id, mode, workspace, previous):
         content = encode(workspace)
         revision = previous["revision"] + 1 if previous else 1
-        # Retain the cutting revision for view-only updates.
+        # View settings and labels do not change the cutting job.
         def geometry(draft):
-            return {field: value for field, value in draft.items() if field != "view"}
+            return {**{field: value for field, value in draft.items() if field not in ("view", "paths")},
+                    "paths": [{field: value for field, value in path.items() if field not in PART_LABEL_FIELDS}
+                              for path in draft["paths"]]}
         cut_revision = (previous["cutRevision"] + (geometry(previous["workspace"]) != geometry(workspace))
                         if previous else 1)
         db.execute("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?) ON CONFLICT(cut_id, mode) DO UPDATE "
                    "SET revision=excluded.revision, cut_revision=excluded.cut_revision, data=excluded.data",
                    (cut_id, mode, revision, cut_revision, content))
         return self.find_workspace(db, cut_id, mode)
+
+    def restore_workspace_part_labels(self, db, cut, order, record):
+        draft = record["workspace"]
+        if not missing_part_labels(draft):
+            return record
+        try:
+            source = self.expand_parts(db, cut["members"], order["quantity"])
+        except (ValueError, RecordNotFound):
+            return record
+        return {**record, "workspace": restore_part_labels(draft, source, check_geometry=True)}
 
     def matching_workspace(self, db, cut, mode):
         if mode not in ("design", "preview", "operator", "demo"):
@@ -640,9 +1212,12 @@ class ProductionStore:
                 raise WorkspaceConflict("Конструктор обновляет раскладку. Дождитесь её отправки.")
         base = self.find_workspace(db, cut["id"], "design")
         if mode in ("design", "preview"):
-            return base
-        work = self.find_workspace(db, cut["id"], mode)
-        return work or {"revision": 0, "cutRevision": base["cutRevision"], "workspace": base["workspace"]}
+            record = base
+        else:
+            record = self.find_workspace(db, cut["id"], mode) or {"revision": 0, "cutRevision": base["cutRevision"],
+                                                                  "workspace": base["workspace"]}
+        record = self.restore_workspace_part_labels(db, cut, order, record)
+        return {**record, "order": {field: order[field] for field in ("id", "number", "designation", "modelName")}}
 
     def workspace(self, cut_id, mode):
         with self.connect() as db:
@@ -660,6 +1235,8 @@ class ProductionStore:
             draft = validate_workspace(payload.get("workspace"))
             if not draft or draft["source"]["filename"] != current["workspace"]["source"]["filename"]:
                 raise ValueError("Сохраните раскладку для этого пункта наряда.")
+            if missing_part_labels(draft):
+                draft = restore_part_labels(draft, current["workspace"]["paths"])
             width = cut["widthMm"]
             layout_width = draft["optimization"].get("nesting", {}).get("widthMm")
             if mode == "design" and width is not None and layout_width != width:

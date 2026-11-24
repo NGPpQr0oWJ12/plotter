@@ -29,6 +29,13 @@ def tilt(path, angle, *, x=0, y=0):
 
 
 class NestingTests(unittest.TestCase):
+    def test_registry_part_names_follow_numbered_parts_after_nesting(self):
+        paths = [{**rectangle(0, 0, 90, 50), "partNumber": 5, "partName": "Сиденье", "productName": "Диван"},
+                 {**rectangle(0, 0, 30, 40), "partNumber": 7, "partName": "Вставка"}]
+        result = pack(paths)["paths"]
+        self.assertEqual([(p["partNumber"], p["partName"], p.get("productName")) for p in result],
+                         [(5, "Сиденье", "Диван"), (7, "Вставка", None)])
+
     def test_omitted_and_null_fabric_length_preserve_unlimited_layout(self):
         paths = [rectangle(0, index * 160, 90, 50) for index in range(2)]
         options = dict(width_mm=100, gap_mm=4, margin_mm=10, page_length_mm=119.88)

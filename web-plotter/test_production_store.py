@@ -1,4 +1,7 @@
+from base64 import b64encode
+from copy import deepcopy
 from datetime import datetime
+import gzip
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,12 +41,147 @@ class ProductionTests(unittest.TestCase):
             path["points"] = [[x + 50 * path["partNumber"], y] for x, y in path["points"]]
         self.store.save_workspace({"cutId": cut_id, **record}, "design", verify_arrangement)
 
+    def save_backup_layout(self, amount=1):
+        draft = self.store.kit_layout(self.kit["id"], 1500, amount)
+        for path in draft["workspace"]["paths"]:
+            path["points"] = [[x + 50 * path["partNumber"], y] for x, y in path["points"]]
+        return self.store.save_kit_layout(draft, verify_arrangement)
+
+    def backup_model(self):
+        return {"name": "Обивка.skp", "bounds": [[0, 0, 0], [20, 20, 0]], "nodes": [{
+            "id": "root", "parent": None, "name": "Обивка", "visible": True,
+            "vertices": [[0, 0, 0], [20, 0, 0], [0, 20, 0]], "triangles": [[0, 1, 2]],
+            "faces": ["face"], "edges": [[0, 1], [1, 2], [2, 0]],
+        }]}
+
+    def test_export_restore_roundtrip_keeps_kit_and_attached_models_only(self):
+        self.add_cut("Заказ не переносится")
+        saved_layout = self.save_backup_layout()
+        model = self.backup_model()
+        model_id = self.store.stage_model(model)
+        self.store.stage_model(model)
+        markup = {"panels": [{"id": "front", "nodeId": "root", "faces": ["face"]}]}
+        drawings = [self.store.save_registry({"kind": "drawing", "name": title, "parent": self.folder["id"],
+                    "entities": self.part["entities"], "model3d": {"id": model_id, "state": markup}}, allow_3d=True)
+                    for title in ("Лицевая сторона", "Изнанка")]
+        snapshot = json.loads(json.dumps(self.store.export_registry(), ensure_ascii=False))
+        self.assertEqual(set(snapshot), {"version", "entries", "kitLayouts", "models", "drawingModels"})
+        self.assertEqual([item["id"] for item in snapshot["models"]], [model_id])
+        target = ProductionStore(self.store.path.with_name("restored.sqlite3"))
+        staged = target.stage_model(model)
+        self.assertEqual(target.restore_registry(snapshot), {"entries": 6})
+        self.assertEqual(target.export_registry(), snapshot)
+        self.assertEqual(target.kit_layout(self.kit["id"], 1500, 1), saved_layout)
+        self.assertEqual(target.orders(), {"orders": []})
+        self.assertEqual(target.model(model_id), self.store.model(model_id))
+        self.assertEqual(json.loads(gzip.decompress(target.model(staged))), model)
+        for drawing in drawings:
+            self.assertEqual(target.registry(drawing["id"]), drawing)
+        target.check()
+        damaged = deepcopy(snapshot)
+        model["nodes"][0]["triangles"][0][-1] = 20
+        damaged["models"][0]["data"] = b64encode(gzip.compress(json.dumps(model).encode())).decode()
+        with self.assertRaisesRegex(ValueError, "геометрия SketchUp"):
+            target.restore_registry(damaged)
+        self.assertEqual(target.export_registry(), snapshot)
+
+    def test_restore_keeps_stale_kit_layout_and_accepts_reordered_json_for_valid_layout(self):
+        saved = self.save_backup_layout()
+        target = ProductionStore(self.store.path.with_name("restored.sqlite3"))
+        reordered = json.loads(json.dumps(self.store.export_registry(), sort_keys=True))
+        target.restore_registry(reordered)
+        restored = target.kit_layout(self.kit["id"], 1500, 1)
+        self.assertTrue(restored["valid"])
+        self.assertEqual(restored["workspace"]["paths"], saved["workspace"]["paths"])
+        wider = {**self.part["entities"][0], "points": [[0, 0], [48, 0], [48, 30], [0, 30]]}
+        self.store.save_registry({**self.part, "entities": [wider]})
+        stale_snapshot = self.store.export_registry()
+        self.assertFalse(stale_snapshot["kitLayouts"][0]["valid"])
+        target.restore_registry(stale_snapshot)
+        target_slot = target.export_registry()["kitLayouts"][0]
+        self.assertEqual(target_slot["workspace"], stale_snapshot["kitLayouts"][0]["workspace"])
+        self.assertEqual(target_slot["basis"], stale_snapshot["kitLayouts"][0]["basis"])
+        self.assertFalse(target_slot["valid"])
+
+    def test_restore_advances_existing_entries_and_slots_without_touching_cut_workspace(self):
+        cut = self.add_cut("Велюр")
+        layout = self.save_backup_layout()
+        archived = self.store.export_registry()
+        current_part = self.store.save_registry({**self.part, "name": "Переименовано"})
+        latest_layout = self.store.save_kit_layout(layout, verify_arrangement)
+        workspace, orders = self.store.workspace(cut, "design"), self.store.orders()
+        self.store.save_registry({"kind": "folder", "name": "Лишняя папка"})
+        self.assertEqual(self.store.restore_registry(archived), {"entries": 4})
+        self.assertEqual(self.store.registry(self.part["id"])["revision"], current_part["revision"] + 1)
+        restored = self.store.kit_layout(self.kit["id"], 1500, 1)
+        self.assertTrue(restored["valid"])
+        self.assertEqual(restored["revision"], latest_layout["revision"] + 1)
+        self.assertEqual(restored["workspace"], layout["workspace"])
+        self.assertEqual(self.store.workspace(cut, "design"), workspace)
+        self.assertEqual(self.store.orders(), orders)
+        with self.assertRaises(WorkspaceConflict):
+            self.store.save_registry({**current_part, "name": "Устаревшая вкладка"})
+        with self.assertRaises(WorkspaceConflict):
+            self.store.save_kit_layout(latest_layout, verify_arrangement)
+
+    def test_restore_rejects_cycles_or_orphaned_cuts_and_rolls_back_bad_kit_geometry(self):
+        cut = self.add_cut("Велюр")
+        self.save_backup_layout()
+        original = self.store.export_registry()
+        workspace = self.store.workspace(cut, "design")
+        cycle = deepcopy(original)
+        next(record for record in cycle["entries"] if record["id"] == self.model["id"])["parent"] = self.folder["id"]
+        without_model = deepcopy(original)
+        next(record for record in without_model["entries"] if record["id"] == self.model["id"])["data"]["model"] = False
+        without_kit = {**original, "entries": [record for record in original["entries"] if record["id"] != self.kit["id"]],
+                       "kitLayouts": []}
+        changed_kind = deepcopy(without_kit)
+        changed_kind["entries"].append({**next(record for record in original["entries"] if record["id"] == self.part["id"]),
+                                         "id": self.kit["id"]})
+        bad_geometry = deepcopy(original)
+        bad_geometry["kitLayouts"][0]["workspace"]["paths"][0]["points"][1][0] += 1
+        for snapshot, error in ((cycle, "циклическую"), (without_model, "существующего наряда"), (without_kit, "существующего раскроя"),
+                                (changed_kind, "существующего раскроя"), (bad_geometry, "все исходные резы")):
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                self.store.restore_registry(snapshot)
+            self.assertEqual(self.store.export_registry(), original)
+            self.assertEqual(self.store.workspace(cut, "design"), workspace)
+
     def test_registry_tree_and_conflicting_writes(self):
         with self.assertRaises(ValueError):
             self.store.save_registry({**self.model, "parent": self.folder["id"]})
         self.store.save_registry({**self.model, "name": "Диван с подушками"})
         with self.assertRaises(WorkspaceConflict):
             self.store.save_registry({**self.model, "name": "Старая вкладка"})
+
+    def test_saved_part_centers_cut_geometry_and_keeps_legend_internal(self):
+        entities = [
+            {"id": "cut", "type": "circle", "layer": "Рез", "center": [105, 207], "radius": 23},
+            {"id": "notch", "type": "line", "layer": "Надсечки", "parentId": "cut", "notch": True,
+             "start": [128, 207], "end": [129, 207]},
+            {"id": "axis", "type": "line", "layer": "Долевая", "reference": True,
+             "start": [85, 180], "end": [150, 180]},
+            {"id": "seam", "type": "spline", "layer": "Шов", "reference": True,
+             "fitPoints": [[100, 200], [105, 201], [110, 200]]},
+        ]
+        draft = {"kind": "part", "parent": self.folder["id"], "name": "Круг", "entities": entities,
+                 "partLegend": {"developer": "", "comments": "Уточнить припуск\nПроверить долевую", "date": "01.1999"}}
+        saved = self.store.save_registry(draft)
+        shapes = {entity["id"]: entity for entity in saved["entities"]}
+        self.assertEqual(shapes["cut"]["center"], [0, 0])
+        self.assertEqual(shapes["notch"]["start"], [23, 0])
+        self.assertEqual(shapes["notch"]["parentId"], "cut")
+        self.assertEqual(shapes["axis"]["start"], [-20, -27])
+        self.assertEqual(shapes["seam"]["fitPoints"], [[-5, -7], [0, -6], [5, -7]])
+        self.assertEqual(saved["partLegend"], {**draft["partLegend"], "date": datetime.now(MOSCOW_TIME).strftime("%m.%Y")})
+        self.assertEqual(self.store.registry(saved["id"])["partLegend"], saved["partLegend"])
+        resaved = self.store.save_registry({**saved, "partLegend": {**saved["partLegend"], "developer": "  И. Иванов  ", "date": "12.2000"}})
+        self.assertEqual(resaved["entities"], saved["entities"])
+        self.assertEqual(resaved["partLegend"]["developer"], "И. Иванов")
+        self.assertEqual(resaved["partLegend"]["date"], datetime.now(MOSCOW_TIME).strftime("%m.%Y"))
+        collected = self.store.collect([self.member(resaved)])["paths"]
+        self.assertEqual(len(collected), 2)
+        self.assertTrue(all("partLegend" not in path for path in collected))
 
     def test_registry_move_preserves_content_and_delete_respects_history(self):
         with self.assertRaises(WorkspaceConflict):
@@ -118,6 +256,45 @@ class ProductionTests(unittest.TestCase):
             default = self.store.workspace(material["id"], "design")["workspace"]
             self.assertEqual(default["paths"][0]["points"], before["workspace"]["paths"][0]["points"])
 
+    def test_existing_kit_layout_recovers_part_names_per_copy(self):
+        loose = self.store.save_registry({"kind": "part", "name": "Вставка", "entities": self.part["entities"]})
+        kit = self.store.save_registry({**self.kit, "members": [self.member(self.part, 2), self.member(loose)]})
+        draft = self.store.kit_layout(kit["id"], 1500, 1)
+        for path in draft["workspace"]["paths"]:
+            path["points"] = [[50 * path["partNumber"] - y, x + 10] for x, y in path["points"]]
+            path["partAngle"] = 90
+        saved = self.store.save_kit_layout(draft, verify_arrangement)
+        paths = saved["workspace"]["paths"]
+        self.assertEqual([(p["partNumber"], p["partName"], p.get("productName")) for p in paths],
+                         [(1, "Сиденье", "Диван"), (2, "Сиденье", "Диван"), (3, "Вставка", None)])
+        legacy = {**saved["workspace"], "paths": [{k: v for k, v in path.items() if k not in ("partName", "productName")}
+                                                   for path in paths]}
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE kit_layouts SET data=? WHERE kit_id=?", (json.dumps(legacy), kit["id"]))
+        self.assertEqual(self.store.kit_layout(kit["id"], 1500, 1), saved)
+
+    def test_legacy_operator_layout_recovers_names_without_changing_cut_revision(self):
+        cut_id = self.add_cut("Велюр")
+        self.arrange(cut_id)
+        self.order = self.store.publish_order(self.order, verify_arrangement)
+        record = self.store.progress(cut_id, "start", "operator")
+        saved = self.store.save_workspace({"cutId": cut_id, **record}, "operator", verify_arrangement)
+        legacy = saved["workspace"]
+        for path in legacy["paths"]:
+            path.pop("partName")
+            path.pop("productName")
+        legacy["paths"][0]["points"][1][0] += 5
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE workspaces SET data=? WHERE cut_id=? AND mode='operator'", (json.dumps(legacy), cut_id))
+        restored = self.store.workspace(cut_id, "operator")
+        actual = restored["workspace"]["paths"]
+        self.assertEqual([(p.get("partName"), p.get("productName")) for p in actual],
+                         [(None, None), *(("Сиденье", "Диван"),) * 3])
+        self.assertEqual(restored["cutRevision"], saved["cutRevision"])
+        persisted = self.store.save_workspace({"cutId": cut_id, **restored}, "operator", verify_arrangement)
+        self.assertEqual(persisted["cutRevision"], saved["cutRevision"])
+        self.assertEqual(persisted["workspace"]["paths"], actual)
+
     def test_kit_layout_rejects_changed_geometry_and_invalidates_after_source_edit(self):
         draft = self.store.kit_layout(self.kit["id"], 1500, 2)
         for path in draft["workspace"]["paths"]:
@@ -144,6 +321,28 @@ class ProductionTests(unittest.TestCase):
         self.add_cut("Новый размер детали")
         self.assertFalse(self.order["cuts"][-1]["prepared"])
         self.assertEqual(self.store.workspace(cut_id, "design"), before)
+
+    def test_centering_a_legacy_part_preserves_saved_kit_layout(self):
+        with self.store.connect(write=True) as db:
+            row = db.execute("SELECT data FROM registry WHERE id=?", (self.part["id"],)).fetchone()
+            legacy = json.loads(row["data"])
+            for shape in legacy["entities"] + legacy["paths"]:
+                shape["points"] = [[x + 235, y + 90] for x, y in shape["points"]]
+            db.execute("UPDATE registry SET data=? WHERE id=?", (json.dumps(legacy), self.part["id"]))
+        draft = self.store.kit_layout(self.kit["id"], 1500, 1)
+        for path in draft["workspace"]["paths"]:
+            path["points"] = [[80 * path["partNumber"] - y, x + 12] for x, y in path["points"]]
+            path["partAngle"] = 90
+        saved = self.store.save_kit_layout(draft, verify_arrangement)
+        metadata = {key: self.part[key] for key in ("id", "revision", "kind", "name", "parent")}
+        centered = self.store.save_registry({**metadata, "partLegend": {}})
+        self.assertEqual(centered["entities"], self.part["entities"])
+        restored = self.store.kit_layout(self.kit["id"], 1500, 1)
+        self.assertTrue(restored["valid"])
+        self.assertEqual(restored["revision"], saved["revision"])
+        self.assertEqual(restored["workspace"]["paths"], saved["workspace"]["paths"])
+        self.assertNotEqual(restored["workspace"]["source"]["filename"], saved["workspace"]["source"]["filename"])
+        self.assertTrue(self.store.save_kit_layout(restored, verify_arrangement)["valid"])
 
     def test_no_width_prefers_newest_distinct_compatible_kit_layout(self):
         def save_variant(width):

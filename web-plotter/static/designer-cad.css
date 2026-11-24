@@ -44,6 +44,34 @@
 .cad-editor .button.primary:hover:not(:disabled) { background: #383838; }
 .cad-editor .button.primary:disabled { color: #595959; background: #e7e7e7; border-color: #ccc; }
 .cad-work { display: grid; grid-template-columns: auto minmax(0, 1fr); min-height: 0; container: cad-work / size; }
+.cad-work:has(.cad-part-legend:not([hidden])) { grid-template-columns: auto minmax(0, 1fr) minmax(210px, 275px); }
+
+.cad-part-legend {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+  overflow: auto;
+  padding: 18px;
+  border-left: 1px solid #c6c6c6;
+  background: #fff;
+  font-family: "OpenGost Type B", sans-serif;
+}
+.cad-part-legend[hidden] { display: none; }
+.cad-part-legend h2 { margin: 0; font-size: 22px; font-weight: 600; }
+.cad-editor .cad-part-legend label, .cad-part-legend-date { display: grid; gap: 4px; font-size: 16px; }
+.cad-part-legend-date { grid-template-columns: 1fr auto; align-items: baseline; padding-block: 5px; border-bottom: 1px solid #ddd; }
+.cad-part-legend input, .cad-part-legend textarea { font: inherit; }
+.cad-part-legend textarea { width: 100%; min-height: 72px; padding: 6px 9px; border: 1px solid #b0b0b0; border-radius: 4px; resize: vertical; }
+.cad-part-legend .button { justify-self: start; }
+
+@media (max-width: 720px) {
+  .cad-work:has(.cad-part-legend:not([hidden])) {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .cad-part-legend { grid-column: 1 / -1; max-height: 32vh; border-left: 0; border-top: 1px solid #c6c6c6; padding: 12px; }
+}
 
 .cad-tools {
   --cad-tool-columns: 2;

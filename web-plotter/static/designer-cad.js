@@ -545,6 +545,64 @@ function transform(entity, point, reflected) {
   return next;
 }
 
+function linkedGroups(entities) {
+  const index = new Map(entities.map(entity => [entity.id, entity]));
+  const groups = new Map();
+  for (const entity of entities) {
+    const path = (index.get(entity.parentId) || entity).groupPath;
+    if (path?.[0] !== "Лекала 3D" || !path[1]) continue;
+    if (!groups.has(path[1])) groups.set(path[1], []);
+    groups.get(path[1]).push(entity);
+  }
+  return groups;
+}
+
+function linkedFrame(group) {
+  const points = group.find(entity => entity.layer === "Линия шва" && entity.reference && entity.closed)?.points;
+  const first = points?.[0], next = first && points.find(p => norm(sub(p, first)) > EPSILON);
+  return next ? [...first, Math.atan2(next[1] - first[1], next[0] - first[0])] : null;
+}
+
+function frameMap(source, target) {
+  const delta = target[2] - source[2], c = Math.cos(delta), s = Math.sin(delta);
+  return ([px, py]) => {
+    const x = px - source[0], y = py - source[1];
+    return [target[0] + x*c - y*s, target[1] + x*s + y*c];
+  };
+}
+
+function linkedRoles(group) {
+  const counts = new Map();
+  return group.map(entity => {
+    const role = JSON.stringify([entity.type, entity.layer, !!entity.notch, !!entity.reference]);
+    const i = counts.get(role) || 0;
+    counts.set(role, i + 1);
+    return role + i;
+  });
+}
+
+function canonicalCadValue(value) {
+  if (typeof value === "number") return Math.round(value * 1e6) / 1e6;
+  if (Array.isArray(value)) return value.map(canonicalCadValue);
+  if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort()
+    .map(key => [key, canonicalCadValue(value[key])]));
+  return value;
+}
+
+async function linkedHash(group, frame) {
+  if (!frame) return null;
+  const normalize = frameMap(frame, [0, 0, 0]);
+  const roles = linkedRoles(group), lookup = new Map(group.map((entity, i) => [entity.id, roles[i]]));
+  const records = group.map((entity, i) => {
+    const record = transform(entity, normalize);
+    record.id = roles[i];
+    if (record.parentId) record.parentId = lookup.get(record.parentId) || record.parentId;
+    return record;
+  }).sort((a,b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(canonicalCadValue(records))));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function projectToSegment(point, a, b) {
   const vector = sub(b, a);
   const squared = dot(vector, vector);
@@ -726,6 +784,10 @@ const CAD_ICONS = {
   spline: '<path d="M3 16c5 0 3-9 8-9s3 9 10 9"/><circle cx="3" cy="16" r="1"/><circle cx="11" cy="7" r="1"/><circle cx="21" cy="16" r="1"/>',
   move: '<path d="M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3m12-6 3 3-3 3"/>',
   rotate: '<use href="#i-turn-cw"/>',
+  pan: '<path d="M7 13V7a1.5 1.5 0 0 1 3 0v4-6a1.5 1.5 0 0 1 3 0v6-5a1.5 1.5 0 0 1 3 0v6-3a1.5 1.5 0 0 1 3 0v6a6 6 0 0 1-6 6h-1a4 4 0 0 1-3-1.3l-4.3-4.4a1.5 1.5 0 0 1 2.1-2.1l.2.2Z"/>',
+  grain: '<path d="M12 3v18M8 7l4-4 4 4m-8 10 4 4 4-4"/>',
+  fabric: '<path d="m3 6 5-2 8 2 5-2v14l-5 2-8-2-5 2V6Zm5-2v14m8-12v14M3 11l5-2 8 2 5-2M3 15l5-2 8 2 5-2"/>',
+  rename: '<path d="m4 16 12-12 4 4L8 20H4v-4ZM13 7l4 4"/>',
   scale: '<path d="M13 4h7v7m0-7-8 8"/><rect x="4" y="12" width="8" height="8" rx="1"/>',
   mirror: '<path d="M12 3v18M9 5 3 18h6Zm6 0 6 13h-6Z"/>',
   join: '<path d="M12 9V5H5a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h7m0-2h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7v-4M8 12h8"/>',
@@ -735,6 +797,7 @@ const CAD_ICONS = {
   offset: '<path d="M5 20V5h15M9 20V9h11m-5 6h5m-2-2 2 2-2 2"/>',
   fillet: '<path d="M4 20v-8a8 8 0 0 1 8-8h8"/><path d="m13 13-5-5m3 0H8v3"/>',
   notch: '<path d="M3 17h7l2-5 2 5h7m-9-9V4m-2 2 2 2 2-2"/>',
+  slit: '<path d="M4 17h5m6 0h5m-8 0 4-12"/><circle cx="11" cy="19" r="2"/>',
   "notch-series": '<path d="M3 17h18M6 17v-6m6 6v-6m6 6v-6M3 6h18"/>',
   "notch-edit": '<path d="M3 18h18m-9 0V8M4 6h16m-3-3 3 3-3 3M7 3 4 6l3 3"/>',
   "notch-convert": '<path d="m3 11 5-5m1 8h6m-2-2 2 2-2 2m3 3h5m-2 0v-8"/>',
@@ -775,6 +838,7 @@ const markup = `
     <div class="cad-actions" role="group" aria-label="Чертёж">
       <button type="button" class="button" data-action="import">Импорт DXF / DWG</button>
       <input type="file" data-field="file" accept=".dxf,.dwg" hidden>
+      <button type="button" class="button" data-action="part-legend" aria-expanded="false" hidden>Легенда</button>
       <button type="button" class="button" data-action="save">Сохранить чертёж</button>
       <button type="button" class="button primary" data-action="part">Сохранить деталь</button>
     </div>
@@ -861,6 +925,13 @@ const markup = `
         <button class="button" type="button" data-action="cancel-preview">Отмена</button>
       </div>
     </div>
+    <aside class="cad-part-legend" data-view="part-legend" aria-label="Легенда детали" hidden>
+      <h2>Легенда детали</h2>
+      <label>Разработчик<input data-field="part-developer" maxlength="255" autocomplete="off"></label>
+      <div class="cad-part-legend-date"><span>Дата составления</span><output data-view="part-date" aria-label="Дата составления">—</output></div>
+      <label>Особые комментарии<textarea data-field="part-comments" maxlength="2000" rows="5"></textarea></label>
+      <button type="button" class="button" data-action="remove-part-legend">Убрать легенду</button>
+    </aside>
   </div>
   <div class="cad-footer">
       <div class="cad-command" data-view="context" hidden>
@@ -889,6 +960,7 @@ const markup = `
         <button class="button cad-action-reference" type="button" data-action="reference" hidden>${cadIcon("reference")}<span></span></button>
       </div>
       <div class="cad-settings">
+        <button type="button" class="button" data-action="linked-pattern" hidden>Лекало 3D</button>
         <button type="button" class="button cad-action-tools" data-action="tools" aria-expanded="false">${cadIcon("tools")}<span>Привязки</span></button>
         <div class="cad-snaps" data-view="tools-panel" role="group" aria-label="Привязки" hidden>
           <strong>Привязки</strong>
@@ -905,6 +977,25 @@ const markup = `
       </div>
     </div>
   </div>
+  <dialog class="plotter-dialog cad-parameter-dialog" data-view="linked-pattern" aria-label="Связь лекала с 3D">
+    <header class="drawing-dialog-heading"><h2>Лекало 3D</h2></header>
+    <form data-form="linked-pattern">
+      <div class="drawing-dialog-body">
+        <label>Лекало <select name="panel"></select></label>
+        <p data-view="linked-status" role="status"></p>
+        <label>Название <input name="panelName" maxlength="120" required></label>
+        <label>Количество <input name="quantity" type="number" min="1" max="999" step="1" required></label>
+        <label>Сторона <select name="side"><option value="">Общая</option><option value="left">Левая</option><option value="right">Правая</option></select></label>
+        <label>Направление <select name="direction"><option value="free">Свободное</option><option value="grain">По долевой</option><option value="nap">По ворсу</option></select></label>
+        <label>Припуск детали, мм <input name="allowance" type="number" min="0" max="1000" step="any" placeholder="Общий припуск"></label>
+      </div>
+      <footer class="drawing-dialog-actions">
+        <button type="button" class="button" name="closeDialog">Закрыть</button>
+        <button type="button" class="button" name="replace" hidden>Заменить правки 2D геометрией из 3D</button>
+        <button type="submit" class="button primary">Сохранить свойства</button>
+      </footer>
+    </form>
+  </dialog>
   <dialog class="plotter-dialog cad-parameter-dialog" data-view="parameters">
     <header class="drawing-dialog-heading"><h2 data-view="parameter-title"></h2></header>
     <form data-form="option" novalidate>
@@ -997,7 +1088,8 @@ function followGrip(notch, previousEntity, nextEntity, previousPath, nextPath) {
   return { ...notch, start: next.point, end: add(next.point, sub(turned, notch.start)) };
 }
 
-export function mountCadEditor(container, { document: draft, onBack, onSaveDocument, onSavePart, request, layoutPart = false }) {
+export function mountCadEditor(container, { document: draft, onBack, onSaveDocument, onSavePart, request,
+  layoutPart = false, sketchupDesign = false }) {
   container.classList.add("cad-editor");
   container.innerHTML = markup;
   const root = container.ownerDocument;
@@ -1019,11 +1111,23 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   actions.tools.setAttribute("aria-controls", toolsPanel.id);
   const lifecycle = new AbortController();
   const listener = { signal: lifecycle.signal };
+  let model3d = draft?.model3d;
+  let savedModel3d = model3d;
+  let patternWorkspace;
+  let projectionVersion = 0, latestProjection = null, projectionRequest = null, projectionMerge = null;
+  let reverseEdit = null;
+  const acceptedContours = new Map();
+  let linkConflicts = new Map(), linkIssues = new Map();
+  const linkedDialog = views["linked-pattern"];
+  const linkedForm = linkedDialog.querySelector("form");
   const previous = [];
   const future = [];
   const geometryCache = new WeakMap();
-  const existingPart = draft?.kind === "part";
-  const initial = { entities: draft?.entities || [], warnings: (draft?.warnings || []).filter(warning => warning !== LEGACY_DEFAULT_UNITS_WARNING) };
+  const existingPart = !layoutPart && draft?.kind === "part";
+  let savedLegend = existingPart ? draft.partLegend ?? null : null;
+  let partLegendEnabled = Boolean(savedLegend);
+  const initial = { entities: draft?.entities || [], warnings: (draft?.warnings || []).filter(warning => warning !== LEGACY_DEFAULT_UNITS_WARNING),
+    ...(draft?.patterns ? { patterns: draft.patterns } : {}) };
   let current = initial;
   let byId = new Map(current.entities.map(entity => [entity.id, entity]));
   let activeGroup = [];
@@ -1106,6 +1210,32 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions.save.classList.add("primary");
     actions.part.textContent = "Сохранить как новую деталь";
     actions.part.classList.remove("primary");
+    actions["part-legend"].hidden = false;
+    views["part-legend"].id = `cad-part-legend-${cadToolsPanelSequence}`;
+    actions["part-legend"].setAttribute("aria-controls", views["part-legend"].id);
+    readPartLegend(savedLegend);
+    showPartLegend(partLegendEnabled);
+  }
+
+  function readPartLegend(legend) {
+    fields["part-developer"].value = legend?.developer || "";
+    fields["part-comments"].value = legend?.comments || "";
+    views["part-date"].textContent = legend?.date || "—";
+  }
+
+  function showPartLegend(visible) {
+    views["part-legend"].hidden = !visible;
+    actions["part-legend"].setAttribute("aria-expanded", String(visible));
+  }
+
+  function partLegend() {
+    return partLegendEnabled ? { developer: fields["part-developer"].value.trim(), comments: fields["part-comments"].value } : null;
+  }
+
+  function legendChanged() {
+    const value = partLegend();
+    return Boolean(value) !== Boolean(savedLegend) ||
+      Boolean(value && (value.developer !== savedLegend?.developer || value.comments !== savedLegend?.comments));
   }
 
   function geometry(entity) {
@@ -1446,6 +1576,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
 
   function log(message = "", error = false) {
     if (message) clearRepairDiagnostics();
+    if (patternWorkspace?.isVisible()) patternWorkspace.notify(message, error);
     views.message.textContent = message;
     views.message.hidden = !message;
     views.message.classList.toggle("cad-error", error);
@@ -1677,6 +1808,9 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function update() {
+    actions["linked-pattern"].hidden = !sketchupDesign || !model3d ||
+      !(model3d.state?.panels?.length || Object.keys(model3d.state?.cadLinks || {}).length);
+    actions["linked-pattern"].textContent = linkConflicts.size || linkIssues.size ? "Лекало 3D · проверить" : "Лекало 3D";
     const items = selectedEntities();
     const units = selectionUnits(selected);
     const count = units.count;
@@ -1728,6 +1862,8 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     actions.import.disabled = running || active;
     actions.save.disabled = running || active;
     actions.part.disabled = running || active || !outlines.some(entity => !entity.reference);
+    actions["part-legend"].disabled = actions["remove-part-legend"].disabled = running;
+    fields["part-developer"].readOnly = fields["part-comments"].readOnly = running;
     views["notch-preview"].hidden = !notchPreview;
     views.measurements.hidden = !["measure", "measure-radius"].includes(tool) || !measurements.length;
     views.erase.hidden = tool !== "erase" || !settings;
@@ -1787,9 +1923,10 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function rememberEdit() {
-    previous.push({ drawing: current, measurements });
+    previous.push({ drawing: current, measurements, model3d });
     if (previous.length > 50) previous.shift();
     future.length = 0;
+    patternWorkspace?.updateHistory();
   }
 
   function changeMeasurements(next) {
@@ -1799,18 +1936,21 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     update();
   }
 
-  function commit(entities, { warnings = current.warnings, ids = selected, amend = false, nextMeasurements = measurements } = {}) {
+  function commit(entities, { warnings = current.warnings, ids = selected, amend = false, nextMeasurements = measurements,
+    patterns = current.patterns } = {}) {
     if (!amend) rememberEdit();
     copyArray = null;
     arrayInput = "";
     future.length = 0;
     measurements = nextMeasurements;
     selectedMeasurement = null;
-    setCurrent({ entities, warnings });
+    const oldEntities = current.entities;
+    setCurrent({ entities, warnings, ...(patterns ? { patterns } : {}) });
     if (ids !== selected) selectedEdges.clear();
     selected = new Set([...ids].filter(id => canvasShows(byId.get(id))));
     updateWarnings(warnings);
     update();
+    if (model3d?.state?.cadLinks) trackLinkedEdits(oldEntities);
   }
 
   function choose(next) {
@@ -1904,9 +2044,9 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
   }
 
   function undo(from, to) {
-    if (!from.length || running || gesture?.type === "grip" || offsetPreview || notchPreview) return;
+    if (!from.length || historyBusy() || gesture?.type === "grip" || offsetPreview || notchPreview) return;
     cancelGesture();
-    to.push({ drawing: current, measurements });
+    to.push({ drawing: current, measurements, model3d });
     const snapshot = from.pop();
     setCurrent(snapshot.drawing);
     measurements = snapshot.measurements;
@@ -1914,6 +2054,16 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     selectedEdges.clear();
     choose(tool === "erase" ? "erase" : "select");
     updateWarnings(current.warnings);
+    if (model3d && snapshot.model3d?.id === model3d.id) {
+      const changed = snapshot.model3d !== model3d;
+      if (changed) adoptAttachment(snapshot.model3d, true);
+      else if (model3d.state?.cadLinks) trackLinkedEdits([]);
+    }
+    patternWorkspace?.updateHistory();
+  }
+
+  function historyBusy() {
+    return Boolean(running || reverseEdit || projectionRequest || projectionMerge || patternWorkspace?.busy());
   }
 
   function screen([x, y]) {
@@ -4779,33 +4929,358 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     update();
   }
 
+  async function seamSignature(entities) {
+    const geometry = entities.filter(item => item.reference &&
+      (item.layer === "Линия шва" || item.layer === "Линия отверстия")).map(item => {
+      const points = item.points || controls(item);
+      return points.map((point, i) => {
+        const previous = i ? points[i - 1] : item.closed ? points.at(-1) : point;
+        return Math.round(Math.hypot(point[0] - previous[0], point[1] - previous[1]) * 100);
+      });
+    });
+    const bytes = new TextEncoder().encode(JSON.stringify(geometry));
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function sameProjectionSource(attachment) {
+    if (!attachment || attachment.id !== model3d?.id) return false;
+    const a = attachment.state || {}, b = model3d.state || {};
+    return ["panels", "seams", "pairs", "joins", "material", "fabricLayers", "autoNotches", "fit", "transferSettings", "modelEdges"]
+      .every(key => a[key] === b[key]);
+  }
+
+  function adoptAttachment(attachment, recalculate, calculated) {
+    model3d = attachment;
+    if (patternWorkspace?.applyCadState) {
+      Promise.resolve(patternWorkspace.applyCadState(attachment, { recalculate, calculated })).catch(error => log(errorMessage(error), true));
+    } else if (recalculate && !calculated) requestCadProjection();
+  }
+
+  function requestCadProjection() {
+    const attachment = model3d;
+    if (!attachment || !sketchupDesign) return;
+    const task = request("/api/cad/3d/calculate", { method: "POST", signal: lifecycle.signal,
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...attachment, sync2d: true }) })
+      .then(result => onSyncPatterns(result.cadSync, attachment)).catch(error => {
+        if (sameProjectionSource(attachment) && !lifecycle.signal.aborted) log(errorMessage(error), true);
+      }).finally(() => { if (projectionRequest === task) projectionRequest = null; });
+    projectionRequest = task;
+    return task;
+  }
+
+  const localChangeMessage = "Форма отредактирована в 2D. Эти правки сохранены в чертеже и требуют согласования с 3D.";
+
+  function trackLinkedEdits(before) {
+    const task = checkLinkedEdits(before, current).catch(error => {
+      if (!lifecycle.signal.aborted) log(errorMessage(error), true);
+    }).finally(() => {
+      if (reverseEdit === task) reverseEdit = null;
+      patternWorkspace?.updateHistory();
+    });
+    reverseEdit = task;
+  }
+
+  async function checkLinkedEdits(oldEntities, drawing) {
+    const source = model3d;
+    const before = linkedGroups(oldEntities), now = linkedGroups(drawing.entities);
+    let changed = false;
+    for (const [id, link] of Object.entries(source?.state?.cadLinks || {})) {
+      const group = now.get(id) || [], old = before.get(id) || [];
+      if (oldEntities.length && group.length === old.length && group.every((entity, i) => entity === old[i])) continue;
+      const hash = await linkedHash(group, linkedFrame(group));
+      if (lifecycle.signal.aborted || current !== drawing || model3d !== source) return;
+      if (hash === link.hash) { linkConflicts.delete(id); continue; }
+      changed = true;
+      linkConflicts.set(id, localChangeMessage);
+      const seam = old.find(entity => entity.reference && entity.closed && entity.layer === "Линия шва");
+      const after = seam && group.find(entity => entity.id === seam.id);
+      const members = new Map(group.map(entity => [entity.id, entity]));
+      const same = (a, b) => a === b || JSON.stringify(canonicalCadValue(a)) === JSON.stringify(canonicalCadValue(b));
+      const canProject = seam && after && after.closed && after.type === "polyline" && !after.bulges?.some(Boolean)
+        && old.length === group.length && old.every(entity => entity === seam || same(entity, members.get(entity.id)))
+        && same({ ...seam, points: after.points }, after)
+        && source.state.seams?.some(s => s.placementFor === id);
+      if (!canProject || await linkedHash(old, linkedFrame(old)) !== link.hash) continue;
+      try {
+        const projected = await request("/api/cad/3d/project-contour", { method: "POST", signal: lifecycle.signal,
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...source, panelId: id,
+            previous: seam.points, points: after.points }) });
+        if (current !== drawing || !sameProjectionSource(source) || lifecycle.signal.aborted) return;
+        const state = model3d.state, seed = projected.seed;
+        const panel = { ...state.panels.find(p => p.id === id), seed: seed.triangle, seedBarycentric: seed.barycentric };
+        const next = { ...model3d, state: { ...state, panels: state.panels.map(p => p.id === id ? panel : p),
+          seams: state.seams.map(s => s.placementFor === id ? { ...s, anchors: projected.anchors } : s) } };
+        acceptedContours.set(id, { hash, panel, frame: projected.frame });
+        adoptAttachment(next, true, projected.calculated);
+        await onSyncPatterns(projected.calculated.cadSync, next);
+        log("Линия шва обновлена на ткани в 3D.");
+        return;
+      } catch (error) {
+        if (current !== drawing || !sameProjectionSource(source) || lifecycle.signal.aborted) return;
+        linkConflicts.set(id, errorMessage(error) + " Правка сохранена в чертеже 2D.");
+      }
+    }
+    if (changed) log(localChangeMessage + " Откройте «Лекало 3D».", true);
+    update();
+  }
+
+  async function mergeProjection(payload, attachment, forceId, version, partial) {
+    const response = () => ({ updated: 0, conflicts: [], issues: [] });
+    if (!payload || lifecycle.signal.aborted || !sameProjectionSource(attachment)) return response();
+    const source = current;
+    const stored = linkedGroups(source.entities), incoming = linkedGroups(payload.entities || []);
+    const links = new Map(Object.entries(model3d.state?.cadLinks || {}));
+    const manifest = new Map(Object.entries(source.patterns || {}));
+    const panelIds = new Set((attachment.state?.panels || []).map(panel => panel.id));
+    const replacements = new Map(), conflicts = partial ? new Map(linkConflicts) : new Map();
+    let changedMetadata = false, linksChanged = false;
+    let right = selectionBounds(source.entities)?.[2] ?? -30;
+
+    for (const [id, meta] of Object.entries(payload.patterns || {})) {
+      const raw = incoming.get(id);
+      if (!raw?.length || !panelIds.has(id)) continue;
+      conflicts.delete(id);
+      const old = stored.get(id) || [], link = links.get(id);
+      const seam = raw.find(entity => entity.layer === "Линия шва" && entity.reference);
+      const base = seam && selectionBounds([seam]);
+      if (!base) continue;
+      const local = raw.map(entity => transform(entity, p => [p[0] - base[0], p[1] - base[1]]));
+      const srcFrame = linkedFrame(local), oldFrame = linkedFrame(old);
+      const hash = await linkedHash(local, srcFrame), oldHash = await linkedHash(old, oldFrame);
+      if (!hash) continue;
+      const approval = acceptedContours.get(id);
+      const projected = approval && approval.hash === oldHash && attachment.state.panels.includes(approval.panel);
+      const edited = !projected && (link || old.length) && oldHash !== hash && (!link || oldHash !== link.hash);
+      if (edited && id !== forceId) {
+        conflicts.set(id, linkConflicts.get(id) || localChangeMessage);
+        continue;
+      }
+      if (hash !== oldHash) {
+        const bounds = selectionBounds(local);
+        const oldBounds = old.length && selectionBounds(old);
+        const place = projected ? frameMap(srcFrame, approval.frame) : link && oldFrame ? frameMap(link.frame, oldFrame) :
+          (oldFrame ? frameMap(srcFrame, oldFrame) : p => [p[0] + (oldBounds ? oldBounds[0] : right + 30) - bounds[0],
+            p[1] + (oldBounds ? oldBounds[1] : 0) - bounds[1]]);
+        const oldRoles = linkedRoles(old), incomingRoles = linkedRoles(local);
+        const previousIds = new Map(old.map((entity, i) => [oldRoles[i], entity.id]));
+        const ids = new Map(local.map((entity, i) => [entity.id, previousIds.get(incomingRoles[i]) ||
+          (byId.has(entity.id) ? crypto.randomUUID() : entity.id)]));
+        const placed = local.map(entity => ({ ...transform(entity, place), id: ids.get(entity.id),
+          ...(entity.parentId ? { parentId: ids.get(entity.parentId) } : {}) }));
+        replacements.set(id, placed);
+        right = Math.max(right, selectionBounds(placed)[2]);
+      }
+      const nextLink = { hash, frame: srcFrame.map(canonicalCadValue) };
+      if (!link || link.hash !== hash || JSON.stringify(link.frame) !== JSON.stringify(nextLink.frame)) {
+        links.set(id, nextLink); linksChanged = true;
+      }
+      const nextMeta = { fabricName: "", side: "", quantity: 1, direction: "free", ...meta,
+        seamSignature: await seamSignature(replacements.get(id) || old) };
+      if (JSON.stringify(canonicalCadValue(nextMeta)) !== JSON.stringify(canonicalCadValue(manifest.get(id)))) {
+        manifest.set(id, nextMeta); changedMetadata = true;
+      }
+    }
+    for (const [id, link] of links) {
+      if (panelIds.has(id)) continue;
+      const old = stored.get(id) || [];
+      if (old.length && id !== forceId && await linkedHash(old, linkedFrame(old)) !== link.hash) {
+        conflicts.set(id, "Деталь удалена в 3D. Её локальные правки остаются в чертеже 2D.");
+        continue;
+      }
+      replacements.set(id, []);
+      links.delete(id); manifest.delete(id); linksChanged = changedMetadata = true;
+    }
+    if (lifecycle.signal.aborted || version !== projectionVersion || !sameProjectionSource(attachment)) return response();
+    if (current !== source) return mergeProjection(payload, attachment, forceId, version, partial);
+    if (replacements.size || changedMetadata) {
+      const removed = new Set([...replacements.keys()].flatMap(id => (stored.get(id) || []).map(entity => entity.id)));
+      const added = [...replacements.values()].flat();
+      const entities = source.entities.filter(entity => !removed.has(entity.id)).concat(added);
+      if (entities.length > MAX_CAD_ENTITIES || storedPointCount(entities) > MAX_CAD_POINTS) {
+        throw new Error("Лекала вместе с текущими объектами превышают предел размера чертежа.");
+      }
+      setCurrent({ ...source, entities, patterns: Object.fromEntries(manifest) });
+      selected = new Set([...selected].filter(id => byId.has(id)));
+      if (selectedEdges.size) for (const id of removed) selectedEdges.delete(id);
+    }
+    for (const id of Object.keys(payload.patterns || {})) acceptedContours.delete(id);
+    linkConflicts = conflicts;
+    if (!partial) linkIssues = new Map();
+    for (const id of Object.keys(payload.patterns || {})) linkIssues.delete(id);
+    for (const item of payload.issues || []) linkIssues.set(item.id, item.message);
+    if (linksChanged) adoptAttachment({ ...model3d, state: { ...model3d.state, cadLinks: Object.fromEntries(links) } }, false);
+    if (linkConflicts.size) log("В чертеже сохранены ручные правки. Откройте «Лекало 3D» для согласования.", true);
+    else if (linkIssues.size) log("Часть лекал ожидает исправления в 3D. Подробности в «Лекало 3D».", true);
+    update();
+    return { updated: replacements.size, conflicts: [...conflicts].map(([id, message]) => ({ id, message })),
+      issues: payload.issues || [] };
+  }
+
+  function onSyncPatterns(payload, attachment, forceId = null, partial = false) {
+    if (!payload || !sameProjectionSource(attachment)) return Promise.resolve({ updated: 0, conflicts: [], issues: [] });
+    if (!partial || !latestProjection) latestProjection = { payload, attachment };
+    const task = mergeProjection(payload, attachment, forceId, ++projectionVersion, partial)
+      .finally(() => {
+        if (projectionMerge === task) projectionMerge = null;
+        patternWorkspace?.updateHistory();
+      });
+    projectionMerge = task;
+    return task;
+  }
+
+  function linkedFields() {
+    const f = linkedForm.elements, id = f.panel.value;
+    const panel = model3d?.state?.panels?.find(item => item.id === id);
+    const issue = linkConflicts.get(id) || linkIssues.get(id);
+    views["linked-status"].textContent = issue ||
+      "Свойства применяются к детали в 3D. Перемещение и поворот всей группы задают её положение на чертеже.";
+    for (const key of ["panelName", "quantity", "side", "direction", "allowance"]) f[key].disabled = !panel;
+    f.panelName.value = panel?.name || "";
+    f.quantity.value = panel?.quantity || 1;
+    f.side.value = panel?.side || "";
+    f.direction.value = panel?.direction || "free";
+    f.allowance.value = model3d?.state?.transferSettings?.panels?.[id]?.allowanceMm ?? "";
+    f.replace.hidden = !linkConflicts.has(id) || !latestProjection || !sameProjectionSource(latestProjection.attachment);
+    f.replace.textContent = panel ? "Заменить правки 2D геометрией из 3D" : "Удалить оставшуюся копию 2D";
+    linkedForm.querySelector('[type="submit"]').disabled = !panel;
+  }
+
+  function openLinkedPattern() {
+    if (!model3d) return;
+    const options = new Map((model3d.state?.panels || []).map(panel => [panel.id, [panel.number, panel.name || panel.id].filter(Boolean).join(" · ")]));
+    for (const id of Object.keys(model3d.state?.cadLinks || {})) if (!options.has(id)) {
+      options.set(id, (current.patterns?.[id]?.name || id) + " · удалена в 3D");
+    }
+    const select = linkedForm.elements.panel;
+    select.replaceChildren(...[...options].map(([id, name]) => {
+      const option = root.createElement("option"); option.value = id; option.textContent = name; return option;
+    }));
+    const chosen = selectedEntities().map(groupPath).find(path => path[0] === "Лекала 3D" && options.has(path[1]))?.[1];
+    select.value = chosen || [...linkConflicts.keys(), ...linkIssues.keys()].find(id => options.has(id)) || options.keys().next().value || "";
+    linkedFields();
+    linkedDialog.showModal();
+  }
+
+  linkedForm.elements.panel.onchange = linkedFields;
+  linkedForm.elements.closeDialog.onclick = () => linkedDialog.close();
+  linkedForm.elements.replace.onclick = async () => {
+    const id = linkedForm.elements.panel.value, snapshot = latestProjection;
+    if (!snapshot || !sameProjectionSource(snapshot.attachment) || !linkConflicts.has(id)) return;
+    rememberEdit();
+    try { await onSyncPatterns(snapshot.payload, snapshot.attachment, id); linkedDialog.close(); }
+    catch (error) { views["linked-status"].textContent = errorMessage(error); }
+  };
+  linkedForm.onsubmit = event => {
+    event.preventDefault();
+    const f = linkedForm.elements, id = f.panel.value, state = model3d?.state;
+    const record = state?.panels?.find(panel => panel.id === id);
+    const name = f.panelName.value.trim();
+    if (!record || !name || !linkedForm.reportValidity()) return;
+    const panel = { ...record, name, quantity: f.quantity.valueAsNumber, side: f.side.value, direction: f.direction.value };
+    const settings = state.transferSettings || {};
+    const preset = { ...settings.panels?.[id] };
+    if (f.allowance.value === "") delete preset.allowanceMm;
+    else preset.allowanceMm = f.allowance.valueAsNumber;
+    const presets = { ...settings.panels, [id]: preset };
+    if (!Object.keys(preset).length) delete presets[id];
+    rememberEdit();
+    adoptAttachment({ ...model3d, state: { ...state, panels: state.panels.map(p => p.id === id ? panel : p),
+      transferSettings: { ...settings, panels: presets } } }, true);
+    linkedDialog.close();
+    log("Свойства лекала переданы в 3D.");
+    update();
+  };
+
+  function adoptSavedPart(drawing, result) {
+    const first = drawing.entities[0];
+    const savedEntity = first && result.entities.find(entity => entity.id === first.id);
+    const offset = savedEntity ? sub(controls(savedEntity)[0], controls(first)[0]) : [0, 0];
+    if (offset.some(value => Math.abs(value) > 1e-8)) {
+      const translate = point => add(point, offset);
+      const moved = new WeakMap();
+      const moveEntity = entity => {
+        if (!moved.has(entity)) moved.set(entity, transform(entity, translate));
+        return moved.get(entity);
+      };
+      const moveMeasurements = items => items.map(item => ({ ...item, points: item.points.map(translate) }));
+      for (const snapshot of [...previous, ...future]) {
+        snapshot.drawing = { ...snapshot.drawing, entities: snapshot.drawing.entities.map(moveEntity) };
+        snapshot.measurements = moveMeasurements(snapshot.measurements);
+      }
+      measurements = moveMeasurements(measurements);
+      center = translate(center);
+    }
+    setCurrent({ ...drawing, entities: result.entities, warnings: result.warnings ?? drawing.warnings });
+    if (offset.some(value => Math.abs(value) > 1e-8)) choose("select");
+    updateWarnings(current.warnings);
+  }
+
   const actionHandlers = {
-    back: () => { if (!running) onBack(); },
+    "linked-pattern": openLinkedPattern,
+    back: () => { if (!running && !patternWorkspace?.busy()) onBack(); },
     tools: () => showTools(toolsPanel.hidden),
     ...Object.fromEntries(Object.keys(MIRROR_MODES).map(mode => [`mirror-${mode}`, () => chooseMirrorMode(mode)])),
     "mirror-cancel": () => choose("select"),
     "cancel-parameters": cancelParameters,
     "relocate-notch": () => submitParameters(true),
     import: () => fields.file.click(),
+    "part-legend": () => {
+      const opening = views["part-legend"].hidden;
+      if (opening) partLegendEnabled = true;
+      showPartLegend(opening);
+      if (opening) fields["part-developer"].focus();
+    },
+    "remove-part-legend": () => {
+      partLegendEnabled = false;
+      showPartLegend(false);
+      actions["part-legend"].focus();
+    },
     save: () => perform(async () => {
+      await reverseEdit;
+      if (patternWorkspace?.busy()) throw new Error("Дождитесь окончания операции в 3D.");
+      await projectionRequest;
+      await projectionMerge;
       const name = fields.name.value.trim();
       if (!name) throw new Error("Введите название чертежа.");
-      const result = await onSaveDocument({ name, ...current });
+      const savedAttachment = model3d;
+      const savedDrawing = current;
+      const pattern = draft?.pattern;
+      const checkSewing = pattern?.seamSignature &&
+        await seamSignature(current.entities) !== pattern.seamSignature;
+      const result = await onSaveDocument({ name, ...savedDrawing,
+        ...(checkSewing ? { pattern: { ...pattern, checkSewing: true } } : {}),
+        ...(existingPart ? { partLegend: partLegend() } : {}),
+        ...(sketchupDesign && savedAttachment ? { model3d: savedAttachment } : {}) });
       if (lifecycle.signal.aborted) return;
-      saved = current;
+      if (existingPart && Array.isArray(result?.entities)) {
+        adoptSavedPart(savedDrawing, result);
+        savedLegend = result.partLegend ?? null;
+        partLegendEnabled = Boolean(savedLegend);
+        readPartLegend(savedLegend);
+      }
+      saved = existingPart ? current : savedDrawing;
       savedName = name;
+      savedModel3d = savedAttachment;
       fields.name.value = name;
       log(layoutPart ? "Деталь обновлена в раскладке." : existingPart ? "Изменения детали сохранены в реестре." : "Чертёж сохранён.");
       if (result?.closeEditor) await onBack();
     }),
     part: () => perform(async () => {
       const included = familyIds([...selected, ...selectedEdges.keys()]);
-      const entities = current.entities.filter(entity => included.has(entity.id)).map(entity => {
+      const patternIds = new Set(current.entities.filter(entity => included.has(entity.id) &&
+        groupPath(entity)[0] === "Лекала 3D").map(entity => groupPath(entity)[1]));
+      const pattern = patternIds.size === 1 ? current.patterns?.[[...patternIds][0]] : null;
+      if (patternIds.size > 1) throw new Error("Для сохранения выберите одно лекало.");
+      const entities = current.entities.filter(entity => included.has(entity.id) ||
+        pattern && groupPath(entity)[0] === "Лекала 3D" && groupPath(entity)[1] === pattern.id).map(entity => {
         if (!entity.parentId || included.has(entity.parentId)) return entity;
         const { parentId, ...unbound } = entity;
         return unbound;
       });
-      const result = await onSavePart({ entities });
+      const changedSeam = pattern?.seamSignature && await seamSignature(entities) !== pattern.seamSignature;
+      const result = await onSavePart({ entities, pattern: changedSeam ? { ...pattern, checkSewing: true } : pattern,
+        ...(existingPart && partLegendEnabled ? { partLegend: partLegend() } : {}) });
       if (lifecycle.signal.aborted || result === false) return;
       const warnings = result?.warnings || [];
       updateWarnings([...current.warnings, ...warnings]);
@@ -4912,6 +5387,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     })), { id: "copy", label: "Копировать в буфер", builtInKeys: ["Ctrl+C"] },
     { id: "paste", label: "Вставить из буфера", builtInKeys: ["Ctrl+V"] }],
     activate(id) {
+      if (patternWorkspace?.isVisible()) return false;
       if (id === "copy") return copyClipboard();
       if (id === "paste") return beginPaste();
       const control = shortcutControls[id];
@@ -5140,7 +5616,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     if (event.key === "Alt") redrawOrthogonal(event.shiftKey, false);
   }, listener);
   root.addEventListener("keydown", event => {
-    if (event.defaultPrevented || event.altKey || event.isComposing || !(event.ctrlKey || event.metaKey)
+    if (patternWorkspace?.isVisible() || event.defaultPrevented || event.altKey || event.isComposing || !(event.ctrlKey || event.metaKey)
         || root.querySelector("dialog[open]") || !container.getClientRects().length) return;
     const target = event.target;
     if (target !== root.body && !container.contains(target)) return;
@@ -5194,6 +5670,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     }
   }, { ...listener, capture: true });
   container.addEventListener("keydown", event => {
+    if (patternWorkspace?.isVisible()) return;
     const key = event.key.toLowerCase();
     if (key === "escape") {
       event.preventDefault();
@@ -5211,7 +5688,7 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
       choose("select");
       return;
     }
-    if (event.target.matches("input, select")) return;
+    if (event.target.matches("input, select, textarea")) return;
     if (event.target === canvas && event.code === "Space") {
       event.preventDefault();
       spacePressed = true;
@@ -5243,17 +5720,109 @@ export function mountCadEditor(container, { document: draft, onBack, onSaveDocum
     } else draw();
   });
   observer.observe(canvas);
+  if (sketchupDesign) {
+    const header = container.querySelector(".cad-actions");
+    const work = container.querySelector(".cad-work");
+    const footer = container.querySelector(".cad-footer");
+    const workspace = root.createElement("section");
+    workspace.className = "pattern-3d";
+    workspace.hidden = true;
+    work.after(workspace);
+    const file = root.createElement("input");
+    file.type = "file";
+    file.accept = ".skp";
+    file.hidden = true;
+    const import3d = root.createElement("button");
+    import3d.type = "button";
+    import3d.className = "button cad-import-3d";
+    import3d.innerHTML = '<span class="cad-cube" aria-hidden="true"></span>Импортировать 3D';
+    const mode = root.createElement("button");
+    mode.type = "button";
+    mode.className = "button";
+    mode.textContent = "Модель 3D";
+    mode.setAttribute("aria-pressed", "false");
+    mode.hidden = !model3d;
+    header.prepend(import3d, file, mode);
+
+    function show2d() {
+      workspace.hidden = true;
+      patternWorkspace?.setVisible(false);
+      work.hidden = footer.hidden = false;
+      actions.import.hidden = actions.part.hidden = false;
+      mode.textContent = "Модель 3D";
+      mode.setAttribute("aria-pressed", "false");
+      canvas.focus({ preventScroll: true });
+    }
+
+    async function show3d(loadModel = true) {
+      if (running) return false;
+      if (!patternWorkspace) {
+        const { mountSurfaceEditor } = await import("/designer-3d.js");
+        if (lifecycle.signal.aborted) return false;
+        patternWorkspace ??= mountSurfaceEditor(workspace, { request, initial: model3d, icon: cadIcon, onSyncPatterns,
+          history: { busy: historyBusy, canUndo: () => Boolean(previous.length), canRedo: () => Boolean(future.length),
+            undo: () => undo(previous, future), redo: () => undo(future, previous) },
+          onChange(attachment) {
+            if (model3d?.id === attachment.id && model3d !== attachment) rememberEdit();
+            model3d = attachment;
+            mode.hidden = false;
+          },
+          async onTransfer(entities, { attachment = model3d, warnings = [], patterns = {} }) {
+            if (!sameProjectionSource(attachment)) return 0;
+            const result = await onSyncPatterns({ entities, patterns, issues: [] }, attachment, null, true);
+            const notices = [...new Set([...current.warnings, ...warnings])].slice(-32);
+            if (JSON.stringify(notices) !== JSON.stringify(current.warnings)) {
+              setCurrent({ ...current, warnings: notices });
+              updateWarnings(notices);
+            }
+            return Object.keys(patterns).length - result.conflicts.filter(issue => Object.hasOwn(patterns, issue.id)).length;
+          },
+        });
+      }
+      closeContextMenu();
+      work.hidden = footer.hidden = true;
+      actions.import.hidden = actions.part.hidden = true;
+      workspace.hidden = false;
+      mode.hidden = false;
+      mode.textContent = "Чертёж 2D";
+      mode.setAttribute("aria-pressed", "true");
+      patternWorkspace.setVisible(true, loadModel);
+      return true;
+    }
+
+    import3d.addEventListener("click", () => file.click(), listener);
+    file.addEventListener("change", async () => {
+      const selectedFile = file.files[0];
+      file.value = "";
+      if (!selectedFile || patternWorkspace?.busy()) return;
+      if (model3d && !await confirmAction({ title: "Заменить 3D-модель?",
+        message: "Новая модель заменит текущую 3D-модель и её разметку.",
+        confirmLabel: "Заменить модель", danger: true })) return;
+      try {
+        if (await show3d(false)) await patternWorkspace.importFile(selectedFile);
+      } catch (error) { log(error.message, true); }
+    }, listener);
+    mode.addEventListener("click", async () => {
+      if (patternWorkspace?.busy()) return;
+      if (!workspace.hidden) return show2d();
+      try { await show3d(); } catch (error) { log(error.message, true); }
+    }, listener);
+  }
   updateSnapButton();
   updateWarnings(current.warnings);
   update();
   canvas.focus({ preventScroll: true });
+  if (sketchupDesign && model3d && (model3d.state?.panels?.length || Object.keys(model3d.state?.cadLinks || {}).length)) {
+    void requestCadProjection();
+  }
   return {
-    hasUnsavedChanges: () => saved !== current || savedName !== fields.name.value.trim(),
-    isBusy: () => running || Boolean(offsetPreview?.applying),
+    hasUnsavedChanges: () => saved !== current || savedName !== fields.name.value.trim() || model3d !== savedModel3d || legendChanged(),
+    isBusy: () => running || Boolean(offsetPreview?.applying) || Boolean(patternWorkspace?.busy()),
     destroy() {
       clearPointerMove();
       clearOffset();
       lifecycle.abort();
+      patternWorkspace?.destroy();
       observer.disconnect();
       container.classList.remove("cad-editor");
       container.replaceChildren();

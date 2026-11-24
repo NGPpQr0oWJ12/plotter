@@ -843,6 +843,79 @@ def prepare_design(entities):
     return {"paths": repaired.paths, "warnings": [], "closedCount": repaired.closed_count, "sourceIds": source_ids}
 
 
+def _conic_extrema(center, u, v, start, sweep):
+    for first, second in zip(u, v):
+        angle = math.degrees(math.atan2(second, first))
+        for direction in (angle, angle + 180):
+            span = (direction - start) % 360 if sweep > 0 else (start - direction) % 360
+            if span <= abs(sweep):
+                radians = math.radians(direction)
+                yield [c + x * math.cos(radians) + y * math.sin(radians) for c, x, y in zip(center, u, v)]
+
+
+def _part_curve_extrema(entity):
+    kind = entity["type"]
+    if kind in ("arc", "circle", "ellipse"):
+        if kind == "ellipse":
+            x, y = entity["axis"]
+            u, v = (x, y), (-y * entity["ratio"], x * entity["ratio"])
+        else:
+            radius = entity["radius"]
+            u, v = (radius, 0), (0, radius)
+        yield from _conic_extrema(entity["center"], u, v, entity.get("startAngle", 0), entity.get("sweep", 360))
+    elif kind == "polyline" and entity.get("bulges"):
+        points = entity["points"]
+        for index, bulge in enumerate(entity["bulges"][:len(points) - int(not entity["closed"])]):
+            start, end = points[index], points[(index + 1) % len(points)]
+            if abs(bulge) < 1e-12 or math.dist(start, end) <= POINT_EPSILON_MM:
+                continue
+            center, first, last, radius = bulge_to_arc(start, end, bulge)
+            yield from _conic_extrema(center, (radius, 0), (0, radius), math.degrees(first if bulge > 0 else last),
+                                      math.degrees(4 * math.atan(bulge)))
+
+
+def center_part_geometry(entities, prepared):
+    """Center cut geometry and translate its reference shapes and marks by the same offset."""
+    paths = prepared["paths"]
+    outlines = set()
+    bounds = [math.inf, math.inf, -math.inf, -math.inf]
+
+    def include(point):
+        x, y = point
+        bounds[0], bounds[1] = min(bounds[0], x), min(bounds[1], y)
+        bounds[2], bounds[3] = max(bounds[2], x), max(bounds[3], y)
+
+    for path, identifiers in zip(paths, prepared["sourceIds"], strict=True):
+        if path.get("notch"):
+            continue
+        outlines.update(identifiers)
+        for point in path["points"]:
+            include(point)
+    for entity in entities:
+        if entity["id"] in outlines:
+            for point in _part_curve_extrema(entity):
+                include(point)
+
+    offset = [(bounds[axis] + bounds[axis + 2]) / 2 for axis in range(2)]
+    if not outlines or all(abs(value) <= 1e-6 for value in offset):
+        return entities, paths
+
+    def translated(point):
+        return _point([point[axis] - offset[axis] for axis in range(2)])
+
+    moved = []
+    for entity in entities:
+        shape = dict(entity)
+        for field in ("start", "end", "point", "center"):
+            if field in entity:
+                shape[field] = translated(entity[field])
+        for field in ("points", "fitPoints", "controlPoints"):
+            if field in entity:
+                shape[field] = [translated(point) for point in entity[field]]
+        moved.append(shape)
+    return moved, [{**path, "points": [translated(point) for point in path["points"]]} for path in paths]
+
+
 def _line_geometry(path):
     points = path["points"]
     return LineString([*points, points[0]] if path["closed"] else points)

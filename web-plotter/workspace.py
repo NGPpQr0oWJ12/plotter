@@ -13,6 +13,7 @@ VERSION = 1
 MAX_REVISION = (1 << 53) - 1  # Exactly representable by the browser.
 # Includes 50,000 contour layer names and 250,000 points at the CAD limits.
 MAX_WORKSPACE_BYTES = 96 * 1024 * 1024
+PART_LABEL_FIELDS = ("partName", "productName")
 
 
 class WorkspaceConflict(ValueError):
@@ -40,6 +41,19 @@ def _text(value, limit):
         and len(value) <= limit
         and all(not 0xD800 <= ord(character) <= 0xDFFF for character in value)
     )
+
+
+def part_path_labels(path):
+    labels = {}
+    for field in PART_LABEL_FIELDS:
+        if field not in path:
+            continue
+        label = path[field]
+        if (path.get("partNumber") is None or not _text(label, 255) or not label.strip()
+                or any(ord(character) < 32 for character in label)):
+            raise ValueError("Неверное название детали или изделия в раскладке.")
+        labels[field] = label
+    return labels
 
 
 def _workspace(value):
@@ -130,6 +144,7 @@ def drawing_paths(paths):
     clean_paths = []
     point_count = 0
     part_rotations = {}
+    part_labels = {}
     for path in paths:
         if not isinstance(path, dict):
             raise ValueError("Неверный контур рабочей области.")
@@ -155,6 +170,11 @@ def drawing_paths(paths):
             if not _revision(part_number) or part_number == 0:
                 raise ValueError("Неверный номер детали рабочей области.")
             clean_path["partNumber"] = part_number
+        labels = part_path_labels(path)
+        for field, label in labels.items():
+            if part_labels.setdefault((part_number, field), label) != label:
+                raise ValueError("У контуров одной детали разные названия.")
+        clean_path.update(labels)
         if "partAngle" in path:
             angle = path["partAngle"]
             if type(angle) not in (int, float) or not 0 <= angle < 360:

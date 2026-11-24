@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from email.message import Message
+import gzip
 from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,11 +38,15 @@ from cut_journal import MAX_EVENTS, CutJournal
 from cut_plan import EPSILON_MM, prepare_cut_plan
 from demo_controller import DemoController
 from designer_cad import edit_design, import_design, prepare_design
+from fit_jobs import FitJobs
 from machine import PlotterError, Simulator, build_plan, number
 from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
 from panel_diagnostics import compare_panel_samples
 from panel_readback import PanelReadback
 from production_store import ProductionStore, RecordNotFound, key, verify_arrangement
+from registry_archive import (MAX_REGISTRY_ARCHIVE, RAR_MIME, RAR_SIGNATURE, RegistryArchiveTooLarge,
+                              read_registry_archive, write_registry_archive)
+from sketchup_design import MAX_MARKUP_BYTES, MAX_SKP_BYTES, check_surface_edit, import_model, markup, transfer_manifest
 from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace
 from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
@@ -83,6 +88,20 @@ MIME = {
     "/designer-cad.js": ("designer-cad.js", "text/javascript; charset=utf-8"),
     "/designer-shortcuts.js": ("designer-shortcuts.js", "text/javascript; charset=utf-8"),
     "/designer-cad.css": ("designer-cad.css", "text/css; charset=utf-8"),
+    "/OpenGostTypeB-Regular.ttf": ("OpenGostTypeB-Regular.ttf", "font/ttf"),
+    "/designer-3d.js": ("designer-3d.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-magnet.js": ("designer-3d-magnet.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-drafting.js": ("designer-3d-drafting.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-fabric.js": ("designer-3d-fabric.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-folds.js": ("designer-3d-folds.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-outline.js": ("designer-3d-outline.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-overlay.js": ("designer-3d-overlay.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-selection.js": ("designer-3d-selection.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-objects.js": ("designer-3d-objects.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-patterns.js": ("designer-3d-patterns.js", "text/javascript; charset=utf-8"),
+    "/designer-3d-fit.js": ("designer-3d-fit.js", "text/javascript; charset=utf-8"),
+    "/designer-3d.css": ("designer-3d.css", "text/css; charset=utf-8"),
+    "/three-3d.js": ("three-3d.js", "text/javascript; charset=utf-8"),
     "/plotter-monochrome.css": ("plotter-monochrome.css", "text/css; charset=utf-8"),
 }
 PRODUCTION_ROUTES = {"/api/registry", "/api/orders", "/api/operator-workspace"}
@@ -158,7 +177,7 @@ class CompanionWorkspace:
             data["workspace"] = validate_workspace(data["workspace"])
         return data
 
-    def production_request(self, endpoint, payload=None, *, raw=None):
+    def production_request(self, endpoint, payload=None, *, raw=None, pdf=False, rar=False):
         request = Request(self.origin + endpoint)
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -167,15 +186,23 @@ class CompanionWorkspace:
             request = Request(request.full_url, body, {"Content-Type": "application/json", "Origin": self.origin})
         elif raw is not None:
             request = Request(request.full_url, raw, {"Content-Type": "application/octet-stream", "Origin": self.origin})
+        binary = ("application/pdf", b"%PDF-") if pdf else (RAR_MIME, RAR_SIGNATURE) if rar else None
+        maximum = MAX_REGISTRY_ARCHIVE if rar else MAX_WORKSPACE_BYTES
         try:
-            with self.opener.open(request, timeout=90 if raw is not None else 30 if payload is not None else 10) as response:
-                contents = response.read(MAX_WORKSPACE_BYTES + 1)
-            if len(contents) > MAX_WORKSPACE_BYTES:
+            with self.opener.open(request, timeout=90 if raw is not None or binary else 30 if payload is not None else 10) as response:
+                contents = response.read(maximum + 1)
+                content_type = response.headers.get_content_type() if binary else None
+            if len(contents) > maximum:
                 raise ValueError("Workspace too large")
+            if binary:
+                mime, signature = binary
+                if content_type != mime or not contents.startswith(signature):
+                    raise ValueError("Invalid binary response")
+                return contents
             return json.loads(contents)
         except HTTPError as error:
             with error:
-                if error.code in (400, 404, 409, 422):
+                if error.code in (400, 404, 409, 413, 415, 422):
                     try:
                         message = json.loads(error.read(4096)).get("error")
                     except (OSError, ValueError, AttributeError, RecursionError):
@@ -1176,6 +1203,11 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
                               companion=bool(self.companion_origin))
         self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
         self.production = self.demo.production = ProductionStore(Path(workspace_path).with_name("production.sqlite3"))
+        self.sketchup_design = os.name == "nt" and not (self.central_mode or self.companion_mode)
+        self.sketchup_lock = Lock()
+        self.sewing_pdf_lock = Lock()
+        self.registry_archive_lock = Lock()
+        self.fit_jobs = FitJobs()
         install_root = None
         if os.name == "nt" and self.local_companion_ui and os.environ.get("LOCALAPPDATA"):
             candidate = (Path(os.environ["LOCALAPPDATA"]) / "Plotter" / "Companion").resolve()
@@ -1243,6 +1275,7 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
                 return {**result, **plotter.cut_status()}
 
     def server_close(self):
+        self.fit_jobs.close()
         self.controller.stop_active_hold()
         self.demo.controller.stop_active_hold()
         super().server_close()
@@ -1332,6 +1365,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
         except RequestError as error:
             self.json_response({"error": str(error)}, error.status)
+        except RegistryArchiveTooLarge as error:
+            self.json_response({"error": str(error)}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         except WorkspaceConflict as error:
             self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
         except RecordNotFound as error:
@@ -1373,8 +1408,28 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
             self.json_response(self.plotter.workspace.read())
+        elif path == "/api/cad/3d/fit":
+            self.require_sketchup_design()
+            identifier = parse_qs(query, max_num_fields=2).get("id", [""])[0]
+            self.json_response(self.server.fit_jobs.status(identifier))
+        elif path == "/api/cad/3d/model":
+            self.require_sketchup_design()
+            model_id = parse_qs(query, max_num_fields=2).get("id", [""])[0]
+            contents = self.server.production.model(model_id)
+            content_type = "application/json; charset=utf-8"
+            if re.search(r"(?:^|,)\s*gzip\s*(?:,|$)", self.headers.get("Accept-Encoding", ""), re.I):
+                self.response_headers(len(contents), content_type, HTTPStatus.OK, encoding="gzip")
+                self.wfile.write(contents)
+            else:
+                self.respond(gzip.decompress(contents), content_type)
         elif path in PRODUCTION_ROUTES:
             self.get_production(path, query)
+        elif path == "/api/registry-backup":
+            self.get_registry_backup()
+        elif path == "/api/sewing-map.pdf":
+            self.get_sewing_pdf(query)
+        elif path == "/api/part-preview.svg":
+            self.get_part_preview(query)
         elif path == "/api/reachability":
             self.json_response(self.plotter.reachability())
         else:
@@ -1452,6 +1507,12 @@ class Handler(BaseHTTPRequestHandler):
                 drawing = import_drawing(data, name)
                 drawing["paths"] = annotate_notches(drawing["paths"])
             self.json_response(drawing)
+        elif path in ("/api/cad/3d/import", "/api/cad/3d/model-surface", "/api/cad/3d/calculate", "/api/cad/3d/check-panel", "/api/cad/3d/preview-contour",
+                      "/api/cad/3d/route-contour", "/api/cad/3d/project-contour", "/api/cad/3d/remaining",
+                      "/api/cad/3d/selected-regions", "/api/cad/3d/edit-cut",
+                      "/api/cad/3d/check-transfer", "/api/cad/3d/transfer",
+                      "/api/cad/3d/fit", "/api/cad/3d/fit-cancel"):
+            self.post_sketchup_design(path, query)
         elif path in ("/api/cad/paths", "/api/cad/edit"):
             data = self.json_body(MAX_WORKSPACE_BYTES)
             result = (prepare_design(data.get("entities")) if path.endswith("/paths") else
@@ -1459,6 +1520,8 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(result)
         elif path in PRODUCTION_ROUTES:
             self.post_production(path)
+        elif path == "/api/registry-backup":
+            self.post_registry_backup()
         elif path == "/api/cut-context":
             self.json_response(self.plotter.change_cut_context(self.json_body(4096)))
         elif path == "/api/close-contours":
@@ -1573,6 +1636,168 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise RequestError("Команда не найдена.", HTTPStatus.NOT_FOUND)
 
+    def require_sketchup_design(self):
+        if not self.server.sketchup_design:
+            raise RequestError("Работа с моделями SketchUp доступна в локальном Plotter для Windows.", HTTPStatus.NOT_FOUND)
+
+    def post_sketchup_design(self, path, query):
+        self.require_sketchup_design()
+        if path.endswith("/import"):
+            filename = parse_qs(query, max_num_fields=2).get("filename", [""])[0]
+            data = self.body(MAX_SKP_BYTES, "application/octet-stream")
+            with request_lock(self.server.sketchup_lock, "Дождитесь окончания работы с моделью."):
+                model_id = self.server.production.stage_model(import_model(data, filename))
+            self.json_response({"id": model_id}, HTTPStatus.CREATED)
+            return
+
+        from upholstery import (build_entities, cad_sync_geometry, calculate, check_cover_panel, check_transfer,
+                                preview_contour, project_cad_contour, remaining_panels, route_contour, selected_panel_regions)
+
+        extra_limit = MAX_MARKUP_BYTES if path.endswith(("/selected-regions", "/model-surface")) else (
+            256 if path.endswith(("/project-contour", "/edit-cut")) else 32) * 1024
+        data = self.json_body(MAX_MARKUP_BYTES + extra_limit)
+        if path.endswith("/fit-cancel"):
+            self.json_response(self.server.fit_jobs.cancel(data.get("id")))
+            return
+        state = data.get("state")
+        markup(state)
+        if path.endswith("/fit"):
+            result = self.server.fit_jobs.start(self.server.production.model(data.get("id")), state)
+            self.json_response(result, HTTPStatus.ACCEPTED)
+            return
+        with request_lock(self.server.sketchup_lock, "Дождитесь окончания работы с моделью."):
+            model = json.loads(gzip.decompress(self.server.production.model(data.get("id"))))
+            edges = state.get("modelEdges", [])
+            if edges or path.endswith("/model-surface"):
+                from model_surface import build_surface_model
+
+                if path.endswith("/model-surface") and "previousEdges" in data:
+                    check_surface_edit(state, data["previousEdges"], edges)
+                model = build_surface_model(model, edges)
+            if path.endswith("/model-surface"):
+                self.json_response(model)
+                return
+            if path.endswith("/edit-cut"):
+                from upholstery import edit_cover_cut
+
+                edit = edit_cover_cut(model, state, data.get("panelId"), data.get("anchors"), data.get("kind"))
+                next_state, checked = edit["state"], edit["calculated"]
+                markup(next_state)
+                checked["cadSync"] = cad_sync_geometry(data["id"], checked, next_state, transfer_manifest(next_state, checked))
+                missing = set(edit["panelIds"]) - checked["cadSync"]["patterns"].keys()
+                if missing:
+                    issue = next((item["message"] for item in checked["cadSync"]["issues"] if item["id"] in missing), None)
+                    raise ValueError(issue or "Не удалось построить лекало с этой линией.")
+                self.json_response(edit)
+                return
+            if path.endswith("/project-contour"):
+                panel_id = data.get("panelId")
+                draft = project_cad_contour(model, state, panel_id, data.get("previous"), data.get("points"))
+                checked = draft["calculated"]
+                checked["cadSync"] = cad_sync_geometry(data["id"], checked, state, transfer_manifest(state, checked))
+                if panel_id not in checked["cadSync"]["patterns"]:
+                    issue = next((i["message"] for i in checked["cadSync"]["issues"] if i["id"] == panel_id), None)
+                    raise ValueError(issue or "Не удалось проверить лекало после изменения контура.")
+                self.json_response(draft)
+                return
+            if path.endswith("/route-contour"):
+                self.json_response(route_contour(model, state, data.get("nodeId"), data.get("anchors")))
+                return
+            if path.endswith("/preview-contour"):
+                self.json_response(preview_contour(model, state, data.get("nodeId"), data.get("anchors"), data.get("seed"),
+                                                   surface_route=data.get("surfaceRoute") is True))
+                return
+            if path.endswith("/remaining"):
+                self.json_response({"regions": remaining_panels(model, state, data.get("nodeId"))})
+                return
+            if path.endswith("/selected-regions"):
+                self.json_response({"regions": selected_panel_regions(model, state, data.get("nodeId"), data.get("faces"))})
+                return
+            if path.endswith("/check-panel"):
+                check_cover_panel(model, state, data.get("nodeId"), data.get("panelId"))
+                self.json_response({"valid": True})
+                return
+            result = calculate(model, state)
+            if path.endswith("/calculate") and "checkPlacement" in data:
+                from upholstery import check_panel_placement
+
+                check_panel_placement(result, data["checkPlacement"])
+            if path.endswith("/calculate") and data.get("sync2d") is True:
+                result["cadSync"] = cad_sync_geometry(data["id"], result, state, transfer_manifest(state, result))
+            elif path.endswith("/check-transfer"):
+                result = check_transfer(result, state, data.get("allowanceMm"), data.get("notchDepthMm"), data.get("panelIds"),
+                                        panel_settings=data.get("panelSettings"))
+            elif path.endswith("/transfer"):
+                entities = build_entities(result, data.get("allowanceMm"), data.get("notchDepthMm"),
+                                          state=state, panel_ids=data.get("panelIds"), panel_settings=data.get("panelSettings"))
+                manifest = transfer_manifest(state, result)
+                identifiers = {entity["groupPath"][1] for entity in entities if entity.get("groupPath")}
+                result = {"entities": entities, "warnings": result["warnings"],
+                          "patterns": {identifier: manifest[identifier] for identifier in identifiers}}
+        self.json_response(result)
+
+    def get_sewing_pdf(self, query):
+        params = {key: values[0] for key, values in parse_qs(query, max_num_fields=4).items()}
+        if self.server.local_companion_ui:
+            contents = self.server.workspace.production_request("/api/sewing-map.pdf?" + urlencode(params), pdf=True)
+            title = "Карта пошива"
+        else:
+            from sewing_document import cut_document, kit_document, standalone_document
+            from sewing_pdf import render_sewing_pdf
+
+            store = self.server.production
+            with request_lock(self.server.sewing_pdf_lock, "Дождитесь построения карты пошива."):
+                if params.get("kitId"):
+                    width = float(params["widthMm"]) if "widthMm" in params else None
+                    data = kit_document(store, params["kitId"], int(params.get("quantity", 1)), width)
+                elif params.get("cutId"):
+                    data = cut_document(store, params["cutId"], params.get("mode", "operator"))
+                elif params.get("workspace") == "1":
+                    data = standalone_document(store, self.plotter.workspace.read()["workspace"])
+                else:
+                    raise ValueError("Выберите комплект или раскрой для карты пошива.")
+                name, parts, context, layout = data
+                title = "Карта пошива · " + name
+                contents = render_sewing_pdf(name, parts, context=context, workspace=layout)
+                if len(contents) > MAX_WORKSPACE_BYTES:
+                    raise ValueError("Карта пошива слишком велика. Скачайте её для меньшего количества комплектов.")
+        self.response_headers(len(contents), "application/pdf", HTTPStatus.OK, title + ".pdf", "sewing-map.pdf")
+        self.wfile.write(contents)
+
+    def get_part_preview(self, query):
+        from sewing_document import registry_part_document
+        from sewing_pdf import render_part_preview_svg
+
+        identifier = key(parse_qs(query, max_num_fields=1).get("id", [None])[0])
+        if self.server.local_companion_ui:
+            entry = self.server.workspace.production_request("/api/registry?" + urlencode({"id": identifier}))
+        else:
+            entry = self.server.production.registry(identifier)
+        with request_lock(self.server.sewing_pdf_lock, "Дождитесь построения чертежа."):
+            contents = render_part_preview_svg(registry_part_document(entry))
+        if len(contents) > MAX_WORKSPACE_BYTES:
+            raise ValueError("Чертёж детали слишком велик для предпросмотра.")
+        self.respond(contents, "image/svg+xml; charset=utf-8")
+
+    def get_registry_backup(self):
+        filename = "plotter-registry.rar"
+        with request_lock(self.server.registry_archive_lock, "Дождитесь окончания работы с резервной копией реестра."):
+            if self.server.local_companion_ui:
+                contents = self.server.workspace.production_request("/api/registry-backup", rar=True)
+            else:
+                contents = write_registry_archive(self.server.production.export_registry())
+            self.response_headers(len(contents), RAR_MIME, HTTPStatus.OK, filename, filename)
+            self.wfile.write(contents)
+
+    def post_registry_backup(self):
+        with request_lock(self.server.registry_archive_lock, "Дождитесь окончания работы с резервной копией реестра."):
+            contents = self.body(MAX_REGISTRY_ARCHIVE, "application/octet-stream")
+            if self.server.local_companion_ui:
+                result = self.server.workspace.production_request("/api/registry-backup", raw=contents)
+            else:
+                result = self.server.production.restore_registry(read_registry_archive(contents))
+        self.json_response(result)
+
     def get_production(self, path, query):
         params = {key: values[0] for key, values in parse_qs(query, max_num_fields=4).items()}
         if self.server.local_companion_ui:
@@ -1587,7 +1812,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Укажите ширину полотна и количество комплектов.") from error
                 self.json_response(store.kit_layout(params.get("id"), width, amount))
             else:
-                self.json_response(store.registry(params.get("id")))
+                registry = store.registry(params.get("id"))
+                if self.server.sketchup_design and not params.get("id"):
+                    registry["sketchupDesign"] = True
+                self.json_response(registry)
         elif path == "/api/orders":
             self.json_response(store.orders(params.get("id"), published_only=params.get("published") == "1"))
         else:
@@ -1614,7 +1842,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.production
         verify = self.server.verify_production_layout
         if path == "/api/registry" and action in ("save", "move"):
-            result = store.save_registry(data)
+            result = store.save_registry(data, allow_3d=self.server.sketchup_design)
         elif path == "/api/registry" and action == "delete":
             result = store.delete_registry(data)
         elif path == "/api/registry" and action == "collect":
@@ -1727,16 +1955,19 @@ class Handler(BaseHTTPRequestHandler):
         self.response_headers(len(contents), content_type, status, filename)
         self.wfile.write(contents)
 
-    def response_headers(self, size, content_type, status, filename=None, fallback_filename="plotter.dxf"):
+    def response_headers(self, size, content_type, status, filename=None, fallback_filename="plotter.dxf", *, encoding=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(size))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin" if self.server.local_companion_ui else "no-referrer")
         connect = f"; connect-src 'self' http://127.0.0.1:{COMPANION_PORT}" if self.server.central_mode else ""
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'" + connect)
+        font = "; font-src data:" if content_type == "image/svg+xml; charset=utf-8" else ""
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'" + connect + font)
         if (self.server.companion_mode and not self.server.local_companion_ui
                 and self.headers.get("Origin") == self.server.companion_origin):
             self.send_header("Access-Control-Allow-Origin", self.server.companion_origin)

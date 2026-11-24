@@ -71,7 +71,7 @@ if (!(Test-Path -LiteralPath $runtime)) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the local Python environment.' }
 }
 
-$installed = & $runtime -c "from importlib.metadata import distributions; from pathlib import Path; installed = {d.metadata['Name'].lower(): d.version for d in distributions()}; print(all(installed.get(name.lower()) == version for name, version in (line.split('==') for line in Path('requirements.txt').read_text().splitlines() if '==' in line)))"
+$installed = & $runtime -c "from importlib.metadata import distributions; from pathlib import Path; from pip._vendor.packaging.requirements import Requirement; installed = {d.metadata['Name'].lower(): d.version for d in distributions()}; requirements = map(Requirement, filter(None, Path('requirements.txt').read_text().splitlines())); print(all(r.specifier.contains(installed.get(r.name.lower(), '0')) for r in requirements if not r.marker or r.marker.evaluate()))"
 if ($LASTEXITCODE -ne 0 -or $installed -ne 'True') {
     & $runtime -m pip install --disable-pip-version-check -r requirements.txt
     if ($LASTEXITCODE -ne 0) { throw 'Could not install the drawing dependencies.' }
