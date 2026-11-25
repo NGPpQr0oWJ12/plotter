@@ -19,6 +19,7 @@ from cad import MAX_ABS_COORDINATE_MM, MAX_ENTITIES, MAX_POINTS, POINT_EPSILON_M
 from designer_cad import center_part_geometry, prepare_design, validate_design
 from machine import PlotterError
 from nesting import validate_placed_parts
+from order_metrics import cut_metrics, plan_snapshot, summarize_cuts, utc_now
 from registry_archive import MAX_REGISTRY_JSON
 from sketchup_design import MAX_MODEL_BYTES, markup
 from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, PART_LABEL_FIELDS, WORKSPACE_REVISION_CONFLICT,
@@ -36,6 +37,17 @@ KIT_LAYOUT_SCHEMA = """
         width_mm REAL NOT NULL, quantity INTEGER NOT NULL, revision INTEGER NOT NULL,
         basis TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kit_id, width_mm, quantity)
     )
+"""
+CUT_STATISTICS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS cut_statistics (
+        cut_id TEXT PRIMARY KEY REFERENCES cuts(id) ON DELETE CASCADE,
+        workspace_mode TEXT, cut_revision INTEGER, width_mm REAL, prepared INTEGER,
+        metrics TEXT, started_at TEXT, finished_at TEXT
+    )
+"""
+CUTS_WITH_STATISTICS = """
+    SELECT cuts.*, stats.metrics AS _metrics, stats.started_at AS _startedAt, stats.finished_at AS _finishedAt
+    FROM cuts LEFT JOIN cut_statistics AS stats ON stats.cut_id=cuts.id
 """
 MODEL_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS sketchup_models (
@@ -324,6 +336,14 @@ def row_data(row):
     return {**json.loads(row["data"]), **{k: row[k] for k in row.keys() if k != "data"}}
 
 
+def cut_with_statistics(row, *, released=True):
+    cut = {"released": released, **row_data(row)}
+    metrics = cut.pop("_metrics")
+    cut["stats"] = cut_metrics(json.loads(metrics) if metrics else None, cut["status"],
+                               cut.pop("_startedAt"), cut.pop("_finishedAt"))
+    return cut
+
+
 def check_composition(draft, cut):
     excluded = set(draft["excluded"])
     actual = {path.get("partNumber") for index, path in enumerate(draft["paths"])
@@ -401,6 +421,7 @@ def check_kit_geometry(source, draft):
     expected, placed = paths_by_part(source), paths_by_part(draft["paths"])
 
     message = "Раскладка должна содержать все исходные резы комплекта. Меняйте только положение и угол деталей."
+    nap_angle = 180 if draft["optimization"].get("napReversed") else 0
     if draft["excluded"] or placed.keys() != expected.keys():
         raise ValueError(message)
     for number, originals in expected.items():
@@ -408,7 +429,7 @@ def check_kit_geometry(source, draft):
         if len(actual) != len(originals):
             raise ValueError(message)
         angle = actual[0].get("partAngle", 0)
-        if originals[0].get("partRotation") == "none" and abs(math.remainder(angle, 360)) > .001:
+        if originals[0].get("partRotation") == "none" and abs(math.remainder(angle - nap_angle, 360)) > .001:
             raise ValueError("Кромка направленной ткани должна идти вдоль рулона.")
         if not same_part_geometry(originals, actual):
             raise ValueError(message)
@@ -417,6 +438,10 @@ def check_kit_geometry(source, draft):
 class ProductionStore:
     def __init__(self, path):
         self.path = Path(path)
+        self.layout_metrics = None
+
+    def configure_metrics(self, callback):
+        self.layout_metrics = callback
 
     @contextmanager
     def connect(self, *, write=False):
@@ -433,6 +458,8 @@ class ProductionStore:
             # This additive table leaves version 1 registries readable by older releases.
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kit_layouts'").fetchone() is None:
                 db.execute(KIT_LAYOUT_SCHEMA)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cut_statistics'").fetchone() is None:
+                db.execute(CUT_STATISTICS_SCHEMA)
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.commit()
@@ -1016,8 +1043,12 @@ class ProductionStore:
 
     @staticmethod
     def cuts(db, order_id):
-        return [{"released": True, **row_data(row)} for row in db.execute(
-            "SELECT * FROM cuts WHERE order_id = ? ORDER BY position", (order_id,))]
+        return [cut_with_statistics(row) for row in db.execute(
+            CUTS_WITH_STATISTICS + " WHERE cuts.order_id=? ORDER BY cuts.position", (order_id,))]
+
+    def order_with_cuts(self, db, header):
+        cuts = self.cuts(db, header["id"])
+        return {**header, "cuts": cuts, "stats": summarize_cuts(cuts)}
 
     def orders(self, order_id=None, *, published_only=False):
         with self.connect() as db:
@@ -1025,22 +1056,25 @@ class ProductionStore:
                 header = self.order_header(db, order_id)
                 if published_only and not header["published"]:
                     raise RecordNotFound("Наряд ещё не отправлен оператору.")
-                return {**header, "cuts": self.cuts(db, order_id)}
+                return self.order_with_cuts(db, header)
             entries = (row_data(row) for row in db.execute(
                 "SELECT * FROM orders WHERE published >= ? ORDER BY rowid DESC", (int(published_only),)))
             orders = {order["id"]: {**self.order_details(db, order),
                                    "materials": [], "total": 0, "done": 0, "active": 0}
                       for order in entries if not order.get("deleted")}
-            for row in db.execute("SELECT cuts.* FROM cuts JOIN orders ON orders.id=cuts.order_id "
+            for row in db.execute(CUTS_WITH_STATISTICS + " JOIN orders ON orders.id=cuts.order_id "
                                   "WHERE orders.published >= ? ORDER BY cuts.order_id, cuts.position", (int(published_only),)):
                 order = orders.get(row["order_id"])
                 if order is None:
                     continue
-                cut = {"released": bool(order["published"]), **row_data(row)}
-                order["materials"].append({field: cut[field] for field in ("id", "name", "widthMm", "status", "prepared", "released")})
+                cut = cut_with_statistics(row, released=bool(order["published"]))
+                order["materials"].append({field: cut[field] for field in
+                                           ("id", "name", "widthMm", "status", "prepared", "released", "stats")})
                 order["total"] += 1
                 order["done"] += cut["status"] == "done"
                 order["active"] += cut["status"] == "active"
+            for order in orders.values():
+                order["stats"] = summarize_cuts(order["materials"])
             return {"orders": list(orders.values())}
 
     def save_order(self, payload):
@@ -1068,9 +1102,10 @@ class ProductionStore:
                     paths = self.expand_parts(db, cut["members"], amount)
                     cut_id = cut["id"]
                     workspace = new_workspace(paths, f"cut-{cut_id}.dxf", cut["widthMm"])
-                    self.put_workspace(db, cut_id, "design", workspace, self.find_workspace(db, cut_id, "design"))
+                    record = self.put_workspace(db, cut_id, "design", workspace, self.find_workspace(db, cut_id, "design"))
                     db.execute("UPDATE cuts SET revision=revision+1, data=? WHERE id=?",
                                (encode(cut_data(cut, prepared=False, released=False, partCount=paths[-1]["partNumber"])), cut_id))
+                    self.refresh_cut_statistics(db, {**cut, "prepared": False}, "design", record)
                 self.clear_operator_workspaces(db, order_id)
             data = {**order_metadata(payload, old), "modelId": model_id, "modelName": model_name, "quantity": amount}
             if old is None:
@@ -1078,7 +1113,7 @@ class ProductionStore:
                 db.execute("INSERT INTO orders VALUES (?, 1, 0, ?)", (order_id, encode(data)))
             else:
                 db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?", (encode(data), order_id))
-            return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
+            return self.order_with_cuts(db, self.order_header(db, order_id))
 
     def update_order_metadata(self, payload):
         order_id = key(payload.get("id"))
@@ -1090,7 +1125,7 @@ class ProductionStore:
                 raw = db.execute("SELECT data FROM orders WHERE id=?", (order_id,)).fetchone()["data"]
                 db.execute("UPDATE orders SET revision=revision+1, data=? WHERE id=?",
                            (encode({**json.loads(raw), **data}), order_id))
-            return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
+            return self.order_with_cuts(db, self.order_header(db, order_id))
 
     def delete_order(self, payload):
         order_id = key(payload.get("id"))
@@ -1159,9 +1194,10 @@ class ProductionStore:
                         db.execute("DELETE FROM workspaces WHERE cut_id=? AND mode IN ('operator','demo')", (cut_id,))
                     if workspace is None:
                         workspace = new_workspace(paths, f"cut-{cut_id}.dxf", data["widthMm"])
-                    self.put_workspace(db, cut_id, "design", workspace, previous)
+                    record = self.put_workspace(db, cut_id, "design", workspace, previous)
+                    self.refresh_cut_statistics(db, {"id": cut_id, **data}, "design", record)
             db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
-            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"]), "cutId": cut_id}
+            return {**self.order_with_cuts(db, self.order_header(db, order["id"])), "cutId": cut_id}
 
     @staticmethod
     def find_workspace(db, cut_id, mode):
@@ -1171,6 +1207,73 @@ class ProductionStore:
             return None
         return {"revision": row["revision"], "cutRevision": row["cut_revision"],
                 "workspace": json.loads(row["data"])}
+
+    @staticmethod
+    def statistics_key(db, cut_id):
+        row = db.execute("SELECT workspace_mode, cut_revision, width_mm, prepared FROM cut_statistics WHERE cut_id=?",
+                         (cut_id,)).fetchone()
+        return tuple(row) if row is not None else None
+
+    @staticmethod
+    def current_statistics_key(db, cut):
+        row = db.execute("SELECT mode, cut_revision FROM workspaces WHERE cut_id=? AND mode IN ('design','operator') "
+                         "ORDER BY mode='operator' DESC LIMIT 1", (cut["id"],)).fetchone()
+        return (*row, cut["widthMm"], row["mode"] != "design" or bool(cut.get("prepared"))) if row is not None else None
+
+    @staticmethod
+    def put_cut_statistics(db, cut_id, key, metrics):
+        db.execute("INSERT INTO cut_statistics (cut_id,workspace_mode,cut_revision,width_mm,prepared,metrics) VALUES (?,?,?,?,?,?) "
+                   "ON CONFLICT(cut_id) DO UPDATE SET workspace_mode=excluded.workspace_mode, "
+                   "cut_revision=excluded.cut_revision, width_mm=excluded.width_mm, prepared=excluded.prepared, "
+                   "metrics=excluded.metrics",
+                   (cut_id, *key, encode(metrics) if metrics is not None else None))
+
+    def calculate_cut_statistics(self, cut, mode, draft, source, verified=None):
+        width = cut["widthMm"]
+        if (width is None or (mode == "design" and not cut.get("prepared"))
+                or draft["optimization"].get("nesting", {}).get("widthMm") != width):
+            return None
+        if not isinstance(verified, dict):
+            try:
+                check_composition(draft, cut)
+                verified = self.layout_metrics(draft, width)
+            except (ValueError, PlotterError):
+                return None
+        return plan_snapshot(verified, source)
+
+    def refresh_cut_statistics(self, db, cut, mode, record, verified=None):
+        key = (mode, record["cutRevision"], cut["widthMm"], mode != "design" or bool(cut.get("prepared")))
+        previous = self.statistics_key(db, cut["id"])
+        if previous == key:
+            return
+        if self.layout_metrics is None:
+            if previous is not None:
+                self.put_cut_statistics(db, cut["id"], (None, None, None, None), None)
+            return
+        metrics = self.calculate_cut_statistics(cut, mode, record["workspace"], mode, verified)
+        self.put_cut_statistics(db, cut["id"], key, metrics)
+
+    def backfill_metrics(self):
+        if self.layout_metrics is None or not self.path.is_file():
+            return
+        with self.connect() as db:
+            cut_ids = [row["id"] for row in db.execute("SELECT cuts.id FROM cuts JOIN orders ON orders.id=cuts.order_id "
+                                                       "WHERE COALESCE(json_extract(orders.data,'$.deleted'),0)=0")]
+        for cut_id in cut_ids:
+            try:
+                with self.connect() as db:
+                    cut = self.cut_record(db, cut_id)
+                    key = self.current_statistics_key(db, cut)
+                    if key is None or self.statistics_key(db, cut_id) == key:
+                        continue
+                    draft = self.find_workspace(db, cut_id, key[0])["workspace"]
+                metrics = self.calculate_cut_statistics(cut, key[0], draft, "saved")
+                with self.connect(write=True) as db:
+                    if (self.current_statistics_key(db, self.cut_record(db, cut_id)) == key
+                            and self.statistics_key(db, cut_id) != key):
+                        self.put_cut_statistics(db, cut_id, key, metrics)
+            except RecordNotFound:
+                continue
 
     @staticmethod
     def clear_operator_workspaces(db, order_id):
@@ -1246,12 +1349,14 @@ class ProductionStore:
                 raise ValueError("Ширина должна совпадать с указанной в пункте наряда.")
             if mode == "operator" and cut["status"] == "pending":
                 raise WorkspaceConflict("Сначала откройте раскрой из наряда.")
+            prepared = cut.get("prepared")
+            verified = None
             if mode == "design" or (mode == "operator" and width is None):
                 prepared = False
                 if layout_width is not None:
                     try:
                         check_composition(draft, cut)
-                        verify_layout(draft, layout_width)
+                        verified = verify_layout(draft, layout_width)
                         prepared = True
                     except (ValueError, PlotterError):
                         pass
@@ -1267,25 +1372,31 @@ class ProductionStore:
             previous = self.find_workspace(db, cut["id"], mode)
             if not previous:
                 previous = current
-            return {**self.put_workspace(db, cut["id"], mode, draft, previous), "widthMm": width}
+            record = self.put_workspace(db, cut["id"], mode, draft, previous)
+            if mode != "demo":
+                self.refresh_cut_statistics(db, {**cut, "widthMm": width, "prepared": prepared}, mode, record, verified)
+            return {**record, "widthMm": width}
 
     def verify_cut(self, db, cut, verify_layout):
-        draft = self.find_workspace(db, cut["id"], "design")["workspace"]
+        record = self.find_workspace(db, cut["id"], "design")
+        draft = record["workspace"]
         width = cut["widthMm"]
+        verified = None
         try:
             check_composition(draft, cut)
             if width is not None:
-                verify_layout(draft, width)
+                verified = verify_layout(draft, width)
         except (ValueError, PlotterError) as error:
             raise ValueError(f'{cut["name"]}: {error}') from error
         data = cut_data(cut, prepared=width is not None, released=True)
         db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(data), cut["id"]))
+        self.refresh_cut_statistics(db, {**cut, **data}, "design", record, verified)
 
     def publish_order(self, payload, verify_layout):
         with self.connect(write=True) as db:
             order = self.order_header(db, payload.get("id"))
             if order["published"]:
-                return {**order, "cuts": self.cuts(db, order["id"])}
+                return self.order_with_cuts(db, order)
             check_revision(payload.get("revision"), order["revision"])
             cuts = self.cuts(db, order["id"])
             if not cuts:
@@ -1293,7 +1404,7 @@ class ProductionStore:
             for cut in cuts:
                 self.verify_cut(db, cut, verify_layout)
             db.execute("UPDATE orders SET published=1, revision=revision+1 WHERE id=?", (order["id"],))
-            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"])}
+            return self.order_with_cuts(db, self.order_header(db, order["id"]))
 
     def publish_cut(self, payload, verify_layout):
         with self.connect(write=True) as db:
@@ -1306,7 +1417,7 @@ class ProductionStore:
                 raise WorkspaceConflict("Этот пункт не ожидает отправки оператору.")
             self.verify_cut(db, cut, verify_layout)
             db.execute("UPDATE orders SET revision=revision+1 WHERE id=?", (order["id"],))
-            return {**self.order_header(db, order["id"]), "cuts": self.cuts(db, order["id"])}
+            return self.order_with_cuts(db, self.order_header(db, order["id"]))
 
     def reopen_order(self, payload):
         order_id = key(payload.get("id"))
@@ -1324,8 +1435,11 @@ class ProductionStore:
                     data.pop("operatorAssignedWidth")
                     db.execute("UPDATE cuts SET data=? WHERE id=?", (encode(data), cut["id"]))
             self.clear_operator_workspaces(db, order_id)
+            for cut in self.cuts(db, order_id):
+                record = self.find_workspace(db, cut["id"], "design")
+                self.refresh_cut_statistics(db, cut, "design", record)
             db.execute("UPDATE orders SET published=0, revision=revision+1 WHERE id=?", (order_id,))
-            return {**self.order_header(db, order_id), "cuts": self.cuts(db, order_id)}
+            return self.order_with_cuts(db, self.order_header(db, order_id))
 
     def progress(self, cut_id, action, mode, revision=None):
         with self.connect(write=True) as db:
@@ -1342,6 +1456,13 @@ class ProductionStore:
                     status = "done"
                 if status != cut["status"]:
                     db.execute("UPDATE cuts SET status=? WHERE id=?", (status, cut_id))
+                    if status == "active":
+                        db.execute("INSERT INTO cut_statistics (cut_id,started_at) VALUES (?,?) "
+                                   "ON CONFLICT(cut_id) DO UPDATE SET started_at=excluded.started_at, finished_at=NULL",
+                                   (cut_id, utc_now()))
+                    else:
+                        db.execute("INSERT INTO cut_statistics (cut_id,finished_at) VALUES (?,?) "
+                                   "ON CONFLICT(cut_id) DO UPDATE SET finished_at=excluded.finished_at", (cut_id, utc_now()))
             elif action != "start" or mode != "demo":
                 raise WorkspaceConflict("В демо-режиме ход наряда не сохраняется.")
             return {**current, "status": status, "name": cut["name"], "widthMm": cut["widthMm"],
@@ -1355,7 +1476,9 @@ class ProductionStore:
             if cut["status"] != "active":
                 raise WorkspaceConflict("Этот раскрой сейчас не открыт на плоттере.")
             current = self.put_workspace(db, cut_id, "operator", current["workspace"], current)
+            self.refresh_cut_statistics(db, cut, "operator", current)
             db.execute("UPDATE cuts SET status='pending' WHERE id=?", (cut_id,))
+            db.execute("UPDATE cut_statistics SET started_at=NULL, finished_at=NULL WHERE cut_id=?", (cut_id,))
             return {**current, "status": "pending", "name": cut["name"], "widthMm": cut["widthMm"]}
 
     def backup(self, destination):

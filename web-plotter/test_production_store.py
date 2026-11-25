@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from production_store import MOSCOW_TIME, ProductionStore, RecordNotFound, verify_arrangement
+from production_store import MOSCOW_TIME, ProductionStore, RecordNotFound, check_kit_geometry, verify_arrangement
 from workspace import WorkspaceConflict
 
 
@@ -322,6 +322,16 @@ class ProductionTests(unittest.TestCase):
         self.assertFalse(self.order["cuts"][-1]["prepared"])
         self.assertEqual(self.store.workspace(cut_id, "design"), before)
 
+    def test_kit_preserves_directed_part_requirement_when_reversing_nap(self):
+        part = {"partNumber": 1, "partRotation": "none", "layer": "0", "closed": True,
+                "points": [[0, 0], [40, 0], [28, 30]]}
+        turned = {**part, "partAngle": 180, "points": [[40 - x, 30 - y] for x, y in part["points"]]}
+        with self.assertRaisesRegex(ValueError, "направленной ткани"):
+            check_kit_geometry([part], {"paths": [turned], "excluded": [], "optimization": {}})
+        check_kit_geometry([part], {"paths": [turned], "excluded": [], "optimization": {"napReversed": True}})
+        with self.assertRaisesRegex(ValueError, "направленной ткани"):
+            check_kit_geometry([part], {"paths": [part], "excluded": [], "optimization": {"napReversed": True}})
+
     def test_centering_a_legacy_part_preserves_saved_kit_layout(self):
         with self.store.connect(write=True) as db:
             row = db.execute("SELECT data FROM registry WHERE id=?", (self.part["id"],)).fetchone()
@@ -626,7 +636,8 @@ class ProductionTests(unittest.TestCase):
         shown, = self.store.orders(published_only=True)["orders"]
         self.assertEqual(shown["active"], 1)
         self.assertEqual(shown["materials"], [{"id": cut_id, "name": "Ткань", "widthMm": 1500,
-                                               "status": "active", "prepared": True, "released": True}])
+                                               "status": "active", "prepared": True, "released": True,
+                                               "stats": new["cuts"][0]["stats"]}])
         with self.assertRaises(WorkspaceConflict):
             self.store.update_order_metadata({**order, "notes": "старая вкладка"})
 

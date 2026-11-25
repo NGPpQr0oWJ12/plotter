@@ -430,6 +430,33 @@ class ServerFlowTests(unittest.TestCase):
         self.controller.read_live.assert_not_called()
         self.controller.operate.assert_not_called()
 
+    def test_order_analysis_matches_operator_cut_plan(self):
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Панель", "entities": [
+            {"id": "outline", "type": "polyline", "layer": "0", "closed": True,
+             "points": [[20, 20], [80, 20], [80, 60], [20, 60]]}]})
+        order = self.request("/api/orders", {"action": "save", "number": "Тест"})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Ткань", "widthMm": 1380, "members": [{"id": part["id"], "quantity": 1}]})
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        self.controller.read_live.return_value = {"responded": False}
+        with patch("production_store.utc_now", return_value="2026-11-24T10:00:00Z"):
+            working = self.request("/api/cut-context", {"action": "select", "cutId": order["cutId"]})
+        job, filename = self.server.workspace_drawing(working["workspace"])
+        plan = self.request("/api/cut-plan", {"filename": filename, "job": job})
+        with patch("production_store.utc_now", return_value="2026-11-24T11:00:00Z"):
+            self.request("/api/cut-context", {"action": "finish", "cutId": order["cutId"], "revision": working["revision"]})
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            client.request("GET", "/api/order-analysis?from=2026-11-24&to=2026-11-24&tz=Europe%2FMoscow")
+            response = client.getresponse()
+            report = json.loads(response.read())
+            self.assertEqual(response.status, HTTPStatus.OK, report)
+        stats = report["orders"][0]["stats"]
+        for field in ("cutDistanceMm", "travelDistanceMm", "estimatedWorkSeconds"):
+            self.assertAlmostEqual(stats[field], plan[field])
+        for field in ("lengthMm", "utilizationPercent"):
+            self.assertAlmostEqual(report["summary"][field], plan["material"][field])
+        self.assertEqual((stats["actualSeconds"], report["summary"]["pairedCount"]), (3600, 1))
+
     def test_registered_cut_cannot_use_another_revision_or_replace_running_cut(self):
         folder = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Диван", "model": True})
         part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Сиденье", "entities": [

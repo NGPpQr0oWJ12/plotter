@@ -33,7 +33,7 @@ jobs:
         with:
           node-version: '22'
       - if: runner.os == 'Linux'
-        run: node --test "web-plotter/test_designer_3d_*.mjs"
+        run: node --test "web-plotter/test_designer_3d_*.mjs" web-plotter/test_fabric_nap.mjs
 
   linux-dwg:
     name: Import a real DWG on Linux

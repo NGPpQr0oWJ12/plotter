@@ -105,6 +105,10 @@ def _workspace(value):
         raise ValueError("Неверные настройки оптимизации рабочей области.")
 
     settings = {"route": optimization["route"], "join": optimization["join"]}
+    if "napReversed" in optimization:
+        if type(optimization["napReversed"]) is not bool:
+            raise ValueError("Неверное направление ворса рабочей области.")
+        settings["napReversed"] = optimization["napReversed"]
     if "routeApplied" in optimization:
         route_applied = optimization["routeApplied"]
         if type(route_applied) is not bool:
