@@ -59,7 +59,7 @@ class CutStatistics {
 }
 
 class CutSimulation {
-  constructor({ projectPoint, element, number, onChange, onPageChange, onProgress, createHeadMarker, markerScale, statistics }) {
+  constructor({ projectPoint, element, number, onChange, onPageChange, onProgress, createHeadMarker, positionHeadMarker, markerScale, statistics }) {
     this.projectPoint = projectPoint;
     this.element = element;
     this.number = number;
@@ -67,6 +67,7 @@ class CutSimulation {
     this.onPageChange = onPageChange;
     this.onProgress = onProgress;
     this.createHeadMarker = createHeadMarker;
+    this.positionHeadMarker = positionHeadMarker;
     this.markerScale = markerScale;
     this.dock = document.getElementById("simulation-dock");
     this.status = document.getElementById("simulation-status");
@@ -329,7 +330,7 @@ class CutSimulation {
     this.partial.setAttribute("x2", x);
     this.partial.setAttribute("y2", y);
     const units = this.markerScale() || 1;
-    this.head.setAttribute("transform", `translate(${x} ${y}) scale(${units})`);
+    this.positionHeadMarker(this.head, x, y, units, feeding && this.running);
     this.shortMarker.setAttribute("visibility", move?.short ? "visible" : "hidden");
     this.shortMarker.setAttribute("cx", x);
     this.shortMarker.setAttribute("cy", y);

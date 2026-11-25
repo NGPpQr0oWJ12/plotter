@@ -20,7 +20,7 @@ import shutil
 import ssl
 import subprocess
 from struct import unpack_from
-from threading import Lock, Timer
+from threading import Lock, Thread, Timer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
@@ -42,6 +42,7 @@ from designer_cad import edit_design, import_design, prepare_design
 from fit_jobs import FitJobs
 from machine import PlotterError, Simulator, build_plan, number
 from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
+from order_analysis import analysis_period, order_analysis
 from panel_diagnostics import compare_panel_samples
 from panel_readback import PanelReadback
 from production_store import RECORD_REVISION_MESSAGE, ProductionStore, RecordNotFound, key, verify_arrangement
@@ -887,6 +888,11 @@ class PlotterState:
         plan = self.cut_plan(job, filename)
         if not plan["canPrepareXiao"]:
             raise ValueError(plan["issues"][0]["message"] if plan["issues"] else "Раскрой не содержит проходов.")
+        material = plan["material"]
+        return {**{field: material[field] for field in ("lengthMm", "areaMm2", "partsAreaMm2", "utilizationPercent")},
+                **{field: plan[field] for field in ("cutDistanceMm", "travelDistanceMm", "estimatedWorkSeconds",
+                                                    "cutSpeedMmS", "travelSpeedMmS")},
+                "approximate": bool(material["openContourCount"])}
 
     def change_cut_context(self, data):
         cut_id = data.get("cutId")
@@ -1253,6 +1259,7 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
                               companion=bool(self.companion_origin))
         self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
         self.production = self.demo.production = ProductionStore(Path(workspace_path).with_name("production.sqlite3"))
+        self.production.configure_metrics(self.verify_production_layout)
         self.sketchup_design = os.name == "nt" and not (self.central_mode or self.companion_mode)
         self.sketchup_lock = Lock()
         self.sewing_pdf_lock = Lock()
@@ -1474,7 +1481,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(contents)
             else:
                 self.respond(gzip.decompress(contents), content_type)
-        elif path in PRODUCTION_ROUTES:
+        elif path in PRODUCTION_ROUTES or path == "/api/order-analysis":
             self.get_production(path, query)
         elif path == "/api/registry-backup":
             self.get_registry_backup()
@@ -1868,6 +1875,9 @@ class Handler(BaseHTTPRequestHandler):
                 if self.server.sketchup_design and not params.get("id"):
                     registry["sketchupDesign"] = True
                 self.json_response(registry)
+        elif path == "/api/order-analysis":
+            period = analysis_period(params)
+            self.json_response(order_analysis(store.orders(published_only=True)["orders"], period))
         elif path == "/api/orders":
             self.json_response(store.orders(params.get("id"), published_only=params.get("published") == "1"))
         else:
@@ -2062,6 +2072,8 @@ def main():
     path = args.workspace or (args.profile.parent / "workspace.json" if args.companion else WORKSPACE_PATH)
     with PlotterServer(port, path, profile_path=args.profile, public_origin=args.public_origin,
                        companion_origin=args.central_url, central_ca=args.central_ca) as server:
+        if not server.companion_mode:
+            Thread(target=server.production.backfill_metrics, name="order-metrics-backfill", daemon=True).start()
         url = f"http://{LOCAL_ADDRESS}:{server.server_port}"
         print(f"Плоттер запущен: {url}", flush=True)
         if args.open:

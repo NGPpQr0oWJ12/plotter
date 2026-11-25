@@ -27,7 +27,9 @@ const placementFields = ["offset-x", "offset-y", "rotation", "size-width", "size
 const DEFAULT_FABRIC_WIDTH_MM = 1380;
 const MIN_RULER_STEP_MM = 5;
 const RULER_SPACING_PX = 88;
-const CLOSE_ZOOM_SPACING_PX = 60;
+const CLOSE_ZOOM_SPACING_PX = 240;
+const MAX_VIEW_SCALE = 25;
+const ZOOM_STEP = 1.25;
 const ROTATION_SNAP_STEP = 45;
 const MEASUREMENT_SNAP_PX = 14;
 const MEASUREMENT_AXIS_THRESHOLD_PX = 5;
@@ -118,6 +120,10 @@ const runStatistics = new CutStatistics($("run-statistics"), formatDuration, num
 
 let source = null;
 let placed = [];
+let fabricNapReversed = false;
+let fabricNapPair = null;
+let napPreviewOriginal = null;
+let napChangePending = false;
 let pathBoxes = [];
 let drawingParts = new Map();
 const partLegendRows = new Map();
@@ -156,7 +162,10 @@ let drag = null;
 let freeRotation = null;
 let renderedPaths = [];
 const notchMarkers = new Map();
+const partSurfaces = new Map();
+let surfacePaths = null;
 const partLabels = new Map();
+const partLabelHeight = 26;
 let fileDragDepth = 0;
 // The camera uses SVG coordinates. From the operator's end, X goes up and Y goes left.
 let baseCamera = null;
@@ -187,7 +196,7 @@ let xiaoResult = null;
 const layoutStatistics = new CutStatistics($("layout-statistics"), formatDuration, number);
 const simulation = new CutSimulation({
   projectPoint, element, number, statistics: layoutStatistics,
-  createHeadMarker,
+  createHeadMarker, positionHeadMarker,
   markerScale: () => camera ? camera.width / Math.max(svg.clientWidth, 1) : 1,
   onPageChange: updateCanvasSection,
   onChange: () => { updateCanvasSection(); renderHead(); renderCutProgress(); renderControls(); },
@@ -603,16 +612,65 @@ function gridSpacing(units) {
   return { major, minor };
 }
 
+function plotterTrim(units) {
+  return Math.min(units, machine.height / 92, machine.width / 92);
+}
+
+function plotterSideFrame(x, top, length, trim, direction) {
+  const side = element("g", { transform: `translate(${x} ${top}) scale(${direction * trim} ${trim})` });
+  const span = length / trim;
+  side.append(
+    element("path", { d: `M0 -6H15L20 -1V${span + 17}l-5 6H0Z`, class: "plotter-side-casting" }),
+    element("path", { d: `M3 1H13V${span + 1}H3Z`, class: "plotter-runner" }),
+    element("path", { d: `M6 2V${span} M11 2V${span}`, class: "plotter-guide-rail" }),
+    element("path", { d: `M16 4V${span - 4}`, class: "plotter-drive-belt" }),
+  );
+  for (const y of [4, span / 2, span - 4]) {
+    side.append(element("use", { href: "#plotter-fixing", x: 2, y }));
+  }
+  side.append(element("use", { href: "#plotter-bearing-block", y: span + 4 }));
+  if (direction > 0) side.append(element("use", { href: "#plotter-feed-drive", x: 17, y: span + 3 }));
+  return side;
+}
+
+function renderedFabricWidth() {
+  if (!includedBounds && !nestingSettings?.widthMm) return 0;
+  const width = nestingSettings?.widthMm ?? (cutWidthPending() ? 0 : machine.height);
+  return Math.max(0, Math.min(width, machine.height));
+}
+
+// The drawing and its cut plan share a fabric-relative origin. Place the machine around that origin.
+function fabricBedOffsetY() {
+  const fabric = renderedFabricWidth();
+  return fabric ? (machine.height - fabric) / 2 : 0;
+}
+
 function renderTable() {
   if (!camera) return;
   const { width, height } = machine;
   const length = Math.max(width, includedBounds?.maxX || 0);
   const layer = $("table-layer");
   const units = camera.width / Math.max(svg.clientWidth, 1);
-  const surface = svgBox({ minX: 0, minY: 0, maxX: length, maxY: height });
-  const parts = [element("rect", { ...surface, class: "table-background" })];
-  const materialWidth = nestingSettings?.widthMm ?? (cutWidthPending() ? 0 : height);
-  const fabric = includedBounds && materialWidth > 0 ? Math.min(materialWidth, height) : 0;
+  const pageStart = canvasSection(cutPlan ?? pendingCanvasPlan)?.page.startX ?? 0;
+  const bed = { x: -height, y: -pageStart - width, width: height, height: width };
+  const trim = plotterTrim(units);
+  const bedTransform = `translate(${fabricBedOffsetY()} 0)`;
+  const hardware = element("g", { class: "plotter-hardware", transform: bedTransform });
+  hardware.append(
+    element("rect", { x: bed.x - 15 * trim, y: bed.y - 7 * trim, width: height + 30 * trim,
+      height: width + 35 * trim, rx: 5 * trim, class: "plotter-chassis" }),
+    element("rect", { x: bed.x - 12 * trim, y: bed.y - 8 * trim, width: height + 24 * trim,
+      height: width + 31 * trim, rx: 4 * trim, class: "plotter-machine-deck" }),
+    element("rect", { ...bed, class: "table-background" }),
+    element("rect", { ...bed, class: "table-border", "vector-effect": "non-scaling-stroke" }),
+    plotterSideFrame(-height, bed.y, width, trim, -1),
+    plotterSideFrame(0, bed.y, width, trim, 1),
+  );
+  const parts = [hardware];
+  for (const pattern of ["plotter-cloth-weave", "plotter-vacuum-bed"]) {
+    updateAttribute($(pattern), "patternTransform", `scale(${Math.max(units, 1)})`);
+  }
+  const fabric = renderedFabricWidth();
   if (fabric) {
     parts.push(element("rect", { x: -fabric, y: -length, width: fabric, height: length, class: "material-surface" }));
   }
@@ -620,7 +678,7 @@ function renderTable() {
   const firstX = Math.max(0, -camera.y - camera.height);
   const lastX = Math.min(length, -camera.y);
   const firstY = Math.max(0, -camera.x - camera.width);
-  const lastY = Math.min(height, -camera.x);
+  const lastY = Math.min(fabric || height, -camera.x);
   const verticalRuler = Math.min(0, Math.max(camera.x + 3 * units, camera.x + camera.width - 76 * units));
   const horizontalRuler = Math.min(0, camera.y + camera.height - 25 * units);
   const grid = [[], []];
@@ -636,7 +694,8 @@ function renderTable() {
       grid[level].push(`M${-y} ${-lastX}V${-firstX}`);
       if (verticalRuler < 0 && -y > verticalRuler - 8 * units) continue;
       ticks[level].push(`M${-y} ${horizontalRuler}v${(main ? 7 : 3) * units}`);
-      if (main && -y >= camera.x + 16 * units) labels.push(rulerText(number(y), -y, horizontalRuler + 21 * units, 12 * units));
+      const labelOffset = horizontalRuler === 0 && pageStart === 0 ? 31 : 23;
+      if (main && -y >= camera.x + 20 * units) labels.push(rulerText(number(y), -y, horizontalRuler + labelOffset * units, 14 * units));
     }
     for (let x = Math.max(step, Math.ceil(firstX / step) * step); x <= lastX; x += step) {
       const main = x % major === 0;
@@ -644,19 +703,37 @@ function renderTable() {
       grid[level].push(`M${-lastY} ${-x}H${-firstY}`);
       if (-x > horizontalRuler - 8 * units) continue;
       ticks[level].push(`M${verticalRuler} ${-x}h${(main ? 7 : 3) * units}`);
-      if (main && -x >= camera.y + 9 * units) labels.push(rulerText(number(x), verticalRuler + 11 * units, -x + 4 * units, 12 * units, "start"));
+      if (main && -x >= camera.y + 12 * units) labels.push(rulerText(number(x), verticalRuler + 11 * units, -x + 5 * units, 14 * units, "start"));
     }
   }
   for (const [index, lines] of grid.entries()) {
     if (lines.length) parts.push(element("path", { d: lines.join(" "), class: index ? "major-line" : "minor-line",
       fill: "none", "vector-effect": "non-scaling-stroke" }));
   }
-  parts.push(element("rect", { ...surface, class: "table-border", "vector-effect": "non-scaling-stroke" }));
   if (fabric) {
     parts.push(element("path", {
-      d: `M${-fabric} 0V${-length}`, class: "material-edge", "vector-effect": "non-scaling-stroke",
+      d: `M${-fabric} 0V${-length} M0 0V${-length}`, class: "material-edge", "vector-effect": "non-scaling-stroke",
     }));
+    const selvage = Math.min(3 * units, 10, fabric / 8);
+    parts.push(element("path", { d: `M${-fabric + selvage} 0V${-length} M${-selvage} 0V${-length}`,
+      class: "plotter-selvage", "vector-effect": "non-scaling-stroke" }));
   }
+  const rollerY = -pageStart + 2 * trim;
+  const feeder = element("g", { class: "plotter-feeder", transform: bedTransform });
+  feeder.append(element("rect", { x: -height - 5 * trim, y: rollerY + 5 * trim, width: height + 10 * trim,
+    height: 6 * trim, rx: trim, class: "plotter-axle" }));
+  feeder.append(element("rect", { x: -height, y: rollerY, width: height, height: 18 * trim, rx: 3 * trim,
+    class: "plotter-feed-roller", "vector-effect": "non-scaling-stroke" }));
+  for (const x of [-height, -5 * trim]) {
+    feeder.append(element("rect", { x, y: rollerY, width: 5 * trim, height: 18 * trim, rx: trim, class: "plotter-roller-collar" }));
+  }
+  feeder.append(element("path", { d: `M${-height + 7 * trim} ${rollerY + 4 * trim}H${-7 * trim}`,
+    class: "plotter-roller-glint", "vector-effect": "non-scaling-stroke" }));
+  const rollerIndex = element("svg", { x: -height * .77, y: rollerY + trim, width: 15 * trim, height: 13 * trim,
+    viewBox: "0 0 15 13", overflow: "hidden", "aria-hidden": "true" });
+  rollerIndex.append(element("path", { d: "M2 -6h11M2 4h11M2 14h11", class: "plotter-roller-index" }));
+  feeder.append(rollerIndex);
+  $("feed-roller-layer").replaceChildren(feeder);
 
   const rulers = [];
   for (const [index, lines] of ticks.entries()) if (lines.length) rulers.push(element("path", {
@@ -667,8 +744,8 @@ function renderTable() {
   const tip = 3 * units;
   const axisPath = `M0 ${-axis}V0H${-axis} M${-tip} ${tip - axis}l${tip} ${-tip} ${tip} ${tip} M${tip - axis} ${-tip}l${-tip} ${tip} ${tip} ${tip}`;
   rulers.push(element("path", { d: axisPath, class: "axis-mark", "vector-effect": "non-scaling-stroke" }));
-  rulers.push(rulerText("Y", -axis - 7 * units, 3 * units, 11 * units, "end", "axis-label"));
-  rulers.push(rulerText("X", 0, -axis - 5 * units, 11 * units, "middle", "axis-label"));
+  rulers.push(rulerText("Y", -axis - 7 * units, 4 * units, 14 * units, "end", "axis-label"));
+  rulers.push(rulerText("X", 0, -axis - 5 * units, 14 * units, "middle", "axis-label"));
   layer.replaceChildren(...parts);
   $("ruler-layer").replaceChildren(...rulers);
 }
@@ -723,6 +800,7 @@ function updateCanvasSection() {
       resizeCamera();
       return;
     }
+    renderTable();
   }
   renderPages();
 }
@@ -767,8 +845,9 @@ function renderSeamMarkers(plan, selected, units, elements, tags) {
   });
   if (!boundaries.length) return;
   boundaries.sort((a, b) => b.active - a.active);
-  const left = -Math.max(machine.height, includedBounds?.maxY ?? 0);
-  const right = -Math.min(0, includedBounds?.minY ?? 0);
+  const bedRight = fabricBedOffsetY();
+  const left = Math.min(bedRight - machine.height, -(includedBounds?.maxY ?? 0));
+  const right = Math.max(bedRight, -(includedBounds?.minY ?? 0));
   for (const { previous, page, seams, y, active } of boundaries) {
     const activeClass = active ? " is-active" : "";
     const description = `Граница проходов ${previous.number} и ${page.number}. Раскрой детали продолжается на следующем проходе.`;
@@ -810,10 +889,9 @@ function renderPages() {
     });
     elements.push(colorCutSection(highlight, selected.number));
   }
-  const tagWidth = 94;
-  const tagHeight = 28;
-  const dimensionX = -machine.height - 9 * units;
-  const tagX = dimensionX - (tagWidth + 5) * units;
+  const tagHeight = 40;
+  const bedRight = fabricBedOffsetY();
+  const dimensionX = bedRight - machine.height - 9 * units;
   const visibleTop = camera.y + 20 * units;
   const visibleBottom = camera.y + camera.height - 20 * units;
   const viewingLocked = section?.kind === "current" || section?.kind === "next";
@@ -821,9 +899,13 @@ function renderPages() {
     if (-page.startX < camera.y || -page.endX > camera.y + camera.height) continue;
     if (page.number > 1) {
       elements.push(element("path", {
-        d: `M0 ${-page.startX}H${-machine.height}`, class: "page-boundary", "vector-effect": "non-scaling-stroke",
+        d: `M${bedRight} ${-page.startX}h${-machine.height}`, class: "page-boundary", "vector-effect": "non-scaling-stroke",
       }));
     }
+    const name = `Проход ${page.number}`;
+    const length = `${number(page.endX - page.startX)} мм`;
+    const tagWidth = Math.max(92, 16 + Math.ceil(Math.max(name.length, length.length) * 8.5));
+    const tagX = dimensionX - (tagWidth + 5) * units;
     if (page.endX <= page.startX || tagX < camera.x + 6 * units
         || dimensionX > camera.x + camera.width || (page.endX - page.startX) / units < tagHeight + 5) continue;
     const y1 = -page.endX;
@@ -837,7 +919,6 @@ function renderPages() {
       d: `M${dimensionX} ${y1}V${y2} M${dimensionX - tick} ${y1}h${2 * tick} M${dimensionX - tick} ${y2}h${2 * tick} M${dimensionX} ${y}h${-5 * units}`,
       class: "page-dimension", "vector-effect": "non-scaling-stroke",
     }));
-    const length = `${number(page.endX - page.startX)} мм`;
     const tag = element("g", {
       class: `page-tag${page === selected ? " is-active" : ""}`,
       transform: `translate(${tagX} ${y - tagHeight * units / 2}) scale(${units})`,
@@ -848,8 +929,8 @@ function renderPages() {
     });
     tag.append(
       element("rect", { width: tagWidth, height: tagHeight, rx: 4, class: "page-tag-surface" }),
-      rulerText(`Проход ${page.number}`, 7, 11, 11, "start", "page-tag-title"),
-      rulerText(length, 7, 23, 10, "start", "page-tag-size"),
+      rulerText(name, 8, 16, 14, "start", "page-tag-title"),
+      rulerText(length, 8, 33, 14, "start", "page-tag-size"),
     );
     tags.push(colorCutSection(tag, page.number));
   }
@@ -861,17 +942,45 @@ function renderPages() {
 function createHeadMarker() {
   const marker = element("g", { class: "tool-head", "aria-hidden": "true", "pointer-events": "none" });
   marker.append(
-    element("path", { d: "M-13 0h5m16 0h5M0 -13v5m0 16v5", class: "head-cross", "vector-effect": "non-scaling-stroke" }),
-    element("circle", { r: 7, class: "head-halo", "vector-effect": "non-scaling-stroke" }),
-    element("circle", { r: 2.5, class: "head-marker" }),
+    element("path", { class: "plotter-crossbeam", "vector-effect": "non-scaling-stroke" }),
+    element("path", { class: "plotter-slide-rail", "vector-effect": "non-scaling-stroke" }),
+    element("use", { href: "#plotter-bridge-shoe", y: -28 }),
+    element("use", { href: "#plotter-bridge-shoe", y: -28 }),
+    element("path", { d: "M-18-40l5-5h24l7 6v19l-4 5h-26l-6-7Z", class: "plotter-carriage" }),
+    element("path", { d: "M-14-38l4-3h16v19h-16l-4-4Z", class: "plotter-carriage-cover" }),
+    element("path", { d: "M-10-35H2m-12 4H2m-12 4h9", class: "plotter-carriage-vents" }),
+    element("use", { href: "#plotter-fixing", x: 12, y: -36 }),
+    element("use", { href: "#plotter-fixing", x: 12, y: -22 }),
+    element("path", { d: "M-6-20H6v10L3-6h-6l-3-4Z", class: "plotter-tool-holder" }),
+    element("path", { d: "M-5-16H5m-10 4H5", class: "plotter-tool-ring" }),
+    element("circle", { r: 3.7, class: "head-halo", "vector-effect": "non-scaling-stroke" }),
+    element("path", { d: "M-2.4-7H2.4L0 0Z", class: "plotter-blade" }),
+    element("path", { d: "M-9 0h3m12 0h3M0 6v3", class: "head-cross", "vector-effect": "non-scaling-stroke" }),
+    element("circle", { r: 1.15, class: "head-marker" }),
   );
   return marker;
+}
+
+function positionHeadMarker(marker, x, y, units, simulatedFeed) {
+  if (simulatedFeed !== undefined) svg.classList.toggle("is-feeding", simulatedFeed);
+  updateAttribute(marker, "transform", `translate(${x} ${y}) scale(${units})`);
+  const bedRight = fabricBedOffsetY();
+  const railOffset = 8 * plotterTrim(units) / units;
+  const left = (bedRight - machine.height - x) / units - railOffset;
+  const right = (bedRight - x) / units + railOffset;
+  updateAttribute(marker.children[0], "d", `M${left} -33H${right}v10H${left}Z`);
+  updateAttribute(marker.children[1], "d", `M${left} -31H${right}M${left} -25H${right}`);
+  updateAttribute(marker.children[2], "x", String(left));
+  updateAttribute(marker.children[3], "x", String(right));
 }
 
 const headMarker = createHeadMarker();
 headMarker.classList.add("live-head");
 headMarker.setAttribute("hidden", "");
-$("head-layer").append(headMarker);
+const parkedHeadMarker = createHeadMarker();
+parkedHeadMarker.classList.add("is-parked");
+parkedHeadMarker.setAttribute("hidden", "");
+$("head-layer").append(parkedHeadMarker, headMarker);
 
 function liveHeadFrame() {
   if (pendingCommand === "upload") return null;
@@ -908,6 +1017,10 @@ function observeHeadPosition(position, drawingPosition) {
 }
 
 function renderHead(now = performance.now()) {
+  if (!simulation.active) {
+    const feeding = live.responded && !live.busy && activeRun?.fresh === true && activeRun.state === "feeding";
+    svg.classList.toggle("is-feeding", Boolean(feeding));
+  }
   const frame = liveHeadFrame();
   const age = headSample ? Math.max(0, now - headSample.at) : Infinity;
   const freshFor = frame?.tracked && frame.tracked.state !== "ready" ? 1200 : 2800;
@@ -915,6 +1028,14 @@ function renderHead(now = performance.now()) {
   const stale = !headSample?.confirmed || (!headSample.indexed && !live.positionFresh)
     || live.busy || !live.responded || age >= freshFor;
   const hidden = !camera || simulation.active || !frame || headSample?.key !== frame.key || age >= visibleFor;
+  const parked = hidden && camera && !simulation.active && (layoutPreparation() || layoutReadOnly());
+  parkedHeadMarker.toggleAttribute("hidden", !parked);
+  if (parked) {
+    const units = camera.width / Math.max(svg.clientWidth, 1);
+    const trim = plotterTrim(units);
+    const pageStart = canvasSection(cutPlan ?? pendingCanvasPlan)?.page.startX ?? 0;
+    positionHeadMarker(parkedHeadMarker, fabricBedOffsetY() + 8 * trim, -pageStart - 14 * trim, units);
+  }
   headMarker.toggleAttribute("hidden", hidden);
   headMarker.classList.toggle("is-stale", stale);
   headMarker.classList.toggle("is-indexed", !hidden && headSample.indexed);
@@ -922,7 +1043,7 @@ function renderHead(now = performance.now()) {
   if (!hidden) {
     const [x, y] = headSample.point;
     const units = camera.width / Math.max(svg.clientWidth, 1);
-    updateAttribute(headMarker, "transform", `translate(${x} ${y}) scale(${units})`);
+    positionHeadMarker(headMarker, x, y, units);
     headStaleTimer = setTimeout(renderHead, Math.max(1, (stale ? visibleFor : freshFor) - age));
   }
 }
@@ -986,9 +1107,10 @@ function resizeCamera({ keepView = false } = {}) {
     left: overlayWidth("launch-controls"),
     right: overlayWidth("canvas-controls"),
   };
+  const bedRight = fabricBedOffsetY();
   const content = {
-    minX: Math.min(0, includedBounds?.minX || 0), minY: Math.min(0, includedBounds?.minY || 0),
-    maxX: Math.max(machine.width, includedBounds?.maxX || 0), maxY: Math.max(machine.height, includedBounds?.maxY || 0),
+    minX: Math.min(0, includedBounds?.minX || 0), minY: Math.min(-bedRight, includedBounds?.minY ?? 0),
+    maxX: Math.max(machine.width, includedBounds?.maxX || 0), maxY: Math.max(machine.height - bedRight, includedBounds?.maxY ?? 0),
   };
   const previousBase = baseCamera;
   if (keepView && camera) {
@@ -1031,20 +1153,14 @@ function fitCamera(mode = "work") {
   scheduleWorkspaceSave({ viewOnly: true });
 }
 
-function hasRollLayout() {
-  return cutPlan?.mode === "roll" || includedBounds?.maxX > machine.width;
+function limitViewScale(scale) {
+  const fineScale = MIN_RULER_STEP_MM * svg.clientWidth / (CLOSE_ZOOM_SPACING_PX * baseCamera.width);
+  return Math.max(Math.min(0.01, fineScale), Math.min(MAX_VIEW_SCALE, scale));
 }
 
 function zoom(factor, px = 0.5, py = 0.5, deferPaint = false) {
   if (!camera || !svg.clientWidth) return;
-  const roll = hasRollLayout();
-  const fineScale = MIN_RULER_STEP_MM * svg.clientWidth / (CLOSE_ZOOM_SPACING_PX * baseCamera.width);
-  const minimumScale = Math.min(0.04, fineScale);
-  const scale = Math.max(minimumScale, Math.min(roll ? 1 : 2.4, (camera.width / baseCamera.width) / factor));
-  if (roll && scale === 1 && factor < 1) {
-    if (cameraMode !== "overview") fitCamera("overview");
-    return;
-  }
+  const scale = limitViewScale(camera.width / baseCamera.width / factor);
   const width = baseCamera.width * scale;
   const height = baseCamera.height * scale;
   if (Math.abs(width - camera.width) < 1e-9) return;
@@ -1498,7 +1614,7 @@ function rememberDrawing(label) {
 }
 
 function drawingHistoryState(label) {
-  return { placed, excluded, selection, nestingSettings, routeApplied, label };
+  return { placed, excluded, selection, nestingSettings, routeApplied, fabricNapReversed, label };
 }
 
 function editSelection(transform, label, { keepRotation = false } = {}) {
@@ -1522,6 +1638,72 @@ function normalizeAngle(angle) {
   const wrapped = angle % 360;
   if (Math.abs(wrapped) < 1e-9 || Math.abs(wrapped) > 360 - 1e-9) return 0;
   return wrapped < 0 ? wrapped + 360 : wrapped;
+}
+
+function rotateFabricNapPaths(paths, parts) {
+  const rotated = paths.slice();
+  const reflect = (value, min, max) => value === min ? max : min + (max - value);
+  for (const { indices, box } of parts) {
+    const rotate = ([x, y]) => [reflect(x, box.minX, box.maxX), reflect(y, box.minY, box.maxY)];
+    for (const index of indices) {
+      const path = paths[index];
+      rotated[index] = { ...mapPath(path, rotate), partAngle: normalizeAngle((path.partAngle ?? 0) + 180) };
+    }
+  }
+  return rotated;
+}
+
+function canFlipFabricNap() {
+  const preview = layoutReadOnly();
+  if (!layoutVisible() || !placed.length || !drawingPartsReady || restoringWorkspace || drawingLocked({ editing: !preview }) || busy()
+      || placementPreviewActive() || simulation.active || xiaoHandoff) return false;
+  if (preview || layoutPreparation()) return true;
+  return !(currentUpload || uploadUncertain || live.stopAvailable || activeRun?.state === "transferring"
+    || cutProgress || controllerRoll);
+}
+
+function flipFabricNap() {
+  if (!canFlipFabricNap()) return;
+  if (layoutReadOnly()) {
+    if (napPreviewOriginal) {
+      placed = napPreviewOriginal;
+      napPreviewOriginal = null;
+    } else {
+      napPreviewOriginal = placed;
+      placed = rotateFabricNapPaths(placed, drawingParts.values());
+    }
+    cutPlan = pendingCanvasPlan = null;
+    updateDrawing({ edited: false, keepView: true });
+    if (placementConflicts.size) notifyError(jobError);
+    return;
+  }
+
+  rememberDrawing("направление ворса");
+  // Keep original coordinates when switching back without any intervening changes.
+  if (placed === fabricNapPair?.rotated) {
+    placed = fabricNapPair.original;
+  } else if (placed === fabricNapPair?.original) {
+    placed = fabricNapPair.rotated;
+  } else {
+    const rotated = rotateFabricNapPaths(placed, drawingParts.values());
+    fabricNapPair = { original: placed, rotated };
+    placed = rotated;
+  }
+  fabricNapReversed = !fabricNapReversed;
+  napChangePending = true;
+  updateDrawing();
+  if (placementConflicts.size) notifyError(jobError);
+}
+
+function renderFabricNap() {
+  const reversed = fabricNapReversed !== Boolean(napPreviewOriginal);
+  const button = $("fabric-nap-toggle");
+  updateControl($("fabric-nap"), "hidden", !placed.length);
+  updateControl($("fabric-nap-note"), "hidden", !layoutReadOnly());
+  updateControl(button, "disabled", !canFlipFabricNap());
+  updateControl(button, "title", layoutReadOnly() ? "Развернуть детали на 180° только на экране" : "Развернуть детали на 180°");
+  updateAttribute(button, "aria-pressed", String(reversed));
+  updateText($("fabric-nap-direction"), reversed ? "Вниз" : "Вверх");
 }
 
 function selectedAngle() {
@@ -1613,6 +1795,49 @@ function pathData(path) {
   return `M ${xy}${path.closed ? " Z" : ""}`;
 }
 
+function renderPartSurfaces() {
+  if (surfacePaths === placed) return;
+  const byPart = new Map();
+  for (const [index, path] of placed.entries()) {
+    if (path.notch) continue;
+    const key = partProgressKey(index);
+    if (!byPart.has(key)) byPart.set(key, []);
+    byPart.get(key).push(index);
+  }
+  const ordered = [];
+  for (const [key, indices] of byPart) {
+    const paths = indices.map(index => placed[index]);
+    let face = partSurfaces.get(key);
+    if (!face || face.paths.length !== paths.length || paths.some((path, index) => path !== face.paths[index])) {
+      const contours = paths.some(path => !path.closed) ? joinTouchingContours(paths).paths : paths;
+      const loops = contours.filter(path => path.points.length >= 3 && (path.closed || sameContourPoint(path.points[0], path.points.at(-1))));
+      const node = loops.length ? (face?.node ?? element("path", { class: "plotter-part-face", "fill-rule": "evenodd" })) : null;
+      if (node) {
+        updateAttribute(node, "d", loops.map(path => pathData(path.closed ? path : { ...path, closed: true })).join(" "));
+      }
+      face = { paths, node };
+      partSurfaces.set(key, face);
+    }
+    face.index = indices[0];
+    if (face.node) {
+      const box = drawingParts.get(key)?.box ?? pathBoxes[face.index];
+      ordered.push({ node: face.node, area: (box.maxX - box.minX) * (box.maxY - box.minY) });
+    }
+  }
+  for (const key of partSurfaces.keys()) if (!byPart.has(key)) partSurfaces.delete(key);
+  ordered.sort((a, b) => b.area - a.area);
+  $("part-surface-layer").replaceChildren(...ordered.map(face => face.node));
+  surfacePaths = placed;
+}
+
+function updateSurfaceStates() {
+  for (const [key, face] of partSurfaces) if (face.node) {
+    face.node.classList.toggle("selected", selection.has(face.index));
+    face.node.classList.toggle("excluded", excluded.has(face.index));
+    face.node.classList.toggle("is-complete", completedDrawingParts.has(key));
+  }
+}
+
 function renderPaths() {
   const layer = $("path-layer");
   const notches = $("notch-layer");
@@ -1672,6 +1897,7 @@ function renderPaths() {
     notchMarkers.delete(index);
   }
   renderedPaths = placed.slice();
+  renderPartSurfaces();
   renderPartHighlight();
 }
 
@@ -1857,7 +2083,10 @@ function renderCutProgress() {
       shape?.classList.toggle("is-cut-complete", nextPaths.has(index));
       shape?.classList.toggle("is-part-complete", nextParts.has(partProgressKey(index)));
     }
-    if (labelsChanged) renderPartLabels();
+    if (labelsChanged) {
+      updateSurfaceStates();
+      renderPartLabels();
+    }
   }
   renderActiveRouteSegment(tracking, current, verifiedVertices);
   layer.toggleAttribute("hidden", simulation.active);
@@ -1896,7 +2125,7 @@ function expandToWholeParts(indices) {
 }
 
 function identifyDrawingParts() {
-  if (drawingPartsReady && placed.every((path) => typeof path.notch === "boolean")) return Promise.resolve();
+  if (napPreviewOriginal || drawingPartsReady && placed.every((path) => typeof path.notch === "boolean")) return Promise.resolve();
   if (partDiscovery?.paths === placed) return partDiscovery.promise;
   const paths = placed;
   const request = { paths };
@@ -1939,6 +2168,7 @@ function partRotationText(rotation) {
 }
 
 function renderPartHighlight() {
+  updateSurfaceStates();
   const outlines = new Map();
   const shapes = $("path-layer").children;
   for (const index of selection) {
@@ -2084,17 +2314,16 @@ function renderPartLabels() {
   }
   visible.sort((a, b) => b.active - a.active || Number(partLabels.has(b.part.number)) - Number(partLabels.has(a.part.number))
     || Boolean(b.part.rotation) - Boolean(a.part.rotation) || b.area - a.area);
-  const occupied = [], selectedOccupied = [];
+  const occupied = [];
   const shown = new Set();
   for (const { part, px, py, center, active } of visible) {
-    const region = active ? selectedOccupied : occupied;
-    if (region.length >= 200) continue;
+    if (occupied.length >= 200) break;
     const label = `№${part.number}`;
     const complete = completedDrawingParts.has(part.number);
-    const width = 12 + label.length * 8 + (part.rotation || complete ? 17 : 0);
+    const width = 28 + (label.length - 1) * 10 + (part.rotation || complete ? 19 : 0);
     const left = px - width / 2;
-    if (region.some((box) => Math.abs(box.y - py) < 25 && left < box.right + 3 && left + width > box.left - 3)) continue;
-    region.push({ left, right: left + width, y: py });
+    if (occupied.some((box) => Math.abs(box.y - py) < partLabelHeight + 3 && left < box.right + 3 && left + width > box.left - 3)) continue;
+    occupied.push({ left, right: left + width, y: py });
     shown.add(part.number);
     const classes = ["part-label", part.rotation, active ? "is-active" : "",
       part.indices.every((index) => excluded.has(index)) ? "is-excluded" : "", complete ? "is-complete" : ""];
@@ -2110,14 +2339,14 @@ function renderPartLabels() {
     if (entry.marker !== marker || entry.name !== part.name || !node.firstChild) {
       const title = element("title");
       title.textContent = `${label} · ${part.name || "Деталь"} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
-      const text = element("text", { x: 6, y: 15.5 });
+      const text = element("text", { x: 7, y: 18.2 });
       text.textContent = label;
-      node.replaceChildren(title, element("rect", { width, height: 22, rx: 5, class: "part-label-bg" }), text);
+      node.replaceChildren(title, element("rect", { width, height: partLabelHeight, rx: 5, class: "part-label-bg" }), text);
       if (complete) {
-        node.append(element("path", { class: "part-check", d: `M${width - 16} 11l3 3 5 -6` }));
+        node.append(element("path", { class: "part-check", d: `M${width - 17} 13l3 3 6 -7` }));
       } else if (part.rotation) {
         node.append(element("use", { class: "icon", href: part.rotation === "none" ? "#i-lock" : "#i-turn-cw",
-          x: width - 17, y: 5, width: 12, height: 12 }));
+          x: width - 19, y: 6, width: 14, height: 14 }));
       }
       entry.marker = marker;
       entry.name = part.name;
@@ -2136,7 +2365,7 @@ function renderPartLabels() {
 
 function positionPartLabel({ node, units, halfWidth }, point) {
   const [x, y] = projectPoint(...point);
-  updateAttribute(node, "transform", `translate(${x - halfWidth * units} ${y - 11 * units}) scale(${units})`);
+  updateAttribute(node, "transform", `translate(${x - halfWidth * units} ${y - partLabelHeight / 2 * units}) scale(${units})`);
 }
 
 function updateSelection(revealLegend = false) {
@@ -2406,12 +2635,15 @@ function stepDrawingHistory(redo = false) {
   const from = redo ? drawingRedo : drawingUndo;
   const to = redo ? drawingUndo : drawingRedo;
   if (!from.length || drawingLocked()) return;
+  const changesNap = from.at(-1).fabricNapReversed !== fabricNapReversed;
+  if (changesNap && !canFlipFabricNap()) return;
   measurementCloseHistory = null;
   cancelCanvasGesture();
   const state = from.pop();
   to.push(drawingHistoryState(state.label));
   const priorNesting = nestingSettings;
-  ({ placed, excluded, selection, nestingSettings, routeApplied } = state);
+  ({ placed, excluded, selection, nestingSettings, routeApplied, fabricNapReversed } = state);
+  if (changesNap) napChangePending = true;
   if (fixedDesignWidth() && nestingSettings?.widthMm !== managedCut.widthMm) {
     nestingSettings = { ...(nestingSettings ?? priorNesting), widthMm: managedCut.widthMm, widthExplicit: true };
   }
@@ -2726,13 +2958,13 @@ function setSaveError(message = "") {
 
 function workspaceViewStorageKey() {
   const mode = managedCut?.mode;
-  if (mode === "operator" || mode === "demo") return `plotter.workspaceView.${mode}.${managedCut.id}`;
+  if (mode === "operator" || mode === "demo" || mode === "preview") return `plotter.workspaceView.${mode}.${managedCut.id}`;
   return null;
 }
 
 function workspaceViewSnapshot() {
   return {
-    zoom: camera && baseCamera ? camera.width / baseCamera.width : 1,
+    zoom: camera && baseCamera ? Math.min(MAX_VIEW_SCALE, camera.width / baseCamera.width) : 1,
     focusX: camera ? camera.x + camera.width / 2 : 0,
     focusY: camera ? camera.y + camera.height / 2 : 0,
     grid: true,
@@ -2751,7 +2983,7 @@ function readWorkspaceView(key) {
   return null;
 }
 
-function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
+function workspaceSnapshot(paths = napPreviewOriginal ?? placed, excludedIndices = excluded) {
   if (!source) return null;
   return {
     source: { filename: source.filename, warnings: source.warnings || [] },
@@ -2760,19 +2992,21 @@ function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
     view: (workspaceViewStorageKey() && sharedWorkspaceView) || workspaceViewSnapshot(),
     optimization: {
       route: routeApplied, routeApplied, join: $("optimize-join").checked,
+      ...(fabricNapReversed ? { napReversed: true } : {}),
       ...(nestingSettings ? { nesting: nestingSettings } : {}),
     },
   };
 }
 
 function scheduleWorkspaceSave({ viewOnly = false } = {}) {
-  if (layoutReadOnly() || restoringWorkspace || pendingCommand === "new-cut" || !source) return;
+  if (restoringWorkspace || pendingCommand === "new-cut" || !source) return;
   const viewKey = viewOnly && workspaceViewStorageKey();
   if (viewKey) {
     // The helper locks the shared layout while a cut owns it. The camera belongs to this tab.
     try { sessionStorage.setItem(viewKey, JSON.stringify(workspaceViewSnapshot())); } catch { /* Storage is optional. */ }
     return;
   }
+  if (layoutReadOnly()) return;
   if (kitLayout()) {
     if (!viewOnly) workspaceChange++;
     renderKitSave();
@@ -2824,7 +3058,7 @@ function persistWorkspace() {
     try {
       while (workspaceSaved !== workspaceChange) {
         const change = workspaceChange;
-        const response = await writeWorkspace(workspaceSnapshot());
+        const response = await writeWorkspace(workspaceSnapshot(), napChangePending);
         if (kitLayout()) {
           managedCut.saved = true;
         } else if (updateManagedCutMetadata(response)) {
@@ -2832,6 +3066,7 @@ function persistWorkspace() {
         }
         workspaceRevision = response.revision;
         workspaceSaved = change;
+        if (workspaceChange === change) napChangePending = false;
       }
       setSaveError();
       return true;
@@ -2874,7 +3109,8 @@ function applyWorkspace(response) {
   const saved = response.workspace;
   sharedWorkspaceView = saved?.view ?? null;
   const viewKey = workspaceViewStorageKey();
-  const view = (saved && viewKey && readWorkspaceView(viewKey)) || sharedWorkspaceView;
+  // Open a finished layout at working scale. Its author's saved overview may span a whole roll.
+  const view = (saved && viewKey && readWorkspaceView(viewKey)) || (layoutReadOnly() ? null : sharedWorkspaceView);
   clearSavedMeasurements();
   selection = new Set();
   partLegendSearch.value = "";
@@ -2883,6 +3119,9 @@ function applyWorkspace(response) {
   drawingUndo.length = drawingRedo.length = 0;
   source = saved?.source || null;
   placed = saved?.paths || [];
+  fabricNapReversed = saved?.optimization.napReversed === true;
+  fabricNapPair = napPreviewOriginal = null;
+  napChangePending = false;
   excluded = new Set(saved?.excluded || []);
   routeApplied = saved?.optimization.routeApplied ?? true;
   $("optimize-join").checked = saved?.optimization.join ?? true;
@@ -2892,15 +3131,11 @@ function applyWorkspace(response) {
   updateDrawing({ edited: false });
   previewCutPage = view?.section ?? null;
   if (view && baseCamera && cameraMode === "manual") {
-    if (hasRollLayout() && view.zoom > 1) {
-      cameraMode = "overview";
-      resizeCamera();
-    } else {
-      const width = baseCamera.width * view.zoom;
-      const height = baseCamera.height * view.zoom;
-      camera = { x: view.focusX - width / 2, y: view.focusY - height / 2, width, height };
-      drawCamera();
-    }
+    const scale = limitViewScale(view.zoom);
+    const width = baseCamera.width * scale;
+    const height = baseCamera.height * scale;
+    camera = { x: view.focusX - width / 2, y: view.focusY - height / 2, width, height };
+    drawCamera();
   }
 }
 
@@ -2963,7 +3198,7 @@ function requestCutPlan() {
       const plan = await getJson("/api/cut-plan", jsonRequest({
         job: { ...buildJob(), ...(managedCut && !kitLayout() ? { cutContext: [managedCut.id, managedCut.cutRevision] } : {}) },
         filename: source.filename,
-      }, AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])), !layoutPreparation());
+      }, AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)])), !layoutPreparation() && !napPreviewOriginal);
       if (epoch !== cutPlanEpoch) return null;
       cutPlan = plan;
       pendingCanvasPlan = null;
@@ -3059,6 +3294,9 @@ async function loadDrawing(file) {
     partLegendSearch.value = "";
     setPartLegendExpanded(true);
     placed = imported.paths.map((path) => translatePath(path, 20 - box.minX, 20 - box.minY));
+    fabricNapReversed = false;
+    fabricNapPair = napPreviewOriginal = null;
+    napChangePending = false;
     excluded = new Set();
     selection = new Set();
     routeApplied = true;
@@ -3385,14 +3623,16 @@ function renderHistoryControls(importing = drawingLocked()) {
     ["redo-tool", measureMode ? measurementRedo : drawingRedo, "Повторить", "Ctrl+Shift+Z"],
   ]) {
     const label = hasMeasurementCloseStep(id === "redo-tool") ? "закрытие линейки" : history.at(-1)?.label;
+    const changesNap = !measureMode && history.length && history.at(-1).fabricNapReversed !== fabricNapReversed;
     updateControl($(id), "title", `${action}${label ? `: ${label}` : ""} (${shortcut})`);
-    updateControl($(id), "disabled", importing || !label);
+    updateControl($(id), "disabled", importing || !label || Boolean(changesNap && !canFlipFabricNap()));
   }
 }
 
 function renderControls() {
   renderAppUpdate();
   renderKitSave();
+  renderFabricNap();
   const armed = controlActive();
   const locked = busy();
   const importing = drawingLocked();
@@ -4332,6 +4572,9 @@ async function clearForNewCut() {
     workspaceSaved = workspaceChange;
     source = null;
     placed = [];
+    fabricNapReversed = false;
+    fabricNapPair = napPreviewOriginal = null;
+    napChangePending = false;
     excluded = new Set();
     selection = new Set();
     drawingUndo.length = 0;
@@ -4590,6 +4833,7 @@ $("nest-show-blocking").addEventListener("click", () => {
 });
 $("undo-tool").addEventListener("click", () => stepEditHistory());
 $("redo-tool").addEventListener("click", () => stepEditHistory(true));
+$("fabric-nap-toggle").addEventListener("click", flipFabricNap);
 $("canvas-import").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", (event) => void loadDrawing(event.target.files[0]));
 $("toast-close").addEventListener("click", () => { $("toast").hidden = true; });
@@ -4765,8 +5009,8 @@ svg.addEventListener("wheel", (event) => {
   if (!event.deltaY) return;
   const [x, y] = screenFraction(event);
   const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? svg.clientHeight : 1;
-  const delta = Math.max(-160, Math.min(160, event.deltaY * unit));
-  zoom(Math.exp(-delta * 0.0014), x, y, true);
+  const delta = Math.max(-240, Math.min(240, event.deltaY * unit));
+  zoom(ZOOM_STEP ** (-delta / 100), x, y, true);
 }, { passive: false });
 function boxFromPoints([x1, y1], [x2, y2]) {
   return { minX: Math.min(x1, x2), minY: Math.min(y1, y2), maxX: Math.max(x1, x2), maxY: Math.max(y1, y2) };
@@ -5342,6 +5586,8 @@ function previewSelection(transform, transformPoint) {
   for (const index of selection) {
     groups[index].setAttribute("transform", transform);
     notchMarkers.get(index)?.setAttribute("transform", transform);
+    const face = partSurfaces.get(partProgressKey(index));
+    if (face?.index === index) face.node?.setAttribute("transform", transform);
   }
   for (const entry of drag.labels) positionPartLabel(entry, transformPoint(entry.center));
 }
@@ -5539,6 +5785,8 @@ function cancelCanvasGesture({ refreshActions = true } = {}) {
       groups[index]?.removeAttribute("transform");
       groups[index]?.classList.remove("move-invalid", "move-valid");
       notchMarkers.get(index)?.removeAttribute("transform");
+      const face = partSurfaces.get(partProgressKey(index));
+      if (face?.index === index) face.node?.removeAttribute("transform");
     }
     for (const entry of gesture.labels ?? []) positionPartLabel(entry, entry.center);
     if (gesture.type === "rotate") renderFreeRotation();
@@ -5724,6 +5972,12 @@ document.addEventListener("keydown", (event) => {
   }
 });
 svg.addEventListener("keydown", (event) => {
+  if (event.target === svg && !event.altKey && !event.ctrlKey && !event.metaKey
+      && ["+", "=", "-"].includes(event.key)) {
+    event.preventDefault();
+    zoom(event.key === "-" ? 1 / ZOOM_STEP : ZOOM_STEP);
+    return;
+  }
   if (!placed.length || drawingLocked() || event.target.closest("[data-canvas-page]")) return;
   if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
     event.preventDefault();
@@ -5995,7 +6249,7 @@ async function navigateLayout(next, { resume = false } = {}) {
         hardwareCutId = next.id;
       }
     } else if (next.id) {
-      response = await getJson(workspaceQuery(next.id, next.mode));
+      response = await getJson(workspaceQuery(next.id, next.previewSource ?? next.mode));
     } else {
       await readConfiguration();
       if (hardwareCutId) {

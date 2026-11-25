@@ -36,6 +36,23 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(saved["workspace"], draft())
         self.assertNotIn("transient", self.path.read_text(encoding="utf-8"))
 
+    def test_nap_direction_round_trips_and_rejects_non_boolean_value(self):
+        layout = draft()
+        layout["optimization"]["napReversed"] = True
+        saved = self.store.write(0, layout)
+        self.assertEqual(WorkspaceStore(self.path).read(), saved)
+        self.assertEqual(saved["workspace"], layout)
+
+        invalid = deepcopy(layout)
+        invalid["optimization"]["napReversed"] = 1
+        with self.assertRaisesRegex(ValueError, "направление ворса"):
+            self.store.write(saved["revision"], invalid)
+        self.assertEqual(self.store.read(), saved)
+
+        layout["optimization"]["napReversed"] = False
+        reset = self.store.write(saved["revision"], layout)
+        self.assertEqual(reset["workspace"], layout)
+
     def test_corrupt_primary_recovers_previous_and_preserves_backup_on_next_save(self):
         layout = draft()
         first = self.store.write(0, layout)

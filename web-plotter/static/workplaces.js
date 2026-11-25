@@ -13,6 +13,12 @@ function registryIcon(kind) {
     part: "M4 7l4-3h9l3 4v12H4ZM4 14h3m10 0h3",
     kit: "m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5",
     chevron: "m9 6 6 6-6 6",
+    chevronDown: "m6 9 6 6 6-6",
+    search: "M15.5 10a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0Zm-1.6 3.9 5.6 5.6",
+    filter: "M4 6h16l-6 7v5l-4 2v-7Z",
+    check: "m5 12 4 4L19 6",
+    sidebarCollapse: "M3 5h18v14H3ZM9 5v14m7-10-3 3 3 3",
+    sidebarExpand: "M3 5h18v14H3ZM9 5v14m4-10 3 3-3 3",
     open: "M3 18V6a2 2 0 0 1 2-2h4l2 3h7a2 2 0 0 1 2 2m-17 9 3-8h15l-3 9H5a2 2 0 0 1-2-1Z",
     view: "M2.5 12c2.1-3.6 5.4-6 9.5-6s7.4 2.4 9.5 6c-2.1 3.6-5.4 6-9.5 6s-7.4-2.4-9.5-6Zm12 0a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z",
     edit: "m4 16-.7 4.7 4.7-.7L20 8l-4-4Zm9.5-9.5 4 4",
@@ -23,6 +29,12 @@ function registryIcon(kind) {
     sewing: "M4 3h10l5 5v13H4Zm10 0v5h5m-12 4h9m-9 4h2m2 0h2m2 0h1",
     zoom: "M16 10a6 6 0 1 1-12 0 6 6 0 0 1 12 0Zm-2 4 5 5m-12-9h6m-3-3v6",
     close: "m6 6 12 12M18 6 6 18",
+    analysis: "M4 4v16h16M8 16v-4m5 4V7m5 9v-6",
+    clock: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM12 6v6l4 2",
+    calendar: "M4 6h16v15H4ZM8 3v5m8-5v5M4 11h16m-12 4h3",
+    material: "M4 18V7a3 3 0 0 1 6 0v11a3 3 0 0 1-6 0Zm6-10h10v13H7m-3-3a3 3 0 0 1 6 0",
+    back: "m11 5-7 7 7 7M4 12h16",
+    plus: "M12 5v14M5 12h14",
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("icon", "registry-icon");
@@ -55,6 +67,18 @@ function button(title, action, { primary = false, disabled = false, icon, iconOn
   return node;
 }
 
+function enableCardOpen(card, label, onOpen) {
+  const trigger = el("button", "", "workplace-card-trigger");
+  trigger.type = "button";
+  trigger.setAttribute("aria-label", label);
+  card.classList.add("workplace-clickable-card");
+  card.prepend(trigger);
+  card.addEventListener("click", event => {
+    const control = event.target.closest("button, a");
+    if (!control || control === trigger) onOpen();
+  });
+}
+
 function input(type, value = "", attrs = {}) {
   const node = document.createElement("input");
   node.type = type;
@@ -73,6 +97,94 @@ function select(options, selected) {
   for (const [id, label] of options) node.add(new Option(label, id));
   node.value = selected ?? "";
   return node;
+}
+
+function registryTypePicker(selected, onSelect) {
+  const kinds = ["", "part", "drawing", "kit", "folder"];
+  const label = el("span", "Тип записи", "registry-filter-label");
+  label.id = "registry-type-label";
+  const value = el("span", "", "registry-type-value");
+  value.id = "registry-type-value";
+  const icon = el("span", "", "registry-type-icon");
+  const chevron = registryIcon("chevronDown");
+  chevron.classList.add("registry-type-chevron");
+  const trigger = button("", () => {
+    if (menu.hidden) openMenu();
+    else closeMenu(true);
+  });
+  trigger.classList.add("registry-type-trigger");
+  trigger.setAttribute("aria-labelledby", `${label.id} ${value.id}`);
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.append(icon, value, chevron);
+
+  const menu = el("div", "", "registry-type-menu");
+  menu.id = "registry-type-menu";
+  menu.hidden = true;
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-labelledby", label.id);
+  trigger.setAttribute("aria-controls", menu.id);
+  const options = kinds.map(kind => {
+    const option = button("", () => {
+      setValue(kind);
+      closeMenu(true);
+      onSelect(kind);
+    });
+    option.classList.add("registry-type-option");
+    option.tabIndex = -1;
+    option.setAttribute("role", "menuitemradio");
+    const optionIcon = el("span", registryIcon(kind || "filter"), "registry-type-icon");
+    optionIcon.dataset.kind = kind;
+    const check = registryIcon("check");
+    check.classList.add("registry-type-check");
+    option.append(optionIcon, el("span", labels[kind] ?? "Все типы"), check);
+    return option;
+  });
+  menu.append(...options);
+  const node = el("div", label, "registry-type");
+  node.append(trigger, menu);
+
+  function setValue(kind) {
+    trigger.dataset.kind = icon.dataset.kind = kind;
+    icon.replaceChildren(registryIcon(kind || "filter"));
+    value.textContent = labels[kind] ?? "Все типы";
+    options.forEach((option, index) => option.setAttribute("aria-checked", String(kinds[index] === kind)));
+  }
+  function openMenu(index = kinds.indexOf(trigger.dataset.kind)) {
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    options[index].focus();
+  }
+  function closeMenu(restoreFocus = false) {
+    trigger.setAttribute("aria-expanded", "false");
+    if (restoreFocus) trigger.focus({ preventScroll: true });
+    menu.hidden = true;
+  }
+  trigger.onkeydown = event => {
+    if (!menu.hidden || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
+    event.preventDefault();
+    openMenu(event.key === "ArrowDown" ? 0 : options.length - 1);
+  };
+  menu.onkeydown = event => {
+    if (event.key === "Tab" || event.key === "Escape") {
+      if (event.key === "Escape") event.preventDefault();
+      closeMenu(true);
+      return;
+    }
+    const index = options.indexOf(document.activeElement);
+    const destinations = {
+      Home: 0, End: options.length - 1,
+      ArrowUp: (index - 1 + options.length) % options.length, ArrowDown: (index + 1) % options.length,
+    };
+    if (!Object.hasOwn(destinations, event.key)) return;
+    event.preventDefault();
+    options[destinations[event.key]].focus();
+  };
+  node.addEventListener("focusout", event => {
+    if (!menu.hidden && !node.contains(event.relatedTarget)) closeMenu();
+  });
+  setValue(selected);
+  return { node, setValue };
 }
 
 function drawPartOutline(canvas, paths) {
@@ -112,7 +224,7 @@ function orderDates(order) {
   const date = order.placedOn ? el("time", showDate(order.placedOn)) : el("strong", "Дата не указана");
   if (order.placedOn) date.dateTime = order.placedOn;
   item.append(date);
-  dates.append(item);
+  dates.append(registryIcon("calendar"), item);
   return dates;
 }
 
@@ -122,7 +234,113 @@ function orderProduct(order) {
 
 function orderContext(order) {
   const product = orderProduct(order);
-  return product ? `${product} · ${order.quantity} шт.` : "";
+  if (!Number.isFinite(order?.quantity) || (!product && order.quantity === 1)) return product;
+  return [product, `${order.quantity} шт.`].filter(Boolean).join(" · ");
+}
+
+const metricNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
+const metricDate = new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" });
+const noMetric = "Нет данных";
+
+function metricValue(value, unit, divisor = 1) {
+  return Number.isFinite(value) ? `${metricNumber.format(value / divisor)} ${unit}` : noMetric;
+}
+
+function workDuration(seconds) {
+  if (!Number.isFinite(seconds)) return noMetric;
+  const total = Math.round(Math.max(0, seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor(total % 3600 / 60);
+  const parts = [];
+  if (hours) parts.push(`${hours} ч`);
+  if (minutes) parts.push(`${minutes} мин`);
+  if (total % 60 || !parts.length) parts.push(`${total % 60} с`);
+  return parts.join(" ");
+}
+
+function workDelta(seconds) {
+  if (!Number.isFinite(seconds)) return noMetric;
+  if (Math.round(Math.abs(seconds)) === 0) return el("span", "По расчёту", "workplace-delta-even");
+  const late = seconds > 0;
+  return el("span", `${late ? "+" : "−"}${workDuration(Math.abs(seconds))} · ${late ? "дольше плана" : "быстрее плана"}`,
+    late ? "workplace-delta-late" : "workplace-delta-early");
+}
+
+function workTimestamp(value) {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return noMetric;
+  const node = el("time", metricDate.format(ms));
+  node.dateTime = value;
+  node.title = new Date(ms).toLocaleString("ru-RU");
+  return node;
+}
+
+function workMetrics(title, icon, values, headingTag = "h3") {
+  const group = el("section", "", "workplace-metrics");
+  const heading = el(headingTag, registryIcon(icon), "workplace-metrics-title");
+  heading.append(title);
+  const list = el("dl");
+  for (const [label, value] of values) {
+    const metric = el("div", el("dt", label));
+    metric.append(el("dd", value ?? noMetric));
+    list.append(metric);
+  }
+  group.append(heading, list);
+  return group;
+}
+
+function materialValues(stats) {
+  return [
+    ["Полотно", metricValue(stats.lengthMm, "пог. м", 1000)],
+    [stats.approximate ? "КИМ (прибл.)" : "КИМ", metricValue(stats.utilizationPercent, "%")],
+    ["Рез", metricValue(stats.cutDistanceMm, "м", 1000)],
+    ["Холостой ход", metricValue(stats.travelDistanceMm, "м", 1000)],
+  ];
+}
+
+function workStats(stats = {}, { order = false, finished, draft = false } = {}) {
+  const group = el("div", "", "workplace-stats");
+  const headingTag = order ? "h3" : "h4";
+  const material = workMetrics("Материал", "material", materialValues(stats), headingTag);
+  const since = Date.parse(stats.startedAt);
+  let actual = Number.isFinite(stats.actualSeconds) ? workDuration(stats.actualSeconds) : noMetric;
+  if (!finished && !draft && !stats.finishedAt && Number.isFinite(since)) {
+    actual = el("span", workDuration((Date.now() - since) / 1000));
+    actual.dataset.workStarted = String(since);
+  }
+  const values = [
+    ["Чистое расчётное", workDuration(stats.estimatedWorkSeconds)],
+    [order ? "Первый старт" : "Начало", workTimestamp(stats.startedAt)],
+    ["Закрытие", workTimestamp(stats.finishedAt)],
+    [order ? "Факт наряда" : "Факт ткани", actual],
+  ];
+  if (order) values.push(["Сумма по тканям", workDuration(stats.fabricActualSeconds)]);
+  values.push(["Отклонение от расчёта", workDelta(stats.deltaSeconds)]);
+  group.append(material, workMetrics("Время", "clock", values, headingTag));
+  const notes = [];
+  if (order && stats.plannedCount > 0 && stats.plannedCount < stats.totalCount) {
+    notes.push(`По ${stats.plannedCount} из ${stats.totalCount} тканей.`);
+  } else if (!Number.isFinite(stats.estimatedWorkSeconds)) {
+    notes.push(finished ? "Расчёт раскладки отсутствует." : "Ожидает раскладки.");
+  }
+  if (order && stats.timedCount > 0 && stats.timedCount < stats.totalCount) {
+    notes.push(`Время записано для ${stats.timedCount} из ${stats.totalCount} тканей.`);
+  }
+  if (!finished && !draft && Number.isFinite(since)) notes.push("Отсчёт продолжается.");
+  if (notes.length) group.append(el("p", notes.join(" "), "workplace-metric-note"));
+  return group;
+}
+
+function localDate(value) {
+  const two = number => String(number).padStart(2, "0");
+  return `${value.getFullYear()}-${two(value.getMonth() + 1)}-${two(value.getDate())}`;
+}
+
+function defaultAnalysisPeriod() {
+  const today = new Date();
+  const first = new Date(today);
+  first.setDate(first.getDate() - 29);
+  return { from: localDate(first), to: localDate(today) };
 }
 
 const ROLE_STORAGE_KEY = "plotter.workplace";
@@ -163,8 +381,14 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   let designerView = "registry";
   let selectedFolder = null;
   let registrySearch = "";
+  let registryKind = "";
+  let registryTreeHidden = false;
   let cad = null;
   let selectedOrder = null;
+  let analysisPeriod = defaultAnalysisPeriod();
+  let analysisDeltaDescending = true;
+  let analysisSeries = "fabricMetersPerHour";
+  let workClock = 0;
   let currentLayout = null;
   let renderEpoch = 0;
   let pending = false;
@@ -586,7 +810,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       const moved = await post("/api/registry", { action: "move", id: entry.id, revision: entry.revision, parent });
       onMoved?.(moved);
       selectedFolder = parent;
-      registrySearch = "";
+      registrySearch = registryKind = "";
       await render();
       if (!returnTo) focusWorkplaceHeading();
     });
@@ -657,7 +881,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         const data = await response.json().catch(() => null);
         throw new Error(data?.error || "Не удалось восстановить резервную копию реестра.");
       }
-      registrySearch = "";
+      registrySearch = registryKind = "";
       await render();
       status.textContent = "Реестр восстановлен.";
     }, { lockWhileSaving: true });
@@ -665,14 +889,42 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
 
   function renderRegistry() {
     revealFolder(selectedFolder);
-    const search = input("search", registrySearch, { placeholder: "Название или путь к папке" });
+    const search = input("search", registrySearch, { id: "registry-query", placeholder: "Название или путь к папке" });
+    const searchLabel = el("label", "Поиск по всему реестру", "registry-filter-label");
+    searchLabel.htmlFor = search.id;
+    const clearSearch = button("Очистить поиск", () => {
+      registrySearch = search.value = "";
+      search.focus({ preventScroll: true });
+      drawMatches();
+    }, { icon: "close", iconOnly: true });
+    clearSearch.classList.add("registry-query-clear");
+    const query = el("div", registryIcon("search"), "registry-query");
+    query.append(search, clearSearch);
+    const searchField = el("div", searchLabel, "registry-search-field");
+    searchField.append(query);
+    const kind = registryTypePicker(registryKind, value => {
+      registryKind = value;
+      drawMatches();
+    });
     const table = el("div", "", "registry-list");
     const tree = el("nav", "", "registry-tree");
+    tree.id = "registry-folder-tree";
     tree.setAttribute("aria-label", "Папки реестра");
-    const location = el("p", "", "registry-location");
-    const content = el("section", location, "registry-body");
-    content.append(field("Поиск по всему реестру", search), table);
-    const columns = el("div", tree, "registry-columns");
+    const toggleTree = button("", () => {
+      registryTreeHidden = !registryTreeHidden;
+      updateTreeVisibility();
+    }, { iconOnly: true });
+    toggleTree.classList.add("registry-tree-toggle");
+    toggleTree.setAttribute("aria-controls", tree.id);
+    const sidebar = el("div", toggleTree, "registry-sidebar");
+    sidebar.append(tree);
+    const breadcrumbs = el("nav", "", "registry-breadcrumbs");
+    breadcrumbs.setAttribute("aria-label", "Путь к папке");
+    const filters = el("div", searchField, "registry-search");
+    filters.append(kind.node);
+    const content = el("section", breadcrumbs, "registry-body");
+    content.append(filters, table);
+    const columns = el("div", sidebar, "registry-columns");
     columns.append(content);
     const childrenByParent = new Map();
     for (const folder of folders()) {
@@ -680,13 +932,42 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       childrenByParent.get(folder.parent).push(folder);
     }
     const folderButtons = new Map();
+    function updateTreeVisibility() {
+      tree.hidden = registryTreeHidden;
+      columns.classList.toggle("registry-tree-hidden", registryTreeHidden);
+      const label = registryTreeHidden ? "Развернуть дерево папок" : "Свернуть дерево папок";
+      toggleTree.title = label;
+      toggleTree.setAttribute("aria-label", label);
+      toggleTree.setAttribute("aria-expanded", String(!registryTreeHidden));
+      toggleTree.replaceChildren(registryIcon(registryTreeHidden ? "sidebarExpand" : "sidebarCollapse"));
+    }
     function browseFolder(id, focusTree = false) {
       selectedFolder = id;
       revealFolder(id);
       registrySearch = search.value = "";
+      registryKind = "";
+      kind.setValue(registryKind);
       drawTree();
+      const current = drawBreadcrumbs();
       drawMatches();
-      if (focusTree) folderButtons.get(id)?.focus({ preventScroll: true });
+      const target = focusTree && !registryTreeHidden ? folderButtons.get(id) : current;
+      target?.focus({ preventScroll: true });
+    }
+    function drawBreadcrumbs() {
+      const path = [{ id: null, name: "Корень реестра" }, ...trailOf(find(selectedFolder))];
+      const current = el("span", path.pop().name);
+      current.tabIndex = -1;
+      current.setAttribute("aria-current", "location");
+      breadcrumbs.replaceChildren();
+      for (const folder of path) {
+        const link = button(folder.name, () => browseFolder(folder.id));
+        link.classList.add("registry-breadcrumb-link");
+        const separator = el("span", "/", "registry-breadcrumb-separator");
+        separator.setAttribute("aria-hidden", "true");
+        breadcrumbs.append(link, separator);
+      }
+      breadcrumbs.append(current);
+      return current;
     }
     function drawTree() {
       tree.replaceChildren();
@@ -737,14 +1018,20 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     }
     function drawMatches() {
       const needle = search.value.trim().toLocaleLowerCase();
-      location.textContent = `Папка: ${pathOf(find(selectedFolder))}`;
+      const searchKind = registryKind;
+      clearSearch.hidden = !search.value;
+      const searching = Boolean(needle || searchKind);
+      const matches = entries.filter(item => {
+        if (!searching) return item.parent === selectedFolder;
+        return (!searchKind || item.kind === searchKind) && (!needle || pathOf(item).toLocaleLowerCase().includes(needle));
+      });
       table.replaceChildren();
-      for (const entry of entries.filter(item => needle ? pathOf(item).toLocaleLowerCase().includes(needle) : item.parent === selectedFolder)) {
+      for (const entry of matches) {
         const row = el("div", "", "registry-row");
         row.dataset.registryId = entry.id;
         const title = el("div", el("strong", entry.name));
         const metadata = el("div", el("span", entry.model ? "Изделие" : labels[entry.kind], "registry-kind"), "registry-row-meta");
-        if (needle) metadata.append(el("small", pathOf(find(entry.parent))));
+        if (searching) metadata.append(el("small", pathOf(find(entry.parent))));
         title.append(metadata);
         const identity = el("div", registryIcon(entry.kind), "registry-entry");
         identity.dataset.kind = entry.kind;
@@ -766,7 +1053,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         row.append(identity, tools);
         table.append(row);
       }
-      if (!table.children.length) table.append(el("p", needle ? "Совпадений нет" : "В этой папке пока нет записей", "workplace-empty"));
+      if (!matches.length) table.append(el("p", searching ? "Совпадений нет" : "В этой папке пока нет записей", "workplace-empty"));
     }
     search.oninput = () => { registrySearch = search.value; drawMatches(); };
     panel.append(workHeading("Реестр лекал", "", [
@@ -775,7 +1062,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       button("Папка", () => recordDialog("folder", null)), button("Комплект", () => recordDialog("kit", null)),
       button("Новый чертёж", () => openCad(null), { primary: true }),
     ]), columns);
+    updateTreeVisibility();
     drawTree();
+    drawBreadcrumbs();
     drawMatches();
   }
 
@@ -1047,6 +1336,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   async function showLayout(next) {
     const result = await navigateLayout(next);
     if (result === false) return;
+    clearInterval(workClock);
     currentLayout = next;
     const mode = next.kitId ? "kit" : result?.demo ? "demo" : next.mode;
     const order = result?.order || next.order;
@@ -1069,7 +1359,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         throw new Error("Сохраните раскладку перед скачиванием карты пошива.");
       }
       const params = mode === "kit" ? { kitId: next.kitId, widthMm: result.widthMm, quantity: result.quantity }
-        : next.id ? { cutId: next.id, mode } : { workspace: 1 };
+        : next.id ? { cutId: next.id, mode: next.previewSource ?? mode } : { workspace: 1 };
       await downloadSewingPdf(params);
     })));
     dock.append(xiaoActions);
@@ -1114,11 +1404,30 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     return true;
   }
 
+  function updateWorkClocks() {
+    const running = panel.querySelectorAll("[data-work-started]");
+    if (!running.length) return;
+    const tick = () => {
+      const now = Date.now();
+      for (const timer of running) timer.textContent = workDuration((now - Number(timer.dataset.workStarted)) / 1000);
+    };
+    tick();
+    workClock = window.setInterval(tick, 1000);
+  }
+
+  async function openOrder(id) {
+    selectedOrder = id;
+    await render();
+    page.scrollTop = 0;
+    focusWorkplaceHeading();
+  }
+
   function renderOrder(order) {
     const operator = tab === "operator";
     const draft = !order.published;
     const done = order.cuts.filter(cut => cut.status === "done").length;
-    const actions = [button("Все наряды", execute(async () => { selectedOrder = null; await render(); }))];
+    const actions = [button(designerView === "analysis" && !operator ? "К анализу" : "Все наряды",
+      execute(() => openOrder(null)), { icon: "back" })];
     if (!operator) {
       const canReopen = order.cuts.every(cut => cut.status === "pending");
       const hasActiveCut = order.cuts.some(cut => cut.status === "active");
@@ -1149,36 +1458,41 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     }), { primary: true }));
     panel.append(workHeading(`Наряд № ${order.number}`, orderContext(order), actions));
     const overview = el("section", orderDates(order), "workplace-order-overview");
+    overview.append(progressRow(done, order.cuts.length));
+    if (draft) overview.append(el("span", "Черновик", "workplace-chip"));
     if (order.notes) overview.append(el("p", order.notes, "workplace-order-notes"));
     panel.append(overview);
-    if (operator || order.published) panel.append(progressRow(done, order.cuts.length));
-    const list = el("div", "", "workplace-cut-list");
+    const finished = done > 0 && done === order.cuts.length;
+    const totals = workStats(order.stats, { order: true, finished, draft });
+    totals.classList.add("workplace-order-totals");
+    panel.append(totals);
+    panel.append(el("h2", `Ткани · ${order.cuts.length}`, "workplace-section-title"));
+    const list = el("div", "", "workplace-cards workplace-cut-list");
     for (const cut of order.cuts) {
       const layout = { id: cut.id, order, name: cut.name };
-      const row = el("article", "", "workplace-cut-row");
-      const main = el("div", el("h2", cut.name));
-      main.append(el("p", cut.widthMm == null ? "Ширина задаётся в автораскладке" : `Полотно ${cut.widthMm} мм`));
-      const tools = el("div", "", "workplace-actions");
+      const row = el("article", "", "workplace-card workplace-cut-row");
+      const header = el("header", el("h3", cut.name), "workplace-fabric-heading");
+      const tools = el("div", "", "workplace-actions workplace-card-tools");
       const released = cut.released !== false;
+      if (!operator || released) {
+        const editable = !operator && (draft || (!released && cut.status === "pending"));
+        enableCardOpen(row, `Открыть раскладку ткани «${cut.name}»`, execute(() =>
+          showLayout({ ...layout, mode: "preview", previewSource: operator ? "operator" : undefined, editable })));
+      }
       const draftState = cut.prepared ? "Готов к отправке" : cut.widthMm == null ? "Раскладка у оператора" : "Требуется раскладка";
       const state = draft ? draftState
         : released ? states[cut.status] : "Конструктор обновляет раскладку";
-      tools.append(el("span", state, `workplace-chip ${cut.status}`));
+      header.append(el("span", state, `workplace-chip ${draft ? "draft" : cut.status}`));
       if (operator && released) {
-        tools.append(button(cut.status === "pending" ? "Приступить" : cut.status === "active" ? "Продолжить" : "Просмотреть",
-          execute(() => showLayout({ ...layout, mode: "operator" })), { primary: cut.status !== "done" }));
+        if (cut.status !== "done") tools.append(button(cut.status === "pending" ? "Приступить" : "Продолжить",
+          execute(() => showLayout({ ...layout, mode: "operator" })), { primary: true }));
         tools.append(button("Демо", execute(() => showLayout({ ...layout, mode: "demo" }))));
       } else if (!operator && (draft || cut.status === "pending")) {
         tools.append(button("Изменить ткань и состав", () => cutDialog(order, cut)));
-        if (draft || !released) {
-          tools.append(button("Раскладка", execute(() => showLayout({ ...layout, mode: "design" })), { primary: true }));
-          if (!draft) tools.append(button("Отправить раскладку", execute(async () => {
-            await post("/api/orders", { action: "publish-cut", id: cut.id, orderId: order.id, orderRevision: order.revision });
-            await render();
-          }), { primary: true }));
-        } else {
-          tools.append(button("Предпросмотр", execute(() => showLayout({ ...layout, mode: "preview" }))));
-        }
+        if (!draft && !released) tools.append(button("Отправить раскладку", execute(async () => {
+          await post("/api/orders", { action: "publish-cut", id: cut.id, orderId: order.id, orderRevision: order.revision });
+          await render();
+        }), { primary: true }));
         tools.append(button("Удалить ткань", execute(async () => {
           if (!await confirmAction({
             title: `Удалить пункт «${cut.name}»?`,
@@ -1189,8 +1503,9 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
           await render();
           focusWorkplaceHeading();
         })));
-      } else if (!operator) tools.append(button("Предпросмотр", execute(() => showLayout({ ...layout, mode: "preview" }))));
-      row.append(main, tools);
+      }
+      row.append(header, workStats(cut.stats, { finished: cut.status === "done", draft }));
+      if (tools.childElementCount) row.append(tools);
       list.append(row);
     }
     if (!list.children.length) list.append(el("p", "Добавьте ткань и выберите детали для раскладки.", "workplace-empty"));
@@ -1200,35 +1515,204 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   function progressRow(done, total) {
     const percent = progressPercent(done, total);
     const row = el("div", "", "workplace-progress");
+    const count = `${done} из ${total}`;
+    const label = el("span", "Готово тканей ", "workplace-progress-label");
+    label.append(el("strong", count));
     const bar = el("progress");
     Object.assign(bar, { max: 100, value: percent, ariaLabel: "Выполнение наряда" });
-    row.append(bar, el("span", `${done} из ${total} · ${percent}%`));
+    bar.setAttribute("aria-valuetext", `Готово тканей: ${count} (${percent}%)`);
+    row.append(label, el("span", `${percent}%`, "workplace-progress-percent"), bar);
     return row;
+  }
+
+  function analysisChart(days) {
+    const chart = el("section", "", "workplace-analysis-section");
+    const title = el("h2", "Выработка по дням");
+    const controls = el("div", "", "workplace-chart-series");
+    controls.setAttribute("role", "group");
+    controls.setAttribute("aria-label", "Показатель выработки");
+    const header = el("header", title, "workplace-chart-heading");
+    header.append(controls);
+    const bars = el("ol", "", "workplace-chart-bars");
+    bars.tabIndex = 0;
+    chart.append(header, bars);
+    const series = [
+      ["fabricMetersPerHour", "Полотно", "пог. м/ч"],
+      ["cutMetersPerHour", "Рез", "м/ч"],
+    ];
+    const switches = series.map(([key, label]) => button(label, () => { analysisSeries = key; draw(); }));
+    controls.append(...switches);
+    function draw() {
+      const [, label, unit] = series.find(([key]) => key === analysisSeries);
+      switches.forEach((control, index) => control.setAttribute("aria-pressed", String(series[index][0] === analysisSeries)));
+      bars.setAttribute("aria-label", `${label} по дням, ${unit}`);
+      bars.replaceChildren();
+      const max = days.reduce((peak, day) => Math.max(peak, day[analysisSeries] ?? 0), 0);
+      for (const day of days) {
+        const value = day[analysisSeries];
+        const date = el("time", showDate(day.date));
+        date.dateTime = day.date;
+        const bar = el("span", "", "workplace-chart-track");
+        bar.setAttribute("aria-hidden", "true");
+        if (Number.isFinite(value)) {
+          const fill = el("span");
+          fill.style.width = `${max > 0 ? value / max * 100 : 0}%`;
+          bar.append(fill);
+        }
+        const row = el("li", date);
+        row.append(bar, el("strong", metricValue(value, unit)));
+        bars.append(row);
+      }
+      if (!days.length) bars.append(el("li", "Нет тканей с зафиксированной датой завершения в выбранном периоде.", "workplace-empty"));
+    }
+    draw();
+    return chart;
+  }
+
+  function analysisOrders(orders) {
+    const section = el("section", el("h2", "Наряды за период"), "workplace-analysis-section");
+    if (!orders.length) {
+      section.append(el("p", "Наряды появятся здесь, когда будет записана дата завершения ткани за выбранный период.", "workplace-empty"));
+      return section;
+    }
+    const scroll = el("div", "", "workplace-analysis-table");
+    scroll.tabIndex = 0;
+    scroll.setAttribute("role", "region");
+    scroll.setAttribute("aria-label", "Таблица нарядов за период");
+    const table = el("table");
+    table.append(el("caption", "Показатели по наряду целиком. Отклонение доступно для нарядов, закрытых за выбранный период."));
+    const heading = table.createTHead().insertRow();
+    const sort = button("", () => { analysisDeltaDescending = !analysisDeltaDescending; draw(); });
+    for (const label of ["Наряд", "Завершено тканей за период", "Полотно", "КИМ", "Расчёт", "Факт наряда", sort]) {
+      const th = el("th", label);
+      th.scope = "col";
+      heading.append(th);
+    }
+    const body = table.createTBody();
+    function draw() {
+      const sorted = [...orders].sort((left, right) => {
+        const a = left.stats?.deltaSeconds, b = right.stats?.deltaSeconds;
+        if (!Number.isFinite(a)) return Number.isFinite(b) ? 1 : 0;
+        if (!Number.isFinite(b)) return -1;
+        return analysisDeltaDescending ? b - a : a - b;
+      });
+      sort.textContent = `Отклонение ${analysisDeltaDescending ? "↓" : "↑"}`;
+      sort.setAttribute("aria-label", `Сортировать отклонение по ${analysisDeltaDescending ? "возрастанию" : "убыванию"}`);
+      sort.parentElement.setAttribute("aria-sort", analysisDeltaDescending ? "descending" : "ascending");
+      body.replaceChildren();
+      for (const order of sorted) {
+        const stats = order.stats ?? {};
+        const row = body.insertRow();
+        const identity = el("th", button(`№ ${order.number}`, execute(() => openOrder(order.id))));
+        identity.scope = "row";
+        if (orderContext(order)) identity.append(el("small", orderContext(order)));
+        if (!order.closedInPeriod) identity.append(el("small", stats.finishedAt ? "Закрыт вне периода"
+          : order.total && order.done === order.total ? "Дата закрытия неизвестна" : "В работе"));
+        row.append(identity);
+        for (const value of [order.periodCutCount ?? noMetric, metricValue(stats.lengthMm, "пог. м", 1000),
+          metricValue(stats.utilizationPercent, "%"), workDuration(stats.estimatedWorkSeconds),
+          workDuration(stats.actualSeconds), workDelta(stats.deltaSeconds)]) row.insertCell().append(value);
+      }
+    }
+    draw();
+    scroll.append(table);
+    section.append(scroll);
+    return section;
+  }
+
+  function renderAnalysis({ summary, days, orders }) {
+    const back = button("Все наряды", execute(async () => {
+      designerView = "orders";
+      await openOrder(null);
+    }), { icon: "back" });
+    panel.append(workHeading("Анализ раскроя", "", [back]));
+    const from = input("date", analysisPeriod.from, { required: true });
+    const to = input("date", analysisPeriod.to, { required: true });
+    const filter = el("form", "", "workplace-analysis-filter");
+    const apply = el("button", "Применить", "button primary");
+    apply.type = "submit";
+    function limitPeriod() {
+      from.max = to.value;
+      to.min = from.value;
+    }
+    limitPeriod();
+    from.oninput = to.oninput = limitPeriod;
+    filter.append(field("С", from), field("По", to), apply);
+    filter.onsubmit = event => {
+      event.preventDefault();
+      void execute(async () => {
+        analysisPeriod = { from: from.value, to: to.value };
+        await render();
+        focusWorkplaceHeading();
+      })();
+    };
+    panel.append(filter);
+    const summaryGrid = el("div", "", "workplace-analysis-summary");
+    const speeds = values => values?.length
+      ? `${values.map(value => metricNumber.format(value)).join(", ")} мм/с` : noMetric;
+    const coverage = (known, total) => Number.isFinite(known) && Number.isFinite(total) ? `${known} из ${total}` : noMetric;
+    summaryGrid.append(
+      workMetrics("Завершено за период", "check", [
+        ["Наряды", summary.completedOrders], ["Ткани", summary.completedCuts], ...materialValues(summary),
+      ]),
+      workMetrics("Время", "clock", [
+        ["Чистое расчётное", workDuration(summary.estimatedWorkSeconds)],
+        ["Факт закрытых нарядов", workDuration(summary.orderActualSeconds)],
+        ["Сумма по тканям", workDuration(summary.fabricActualSeconds)],
+        ["Ткани с фактом", coverage(summary.timedCount, summary.completedCuts)],
+        ["Скорость реза", speeds(summary.cutSpeedsMmS)], ["Скорость хода", speeds(summary.travelSpeedsMmS)],
+      ]),
+      workMetrics("Выработка", "analysis", [
+        ["Полотно в час", metricValue(summary.fabricMetersPerHour, "пог. м/ч")],
+        ["Рез в час", metricValue(summary.cutMetersPerHour, "м/ч")],
+        ["Эффективность (расчёт / факт)", metricValue(summary.efficiencyPercent, "%")],
+        ["Ткани с расчётом и фактом", coverage(summary.pairedCount, summary.completedCuts)],
+      ]),
+    );
+    if (summary.plannedCount < summary.completedCuts || summary.timedOrderCount < summary.completedOrders) {
+      const details = [];
+      if (summary.plannedCount < summary.completedCuts) {
+        details.push(`Расчёт для ${coverage(summary.plannedCount, summary.completedCuts)} тканей.`);
+      }
+      if (summary.timedOrderCount < summary.completedOrders) {
+        details.push(`Фактическое время для ${coverage(summary.timedOrderCount, summary.completedOrders)} нарядов.`);
+      }
+      summaryGrid.append(el("p", details.join(" "), "workplace-metric-note"));
+    }
+    panel.append(summaryGrid, analysisChart(days), analysisOrders(orders));
   }
 
   async function render() {
     const epoch = ++renderEpoch;
+    clearInterval(workClock);
     page.classList.remove("is-cad");
-    if (tab === "designer") await refreshRegistry();
+    const showReport = tab === "designer" && designerView === "analysis" && !selectedOrder;
+    let report;
+    if (showReport) {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      report = await get("/api/order-analysis", { ...analysisPeriod, tz });
+    } else if (tab === "designer") await refreshRegistry();
     if (epoch !== renderEpoch) return;
     const operator = tab === "operator";
     panel.replaceChildren();
     if (!operator) {
       const nav = el("nav", "", "workplace-subnav");
       for (const [view, title] of [["registry", "Реестр"], ["orders", "Наряды"]]) {
-        const control = button(title, execute(async () => { designerView = view; selectedOrder = null; await render(); }));
-        control.setAttribute("aria-pressed", String(designerView === view));
+        const control = button(title, execute(async () => { designerView = view; await openOrder(null); }));
+        control.setAttribute("aria-pressed", String(designerView === view || (view === "orders" && designerView === "analysis")));
         nav.append(control);
       }
       panel.append(nav);
       if (designerView === "registry") { renderRegistry(); return; }
+      if (showReport) { renderAnalysis(report); return; }
     }
     const params = operator ? { published: 1 } : {};
     const result = await get("/api/orders", selectedOrder ? { ...params, id: selectedOrder } : params);
     if (epoch !== renderEpoch) return;
-    if (selectedOrder) { renderOrder(result); return; }
+    if (selectedOrder) { renderOrder(result); updateWorkClocks(); return; }
     const actions = operator ? [button("Новый раскрой", execute(() => showLayout({ mode: "standalone" })), { primary: true })]
-      : [button("Новый наряд", () => orderDialog(null), { primary: true })];
+      : [button("Анализ", execute(async () => { designerView = "analysis"; await openOrder(null); }), { icon: "analysis" }),
+        button("Новый наряд", () => orderDialog(null), { primary: true, icon: "plus" })];
     if (operator) actions.unshift(button("Продолжить раскрой", execute(async () => {
       const id = await getActiveCut();
       const order = id && result.orders.find(order => order.materials?.some(material => material.id === id));
@@ -1236,26 +1720,32 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       await showLayout(id ? { mode: "operator", id, order, name: material?.name } : { mode: "standalone" });
     })));
     panel.append(workHeading(operator ? "Наряды на раскрой" : "Наряды", "", actions));
-    const cards = el("div", "", "workplace-cards");
+    const cards = el("div", "", "workplace-cards workplace-order-list");
     for (const order of result.orders) {
-      const card = el("article", "", "workplace-card");
+      const card = el("article", "", "workplace-card workplace-order-card");
+      enableCardOpen(card, `Открыть наряд № ${order.number}`, execute(() => openOrder(order.id)));
       const identity = el("div", el("h2", `Наряд № ${order.number}`), "workplace-card-identity");
+      const finished = order.total > 0 && order.done === order.total;
+      const state = !order.published ? "draft" : finished ? "done" : order.active || order.done ? "active" : "pending";
+      identity.prepend(el("span", state === "draft" ? "Черновик" : states[state], `workplace-chip ${state}`));
       const detail = orderContext(order);
       if (detail) identity.append(el("p", detail));
       const summary = el("div", "", "workplace-card-materials");
       summary.append(el("span", "Ткани", "workplace-order-label"));
       const fabrics = order.materials?.map(material => material.widthMm == null ? material.name : `${material.name} · ${material.widthMm} мм`);
       summary.append(el("span", fabrics?.join(", ") || "Ткани не добавлены"));
-      const progress = el("div", order.published ? progressRow(order.done, order.total)
-        : el("small", "Черновик", "workplace-chip"), "workplace-card-progress");
-      const open = button("Открыть", execute(async () => { selectedOrder = order.id; await render(); }));
-      open.setAttribute("aria-label", `Открыть наряд № ${order.number}`);
-      card.append(identity, orderDates(order), summary, progress, open);
+      const progress = progressRow(order.done, order.total);
+      const header = el("header", identity, "workplace-card-heading");
+      header.append(orderDates(order));
+      card.append(header, summary, progress, workStats(order.stats, {
+        order: true, finished, draft: !order.published,
+      }));
       if (order.notes) card.append(el("p", order.notes, "workplace-card-notes"));
       cards.append(card);
     }
     if (!cards.children.length) cards.append(el("p", operator ? "Отправленные наряды появятся здесь." : "Создайте наряд и добавьте ткани.", "workplace-empty"));
     panel.append(cards);
+    updateWorkClocks();
   }
 
   function saveRole(role) {
@@ -1319,8 +1809,10 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     cad?.destroy();
     cad = null;
     tab = selectedOrder = selectedFolder = null;
-    registrySearch = "";
+    registrySearch = registryKind = "";
     designerView = "registry";
+    analysisPeriod = defaultAnalysisPeriod();
+    clearInterval(workClock);
     saveRole(null);
     page.classList.remove("is-cad");
     panel.replaceChildren();
