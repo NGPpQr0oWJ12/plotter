@@ -14,10 +14,14 @@ MAX_REVISION = (1 << 53) - 1  # Exactly representable by the browser.
 # Includes 50,000 contour layer names and 250,000 points at the CAD limits.
 MAX_WORKSPACE_BYTES = 96 * 1024 * 1024
 PART_LABEL_FIELDS = ("partName", "productName")
+WORKSPACE_REVISION_CONFLICT = "workspace_revision_conflict"
+WORKSPACE_REVISION_MESSAGE = "Рабочая область изменилась в другой вкладке. Обновите страницу."
 
 
 class WorkspaceConflict(ValueError):
-    """The tab is trying to overwrite a newer workspace."""
+    def __init__(self, message, *, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def validate_workspace(value):
@@ -283,7 +287,7 @@ class WorkspaceStore:
         with self._locked():
             revision, _, previous, _ = self._current()
             if revision != expected_revision:
-                raise WorkspaceConflict("Рабочая область изменилась в другой вкладке. Обновите страницу.")
+                raise WorkspaceConflict(WORKSPACE_REVISION_MESSAGE, code=WORKSPACE_REVISION_CONFLICT)
             if revision == MAX_REVISION:
                 raise ValueError("Достигнут предел редакций рабочей области.")
             revision += 1

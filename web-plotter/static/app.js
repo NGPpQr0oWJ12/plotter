@@ -164,6 +164,7 @@ let cameraMode = "work";
 let cameraFrame = null;
 let cameraViewport = null;
 let workspaceRevision = null;
+let sharedWorkspaceView = null;
 let restoringWorkspace = true;
 let workspaceChange = 0;
 let workspaceSaved = 0;
@@ -2678,20 +2679,40 @@ function setSaveError(message = "") {
   status.classList.toggle("failed", Boolean(message));
 }
 
+function workspaceViewStorageKey() {
+  const mode = managedCut?.mode;
+  if (mode === "operator" || mode === "demo") return `plotter.workspaceView.${mode}.${managedCut.id}`;
+  return null;
+}
+
+function workspaceViewSnapshot() {
+  return {
+    zoom: camera && baseCamera ? camera.width / baseCamera.width : 1,
+    focusX: camera ? camera.x + camera.width / 2 : 0,
+    focusY: camera ? camera.y + camera.height / 2 : 0,
+    grid: true,
+    cameraMode,
+    ...(previewCutPage ? { section: previewCutPage } : {}),
+  };
+}
+
+function readWorkspaceView(key) {
+  try {
+    const view = JSON.parse(sessionStorage.getItem(key));
+    if (view && ["work", "overview", "manual"].includes(view.cameraMode)
+        && Number.isFinite(view.zoom) && view.zoom > 0
+        && Number.isFinite(view.focusX) && Number.isFinite(view.focusY)) return view;
+  } catch { /* Storage is optional. */ }
+  return null;
+}
+
 function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
   if (!source) return null;
   return {
     source: { filename: source.filename, warnings: source.warnings || [] },
     paths,
     excluded: [...excludedIndices],
-    view: {
-      zoom: camera && baseCamera ? camera.width / baseCamera.width : 1,
-      focusX: camera ? camera.x + camera.width / 2 : 0,
-      focusY: camera ? camera.y + camera.height / 2 : 0,
-      grid: true,
-      cameraMode,
-      ...(previewCutPage ? { section: previewCutPage } : {}),
-    },
+    view: (workspaceViewStorageKey() && sharedWorkspaceView) || workspaceViewSnapshot(),
     optimization: {
       route: routeApplied, routeApplied, join: $("optimize-join").checked,
       ...(nestingSettings ? { nesting: nestingSettings } : {}),
@@ -2701,6 +2722,12 @@ function workspaceSnapshot(paths = placed, excludedIndices = excluded) {
 
 function scheduleWorkspaceSave({ viewOnly = false } = {}) {
   if (layoutReadOnly() || restoringWorkspace || pendingCommand === "new-cut" || !source) return;
+  const viewKey = viewOnly && workspaceViewStorageKey();
+  if (viewKey) {
+    // The helper locks the shared layout while a cut owns it. The camera belongs to this tab.
+    try { sessionStorage.setItem(viewKey, JSON.stringify(workspaceViewSnapshot())); } catch { /* Storage is optional. */ }
+    return;
+  }
   if (kitLayout()) {
     if (!viewOnly) workspaceChange++;
     renderKitSave();
@@ -2735,6 +2762,14 @@ function updateManagedCutMetadata(response) {
   return revised || widthChanged;
 }
 
+function isWorkspaceRevisionConflict(error) {
+  if (error.status !== 409) return false;
+  if (error.details?.code) return error.details.code === "workspace_revision_conflict";
+  // Older servers return these messages without a code.
+  return error.message === "Рабочая область изменилась в другой вкладке. Обновите страницу."
+    || error.message === "Запись изменилась в другой вкладке. Заново откройте её.";
+}
+
 function persistWorkspace() {
   clearTimeout(saveTimer);
   if (savePromise) return savePromise;
@@ -2756,9 +2791,8 @@ function persistWorkspace() {
       setSaveError();
       return true;
     } catch (error) {
-      if (error.status === 409) workspaceRevision = null;
-      setSaveError(kitLayout() || error.status !== 409 ? "Не сохранено: " + messageFrom(error)
-        : "Другая вкладка сохранила правки. Перезагрузите страницу.");
+      if (isWorkspaceRevisionConflict(error) || (kitLayout() && error.status === 409)) workspaceRevision = null;
+      setSaveError("Не сохранено: " + messageFrom(error));
       return false;
     } finally {
       savePromise = null;
@@ -2793,6 +2827,9 @@ function applyWorkspace(response) {
   workspaceRevision = response.revision;
   workspaceChange = workspaceSaved = 0;
   const saved = response.workspace;
+  sharedWorkspaceView = saved?.view ?? null;
+  const viewKey = workspaceViewStorageKey();
+  const view = (saved && viewKey && readWorkspaceView(viewKey)) || sharedWorkspaceView;
   clearSavedMeasurements();
   selection = new Set();
   partLegendSearch.value = "";
@@ -2805,18 +2842,18 @@ function applyWorkspace(response) {
   routeApplied = saved?.optimization.routeApplied ?? true;
   $("optimize-join").checked = saved?.optimization.join ?? true;
   nestingSettings = saved?.optimization.nesting || null;
-  cameraMode = saved?.view.cameraMode ?? "work";
+  cameraMode = view?.cameraMode ?? "work";
   updateOptimizationControls();
   updateDrawing({ edited: false });
-  previewCutPage = saved?.view.section ?? null;
-  if (saved && baseCamera && cameraMode === "manual") {
-    if (hasRollLayout() && saved.view.zoom > 1) {
+  previewCutPage = view?.section ?? null;
+  if (view && baseCamera && cameraMode === "manual") {
+    if (hasRollLayout() && view.zoom > 1) {
       cameraMode = "overview";
       resizeCamera();
     } else {
-      const width = baseCamera.width * saved.view.zoom;
-      const height = baseCamera.height * saved.view.zoom;
-      camera = { x: saved.view.focusX - width / 2, y: saved.view.focusY - height / 2, width, height };
+      const width = baseCamera.width * view.zoom;
+      const height = baseCamera.height * view.zoom;
+      camera = { x: view.focusX - width / 2, y: view.focusY - height / 2, width, height };
       drawCamera();
     }
   }
@@ -5833,7 +5870,7 @@ async function openLayoutPart(part) {
         try {
           response = await writeWorkspace(workspaceSnapshot(next, nextExcluded), true);
         } catch (error) {
-          if (error.status === 409 && /вкладк|редакц/i.test(messageFrom(error))) workspaceRevision = null;
+          if (isWorkspaceRevisionConflict(error)) workspaceRevision = null;
           throw error;
         }
         rememberDrawing("изменение детали в конструкторе");

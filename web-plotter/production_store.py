@@ -21,13 +21,15 @@ from machine import PlotterError
 from nesting import validate_placed_parts
 from registry_archive import MAX_REGISTRY_JSON
 from sketchup_design import MAX_MODEL_BYTES, markup
-from workspace import MAX_REVISION, MAX_WORKSPACE_BYTES, PART_LABEL_FIELDS, WorkspaceConflict, drawing_paths, validate_workspace
+from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, PART_LABEL_FIELDS, WORKSPACE_REVISION_CONFLICT,
+                       WorkspaceConflict, drawing_paths, validate_workspace)
 
 
 SCHEMA_VERSION = 1
 MAX_QUANTITY = 50_000
 REGISTRY_BACKUP_VERSION = 1
 MOSCOW_TIME = timezone(timedelta(hours=3))
+RECORD_REVISION_MESSAGE = "Запись изменилась в другой вкладке. Заново откройте её."
 KIT_LAYOUT_SCHEMA = """
     CREATE TABLE IF NOT EXISTS kit_layouts (
         kit_id TEXT NOT NULL REFERENCES registry(id) ON DELETE CASCADE,
@@ -141,9 +143,10 @@ def key(value):
     return value
 
 
-def check_revision(value, revision):
+def check_revision(value, revision, *, mismatch_code=None):
     if type(value) is not int or value != revision:
-        raise WorkspaceConflict("Запись изменилась в другой вкладке. Заново откройте её.")
+        code = mismatch_code if type(value) is int and 0 <= value <= MAX_REVISION else None
+        raise WorkspaceConflict(RECORD_REVISION_MESSAGE, code=code)
 
 
 def backup_revision(value, previous=None):
@@ -1229,7 +1232,7 @@ class ProductionStore:
         with self.connect(write=True) as db:
             cut = self.cut_record(db, payload.get("cutId"))
             current = self.matching_workspace(db, cut, mode)
-            check_revision(payload.get("revision"), current["revision"])
+            check_revision(payload.get("revision"), current["revision"], mismatch_code=WORKSPACE_REVISION_CONFLICT)
             if mode == "preview" or (mode == "operator" and cut["status"] == "done"):
                 raise WorkspaceConflict("Этот раскрой открыт для просмотра.")
             draft = validate_workspace(payload.get("workspace"))

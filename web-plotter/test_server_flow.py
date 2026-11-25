@@ -11,6 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import ezdxf
 
@@ -84,11 +85,14 @@ class ServerFlowTests(unittest.TestCase):
         corrected["paths"][1]["points"][1] = [65, 50]
         data = {"revision": revision, "workspace": corrected, "partCorrection": True}
         with self.server.upload_lock:
-            self.request("/api/workspace", data, HTTPStatus.CONFLICT)
+            self.assertEqual(self.request("/api/workspace", data, HTTPStatus.CONFLICT),
+                             {"error": "Дождитесь завершения передачи задания."})
         self.assertEqual(self.server.workspace.read()["revision"], revision)
         saved = self.request("/api/workspace", data)
         self.assertEqual(saved["workspace"], corrected)
-        self.request("/api/workspace", data, HTTPStatus.CONFLICT)
+        self.assertEqual(self.request("/api/workspace", data, HTTPStatus.CONFLICT),
+                         {"error": "Рабочая область изменилась в другой вкладке. Обновите страницу.",
+                          "code": "workspace_revision_conflict"})
         self.assertEqual(self.server.workspace.read(), saved)
 
     def test_kit_layout_and_registry_move_through_production_api(self):
@@ -146,7 +150,35 @@ class ServerFlowTests(unittest.TestCase):
                     request("POST", "/api/workspace", HTTPStatus.OK, headers, payload)
                     save.assert_called_once_with(0, drawing())
                     save.side_effect = WorkspaceConflict("shared revision advanced")
-                    request("POST", "/api/workspace", HTTPStatus.CONFLICT, headers, payload)
+                    self.assertEqual(json.loads(request("POST", "/api/workspace", HTTPStatus.CONFLICT, headers, payload)),
+                                     {"error": "shared revision advanced"})
+
+                workspace_error = "Рабочая область изменилась в другой вкладке. Обновите страницу."
+                record_error = "Запись изменилась в другой вкладке. Заново откройте её."
+                revision_code = "workspace_revision_conflict"
+                operator_save = {"action": "save", "mode": "operator", "cutId": "a" * 32, "revision": 0}
+                cases = (
+                    ("/api/workspace", json.loads(payload), {"error": workspace_error}, revision_code),
+                    ("/api/operator-workspace", operator_save, {"error": record_error}, revision_code),
+                    ("/api/operator-workspace", {**operator_save, "revision": None}, {"error": record_error}, None),
+                    ("/api/orders", {"action": "save", "revision": 0}, {"error": record_error}, None),
+                    ("/api/operator-workspace", operator_save, {"error": record_error, "code": "workspace_in_use"},
+                     "workspace_in_use"),
+                )
+                with patch.object(companion.workspace.opener, "open") as open_central:
+                    for path, body, error, code in cases:
+                        with self.subTest(path=path, body=body, code=code):
+                            open_central.side_effect = HTTPError("", 409, "Conflict", {},
+                                                                 io.BytesIO(json.dumps(error).encode("utf-8")))
+                            result = json.loads(request("POST", path, HTTPStatus.CONFLICT, headers, json.dumps(body)))
+                            self.assertEqual(result, {"error": error["error"], **({"code": code} if code else {})})
+                    companion.selected_cut = operator_save["cutId"]
+                    with patch.object(companion, "owns_drawing", return_value=True):
+                        result = json.loads(request("POST", "/api/operator-workspace", HTTPStatus.CONFLICT,
+                                                    headers, json.dumps(operator_save)))
+                    self.assertEqual(result, {"error": "Сначала освободите раскладку на плоттере.",
+                                              "code": "workspace_in_use"})
+                    self.assertEqual(open_central.call_count, len(cases))
                 self.controller.operate.assert_not_called()
             finally:
                 companion.shutdown()
@@ -415,9 +447,14 @@ class ServerFlowTests(unittest.TestCase):
         job, filename = self.server.workspace_drawing(working["workspace"])
         first = self.request("/api/cut-plan", {"job": {**job, "cutContext": [cut_id, working["cutRevision"]]}, "filename": filename})
         working["workspace"]["paths"][0]["points"] = [[x + 5, y] for x, y in job["paths"][0]["points"]]
-        changed = self.request("/api/operator-workspace", {"mode": "operator", "action": "save", "cutId": cut_id,
-                                                           "partCorrection": True, **working})
+        save = {"mode": "operator", "action": "save", "cutId": cut_id, "partCorrection": True, **working}
+        changed = self.request("/api/operator-workspace", save)
         self.assertEqual(changed["workspace"], working["workspace"])
+        record_error = "Запись изменилась в другой вкладке. Заново откройте её."
+        self.assertEqual(self.request("/api/operator-workspace", save, HTTPStatus.CONFLICT),
+                         {"error": record_error, "code": "workspace_revision_conflict"})
+        self.assertEqual(self.request("/api/operator-workspace", {**save, "revision": False}, HTTPStatus.CONFLICT),
+                         {"error": record_error})
         self.assertEqual(self.server.production.workspace(cut_id, "preview")["workspace"]["paths"], published_paths)
         self.upload(first, HTTPStatus.CONFLICT, cutId=cut_id, autoRunOff=True)
         job, filename = self.server.workspace_drawing(changed["workspace"])
@@ -425,8 +462,11 @@ class ServerFlowTests(unittest.TestCase):
         upload = self.upload(second, cutId=cut_id, autoRunOff=True)
         self.start(second, upload, HTTPStatus.CONFLICT)
         self.report_live(upload, 3, "running", startedAt=1, startedReceipt=upload["jobReceipt"])
-        self.request("/api/operator-workspace", {"action": "save", "mode": "operator", "cutId": cut_id,
-                                                 "partCorrection": True, **changed}, HTTPStatus.CONFLICT)
+        for part_correction in (True, False):
+            blocked = self.request("/api/operator-workspace", {**save, **changed, "partCorrection": part_correction},
+                                   HTTPStatus.CONFLICT)
+            self.assertEqual(blocked, {"error": "Раскладка используется плоттером. Завершите или сбросьте раскрой.",
+                                       "code": "workspace_in_use"})
         self.request("/api/cut-context", {"action": "select", "cutId": None}, HTTPStatus.CONFLICT)
         self.request("/api/cut-context", {"action": "finish", "cutId": cut_id, "revision": changed["revision"]}, HTTPStatus.CONFLICT)
         self.assertEqual(self.controller.upload_job.call_count, 1)
@@ -527,7 +567,9 @@ class ServerFlowTests(unittest.TestCase):
         self.controller.read_live.return_value = {"responded": False, "busy": False,
                                                  "run": {"state": "completed", "fresh": False}}
         self.request("/api/new-cut", {"revision": revision, "stopped": False}, HTTPStatus.BAD_REQUEST)
-        self.request("/api/new-cut", {"revision": revision - 1, "stopped": True}, HTTPStatus.CONFLICT)
+        stale = self.request("/api/new-cut", {"revision": revision - 1, "stopped": True}, HTTPStatus.CONFLICT)
+        self.assertEqual(stale, {"error": "Рабочая область изменилась в другой вкладке. Обновите страницу.",
+                                 "code": "workspace_revision_conflict"})
         self.controller.read_live.assert_not_called()
         result = self.request("/api/new-cut", {"revision": revision, "stopped": True})
         self.assertEqual(result["revision"], revision + 1)

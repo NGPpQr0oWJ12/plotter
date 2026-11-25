@@ -43,11 +43,12 @@ from machine import PlotterError, Simulator, build_plan, number
 from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
 from panel_diagnostics import compare_panel_samples
 from panel_readback import PanelReadback
-from production_store import ProductionStore, RecordNotFound, key, verify_arrangement
+from production_store import RECORD_REVISION_MESSAGE, ProductionStore, RecordNotFound, key, verify_arrangement
 from registry_archive import (MAX_REGISTRY_ARCHIVE, RAR_MIME, RAR_SIGNATURE, RegistryArchiveTooLarge,
                               read_registry_archive, write_registry_archive)
 from sketchup_design import MAX_MARKUP_BYTES, MAX_SKP_BYTES, check_surface_edit, import_model, markup, transfer_manifest
-from workspace import MAX_WORKSPACE_BYTES, WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace
+from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, WORKSPACE_REVISION_CONFLICT, WORKSPACE_REVISION_MESSAGE,
+                       WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace)
 from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
 
 
@@ -105,6 +106,7 @@ MIME = {
     "/plotter-monochrome.css": ("plotter-monochrome.css", "text/css; charset=utf-8"),
 }
 PRODUCTION_ROUTES = {"/api/registry", "/api/orders", "/api/operator-workspace"}
+WORKSPACE_IN_USE = "workspace_in_use"
 LOGGER = logging.getLogger("plotter")
 
 
@@ -204,12 +206,24 @@ class CompanionWorkspace:
             with error:
                 if error.code in (400, 404, 409, 413, 415, 422):
                     try:
-                        message = json.loads(error.read(4096)).get("error")
+                        response = json.loads(error.read(4096))
+                        message = response.get("error")
                     except (OSError, ValueError, AttributeError, RecursionError):
                         message = None
                     if isinstance(message, str) and message:
                         if error.code == 409:
-                            raise WorkspaceConflict(message) from error
+                            code = response.get("code")
+                            if not isinstance(code, str) or not code:
+                                code = None
+                                revision = payload.get("revision") if isinstance(payload, dict) else None
+                                if type(revision) is int and 0 <= revision <= MAX_REVISION:
+                                    legacy_standalone = (endpoint in ("/api/workspace", "/api/new-cut")
+                                                         and message == WORKSPACE_REVISION_MESSAGE)
+                                    legacy_managed = (endpoint == "/api/operator-workspace" and payload.get("action") == "save"
+                                                      and message == RECORD_REVISION_MESSAGE)
+                                    if legacy_standalone or legacy_managed:
+                                        code = WORKSPACE_REVISION_CONFLICT
+                            raise WorkspaceConflict(message, code=code) from error
                         raise RequestError(message, error.code) from error
             raise RequestError("Помощник не смог обратиться к общей раскладке.", HTTPStatus.BAD_GATEWAY) from error
         except (URLError, OSError, ValueError, RecursionError) as error:
@@ -1231,7 +1245,8 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
             with self.workspace_lock:
                 if any(plotter.selected_cut == cut_id and (plotter.owns_drawing() or plotter.controller.upload_in_progress)
                        for plotter in plotters):
-                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.")
+                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.",
+                                            code=WORKSPACE_IN_USE)
                 yield
 
     def save_workspace(self, revision, draft, *, part_correction=False):
@@ -1262,7 +1277,8 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
                 if plotter.selected_cut is not None:
                     raise WorkspaceConflict("Вернитесь к самостоятельному раскрою перед очисткой.")
                 if self.workspace.read()["revision"] != revision:
-                    raise WorkspaceConflict("Рабочая область изменилась в другой вкладке. Обновите страницу.")
+                    raise WorkspaceConflict(WORKSPACE_REVISION_MESSAGE,
+                                            code=WORKSPACE_REVISION_CONFLICT if revision <= MAX_REVISION else None)
                 if other.owns_drawing() or other.controller.upload_in_progress is True:
                     raise RequestError("Текущее задание открыто в другом режиме. Завершите его или сбросьте там.",
                                        HTTPStatus.CONFLICT)
@@ -1368,7 +1384,7 @@ class Handler(BaseHTTPRequestHandler):
         except RegistryArchiveTooLarge as error:
             self.json_response({"error": str(error)}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         except WorkspaceConflict as error:
-            self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
+            self.json_response({"error": str(error), **({"code": error.code} if error.code else {})}, HTTPStatus.CONFLICT)
         except RecordNotFound as error:
             self.json_response({"error": str(error)}, HTTPStatus.NOT_FOUND)
         except NestingFitError as error:
@@ -1833,7 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
                          if part_correction else self.server.workspace_lock)
                 with guard:
                     if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
-                        raise WorkspaceConflict("Сначала освободите раскладку на плоттере.")
+                        raise WorkspaceConflict("Сначала освободите раскладку на плоттере.", code=WORKSPACE_IN_USE)
                     result = self.server.workspace.production_request(path, data)
             else:
                 result = self.server.workspace.production_request(path, data)
@@ -1869,7 +1885,8 @@ class Handler(BaseHTTPRequestHandler):
                      if part_correction else self.server.workspace_lock)
             with guard:
                 if plotter.selected_cut == data.get("cutId") and plotter.owns_drawing():
-                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.")
+                    raise WorkspaceConflict("Раскладка используется плоттером. Завершите или сбросьте раскрой.",
+                                            code=WORKSPACE_IN_USE)
                 result = store.save_workspace(data, mode, verify)
         elif (path == "/api/operator-workspace" and action in ("start", "finish") and mode in ("operator", "demo")
               and self.server.central_mode):
