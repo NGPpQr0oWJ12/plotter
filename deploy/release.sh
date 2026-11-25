@@ -178,6 +178,12 @@ PY
         install -m 0644 "$source/CHANGELOG.md" "$final/CHANGELOG.md"
     fi
     install -m 0644 "$source"/web-plotter/static/*.{css,html,js} "$final/web-plotter/static/"
+    local asset
+    for asset in OpenGostTypeB-Regular.ttf OpenGost-OFL.txt three-license.txt; do
+        if [[ -f $source/web-plotter/static/$asset ]]; then
+            install -m 0644 "$source/web-plotter/static/$asset" "$final/web-plotter/static/"
+        fi
+    done
     install -D -m 0644 "$source/research/machine-profile.example.json" "$final/research/machine-profile.example.json"
     python3 -m venv "$final/.venv"
     "$final/.venv/bin/python" -m pip install -r "$final/web-plotter/requirements.txt"
