@@ -1,7 +1,9 @@
 """Xiao graph framing and acknowledged transfer for a prepared single page."""
 
+from bisect import bisect_left
 from dataclasses import dataclass
 import math
+import re
 import socket
 from time import monotonic, sleep
 
@@ -13,6 +15,7 @@ BLOCK_POINT_LIMIT = 50
 BLOCK_APPEND_THRESHOLD = 912
 ACK_TIMEOUT = 1.5
 COORDINATE_OFFSET_MM = 0.01
+GRAPH_POINT = re.compile(rb"\(([01]),\d+,([\d.]+),([\d.]+),[\d.]+\)")
 
 
 class JobEncodingError(ValueError):
@@ -32,12 +35,24 @@ class GraphBlock:
     payload: bytes
     next_index: int
 
+    def vertices(self):
+        # The checksum trailer is outside the graph text.
+        return tuple(((float(x), float(y)), draw == b"1") for draw, x, y in GRAPH_POINT.findall(self.payload[:-5]))
+
 
 @dataclass(frozen=True)
 class EncodedJob:
     chunks: tuple[GraphBlock, ...]
     point_count: int
     path_end_indices: tuple[int, ...]
+
+    def vertex(self, index):
+        """Return the encoded XY and tool state for a one-based point index."""
+        if not 1 <= index <= self.point_count:
+            raise IndexError("Xiao point index out of range")
+        block_index = bisect_left(self.chunks, index, key=lambda block: block.next_index)
+        before = self.chunks[block_index - 1].next_index if block_index else 0
+        return self.chunks[block_index].vertices()[index - before - 1]
 
 
 @dataclass(frozen=True)

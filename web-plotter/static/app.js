@@ -112,6 +112,7 @@ let paintedSectionKey = "";
 let followedSectionKey = "";
 let headSample = null;
 let headStaleTimer;
+let liveRoutePosition = null;
 let trackedRun = readTrackedRun();
 const runStatistics = new CutStatistics($("run-statistics"), formatDuration, number);
 
@@ -873,15 +874,20 @@ headMarker.setAttribute("hidden", "");
 $("head-layer").append(headMarker);
 
 function liveHeadFrame() {
-  if (pendingCommand === "upload" || live.externalMotion) return null;
+  if (pendingCommand === "upload") return null;
   const tracked = cutProgress;
   if (tracked && trackedHeadStates.has(tracked.state)) {
     if (tracked.planId !== cutPlan?.planId) return null;
-    return { key: `${tracked.planId}/${tracked.page}`, cutting: tracked.state !== "ready" };
+    return { key: `${tracked.planId}/${tracked.page}/${tracked.startedAt ?? "ready"}`, tracked };
   }
-  if (runInProgress() || controllerRoll || (tracked && tracked.pages > 1)) return null;
+  if (live.externalMotion || runInProgress() || controllerRoll || (tracked && tracked.pages > 1)) return null;
   if (currentUpload && !tracked) return null;
   return { key: "table", cutting: false };
+}
+
+function matchesRoutePosition(point, tracked) {
+  return point?.planId === tracked.planId && point?.page === tracked.page
+    && Number.isFinite(point.x) && Number.isFinite(point.y);
 }
 
 function observeHeadPosition(position, drawingPosition) {
@@ -890,24 +896,28 @@ function observeHeadPosition(position, drawingPosition) {
     headSample = null;
     return;
   }
-  const point = frame.key === "table" ? position : drawingPosition;
-  if (frame.key !== "table" && (!point || `${point.planId}/${point.page}` !== frame.key)) {
+  const point = frame.tracked ? (demoMode ? drawingPosition : liveRoutePosition) : position;
+  if (frame.tracked && (!matchesRoutePosition(point, frame.tracked)
+      || (!demoMode && (point.index !== frame.tracked.index || !frame.tracked.fresh)))) {
     if (headSample?.key === frame.key) headSample.confirmed = false;
     return;
   }
   if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return;
-  headSample = { key: frame.key, point: projectPoint(point.x, point.y), at: performance.now(), confirmed: true };
+  headSample = { key: frame.key, point: projectPoint(point.x, point.y), at: performance.now(), confirmed: true,
+    indexed: point.source === "completed-index" };
 }
 
 function renderHead(now = performance.now()) {
   const frame = liveHeadFrame();
   const age = headSample ? Math.max(0, now - headSample.at) : Infinity;
-  const freshFor = frame?.cutting ? 1200 : 2800;
+  const freshFor = frame?.tracked && frame.tracked.state !== "ready" ? 1200 : 2800;
   const visibleFor = 4000;
-  const stale = !headSample?.confirmed || !live.positionFresh || live.busy || !live.responded || age >= freshFor;
+  const stale = !headSample?.confirmed || (!headSample.indexed && !live.positionFresh)
+    || live.busy || !live.responded || age >= freshFor;
   const hidden = !camera || simulation.active || !frame || headSample?.key !== frame.key || age >= visibleFor;
   headMarker.toggleAttribute("hidden", hidden);
   headMarker.classList.toggle("is-stale", stale);
+  headMarker.classList.toggle("is-indexed", !hidden && headSample.indexed);
   clearTimeout(headStaleTimer);
   if (!hidden) {
     const [x, y] = headSample.point;
@@ -1722,7 +1732,10 @@ function makeDrawingProgressModel(plan, includedIndices) {
   const pathsByPart = new Map();
   for (const page of plan.pages) {
     const sections = [];
+    let previousPoint = null;
     for (const [ordinal, path] of page.paths.entries()) {
+      const entryFrom = previousPoint;
+      previousPoint = path.closed ? path.points[0] : path.points.at(-1);
       const index = includedIndices[path.index];
       if (index === undefined) continue;
       const key = partProgressKey(index);
@@ -1730,11 +1743,34 @@ function makeDrawingProgressModel(plan, includedIndices) {
       pathTotals.set(index, (pathTotals.get(index) || 0) + 1);
       if (!pathsByPart.has(key)) pathsByPart.set(key, new Set());
       pathsByPart.get(key).add(index);
-      sections.push({ index, key, path, end: page.pathEndIndices?.[ordinal], trace: "" });
+      sections.push({ index, key, path, end: page.pathEndIndices?.[ordinal], entryFrom, trace: "", travel: "" });
     }
     pathsByPage.set(page.number, sections);
   }
   return { plan, totals, pathsByPage, pathTotals, pathsByPart, signature: "", count: 0, total: totals.size };
+}
+
+function executedTravel(section) {
+  const from = section.entryFrom;
+  const to = section.path.points[0];
+  if (!from || !to || (from[0] === to[0] && from[1] === to[1])) return "";
+  return section.travel ||= pathData({ points: [from, to] });
+}
+
+function renderActiveRouteSegment(tracking, section, verifiedVertices) {
+  const segment = $("live-active-segment");
+  const point = liveRoutePosition;
+  let route = "";
+  if (!demoMode && tracking?.fresh && section && matchesRoutePosition(point, tracking)
+      && point.index === tracking.index && point.source === "controller-position") {
+    const kind = verifiedVertices > 0 ? "cut" : "travel";
+    const from = kind === "cut" ? section.path.points[verifiedVertices - 1] : section.entryFrom;
+    if (from && point.kind === kind) {
+      route = pathData({ points: [from, [point.x, point.y]] });
+      updateAttribute(segment, "class", kind === "cut" ? "cut-trace" : "travel-trace");
+    }
+  }
+  updateAttribute(segment, "d", route);
 }
 
 function renderCutProgress() {
@@ -1752,16 +1788,19 @@ function renderCutProgress() {
     else upper = mid;
   }
   const current = currentSections[prefix];
-  const verifiedVertices = Number.isInteger(current?.end)
-    ? Math.max(0, current.path.points.length + Number(current.path.closed) - (current.end - tracking.index))
-    : 0;
+  const vertexCount = current ? current.path.points.length + Number(Boolean(current.path.closed)) : 0;
+  const verifiedVertices = Number.isInteger(current?.end) && Number.isInteger(tracking.index)
+    ? Math.max(0, Math.min(vertexCount, vertexCount - (current.end - tracking.index))) : 0;
   const signature = tracking ? `${tracking.page}/${firstPage}/${lastDone}/${prefix}/${verifiedVertices}` : "none";
   const layer = $("live-trace-layer");
+  const cutTrace = $("live-cut-trace");
+  const travelTrace = $("live-travel-trace");
   if (model ? model.signature !== signature
-    : completedDrawingPaths.size || completedDrawingParts.size || layer.firstElementChild) {
+    : completedDrawingPaths.size || completedDrawingParts.size || cutTrace.getAttribute("d") || travelTrace.getAttribute("d")) {
     const nextPaths = new Set();
     const nextParts = new Set();
     const verifiedTrace = [];
+    const verifiedTravel = [];
     if (model && tracking) {
       const done = new Map();
       const cutPaths = new Map();
@@ -1776,12 +1815,18 @@ function renderCutProgress() {
             cutPaths.set(index, (cutPaths.get(index) || 0) + 1);
             section.trace ||= pathData(path);
             verifiedTrace.push(section.trace);
+            const travel = executedTravel(section);
+            if (travel) verifiedTravel.push(travel);
           }
         }
       }
       // The controller's proof excludes the next target. Draw only the visited prefix of the open trace.
       if (verifiedVertices > 1) {
         verifiedTrace.push(pathData({ points: current.path.points.slice(0, verifiedVertices), closed: false }));
+      }
+      if (verifiedVertices > 0) {
+        const travel = executedTravel(current);
+        if (travel) verifiedTravel.push(travel);
       }
       for (const [index, count] of cutPaths) if (count === model.pathTotals.get(index)) nextPaths.add(index);
       for (const [key, count] of done) if (count === model.totals.get(key)) nextParts.add(key);
@@ -1792,12 +1837,8 @@ function renderCutProgress() {
       model.count = 0;
       model.signature = signature;
     }
-    const trace = layer.firstElementChild;
-    if (verifiedTrace.length) {
-      const route = verifiedTrace.join(" ");
-      if (trace) updateAttribute(trace, "d", route);
-      else layer.append(element("path", { d: route, class: "cut-trace", "vector-effect": "non-scaling-stroke" }));
-    } else if (trace) trace.remove();
+    updateAttribute(cutTrace, "d", verifiedTrace.join(" "));
+    updateAttribute(travelTrace, "d", verifiedTravel.join(" "));
     const groups = $("path-layer").children;
     const changed = new Set();
     for (const paths of [completedDrawingPaths, nextPaths]) {
@@ -1818,7 +1859,11 @@ function renderCutProgress() {
     }
     if (labelsChanged) renderPartLabels();
   }
-  $("live-trace-layer").toggleAttribute("hidden", simulation.active);
+  renderActiveRouteSegment(tracking, current, verifiedVertices);
+  layer.toggleAttribute("hidden", simulation.active);
+  const activeTrace = $("live-active-segment");
+  $("live-route-legend").hidden = simulation.active || !tracking
+    || ![cutTrace, travelTrace, activeTrace].some(path => path.getAttribute("d"));
   if (!simulation.active) $("canvas-cut-status").hidden = true;
   return tracking ? { count: model.count, total: model.total } : null;
 }
@@ -3657,7 +3702,8 @@ function applyLive(response) {
   }
   applyJobStatus(response);
   if (simulation.active && runInProgress()) simulation.close();
-  if (response.position && response.responded && !response.busy) observeHeadPosition(response.position, response.drawingPosition);
+  liveRoutePosition = response.responded && !response.busy ? response.routePosition ?? null : null;
+  if (response.responded && !response.busy) observeHeadPosition(response.position, response.drawingPosition);
   renderLive();
 }
 

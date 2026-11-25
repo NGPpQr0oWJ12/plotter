@@ -156,7 +156,11 @@
             <g id="path-layer"></g>
             <g id="notch-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="part-highlight-layer" pointer-events="none" aria-hidden="true"></g>
-            <g id="live-trace-layer" pointer-events="none" aria-hidden="true"></g>
+            <g id="live-trace-layer" pointer-events="none" aria-hidden="true">
+              <path id="live-travel-trace" class="travel-trace" vector-effect="non-scaling-stroke"/>
+              <path id="live-cut-trace" class="cut-trace" vector-effect="non-scaling-stroke"/>
+              <path id="live-active-segment" vector-effect="non-scaling-stroke"/>
+            </g>
             <g id="simulation-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="page-annotation-layer" pointer-events="none"></g>
             <g id="part-label-layer" aria-hidden="true"></g>
@@ -200,6 +204,7 @@
             <dl class="run-metrics">
               <div><dt>Проход</dt><dd id="run-page">—</dd></div><div><dt>Деталей готово</dt><dd id="run-done">—</dd></div>
             </dl>
+            <div id="live-route-legend" class="live-route-legend" hidden><span>Рез</span><span>Холостой ход</span></div>
           </section>
           <section class="launch-panel" id="launch-panel" aria-labelledby="launch-title">
             <header class="launch-summary">

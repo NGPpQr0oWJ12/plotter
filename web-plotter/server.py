@@ -33,7 +33,8 @@ from ezdxf.lldxf.validator import is_valid_layer_name
 from app_update import MAX_ARCHIVE, AppUpdates, UpdateError, read_release_notes, read_version
 from auto_run import AutoRunReadback
 from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_contours
-from controller import ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, HOLD_LEASE_SECONDS, Controller
+from controller import (ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, EXTERNAL_CUT_EVENTS, HOLD_LEASE_SECONDS, TICKS_PER_MM,
+                        Controller)
 from cut_journal import MAX_EVENTS, CutJournal
 from cut_plan import EPSILON_MM, prepare_cut_plan
 from demo_controller import DemoController
@@ -49,7 +50,7 @@ from registry_archive import (MAX_REGISTRY_ARCHIVE, RAR_MIME, RAR_SIGNATURE, Reg
 from sketchup_design import MAX_MARKUP_BYTES, MAX_SKP_BYTES, check_surface_edit, import_model, markup, transfer_manifest
 from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, WORKSPACE_REVISION_CONFLICT, WORKSPACE_REVISION_MESSAGE,
                        WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace)
-from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
+from xiao_job import COORDINATE_OFFSET_MM, EncodedJob, JobEncodingError, prepare_single_page
 
 
 ROOT = Path(__file__).resolve().parent
@@ -283,6 +284,7 @@ class CutProgress:
     completed_pages: int = 0
     fresh: bool = False
     events: tuple = ()
+    route: EncodedJob | None = None
 
     def snapshot(self):
         return {"planId": self.plan_id, "filename": self.filename, "page": self.page,
@@ -623,13 +625,13 @@ class PlotterState:
         if self.page_finished(progress, result):
             complete = progress.page == progress.pages
             progress = replace(progress, state="completed" if complete else "advance", index=progress.points,
-                               ended_at=run["endedAt"], completed_pages=progress.completed_pages + 1)
+                               ended_at=run["endedAt"], completed_pages=progress.completed_pages + 1, route=None)
             progress = self.record_cut_event(progress, "page_completed", f"Проход {progress.page} завершён.")
             if complete:
                 message = f"Раскрой завершён. Проходов: {progress.completed_pages}."
                 progress = self.record_cut_event(progress, "cut_completed", message)
         elif state == "cancelled":
-            progress = replace(progress, state=state, ended_at=run.get("endedAt"))
+            progress = replace(progress, state=state, ended_at=run.get("endedAt"), route=None)
             progress = self.record_cut_event(progress, "cut_cancelled", f"Рез прохода {progress.page} отменён.")
         elif state in ("starting", "running", "pausing", "paused", "resuming", "feeding", "cancelling", "unknown", "error"):
             if state in ("unknown", "error") and progress.state not in ("unknown", "error"):
@@ -718,6 +720,38 @@ class PlotterState:
             raise RequestError("Контроллер не подтвердил готовность текущего прохода. Проверьте станок на пульте.",
                                HTTPStatus.CONFLICT)
 
+    @staticmethod
+    def _live_route_position(progress, result):
+        run = result.get("run", {})
+        index = progress.index
+        # The next vertex can be a target rather than a completed point.
+        if (not progress.route or not progress.receipt or run.get("startedReceipt") != progress.receipt
+                or run.get("startedAt") != progress.started_at or run.get("indexRegressed") or result.get("motionInhibited")
+                or result.get("lastEvent", {}).get("code") not in EXTERNAL_CUT_EVENTS
+                or run.get("state") not in ("running", "pausing", "paused", "resuming")
+                or run.get("indexLimit") != progress.route.point_count or not 1 <= index < progress.route.point_count
+                or type(run.get("completedIndex")) is not int or run["completedIndex"] != index
+                or run.get("index") != index + 1):
+            return None
+
+        start, _ = progress.route.vertex(index)
+        target, drawing = progress.route.vertex(index + 1)
+        position = result["position"]
+        measured = position["x"], position["y"]
+        dx, dy = target[0] - start[0], target[1] - start[1]
+        distance_squared = dx * dx + dy * dy
+        point, source = start, "completed-index"
+        if distance_squared:
+            fraction = ((measured[0] - start[0]) * dx + (measured[1] - start[1]) * dy) / distance_squared
+            fraction = min(1, max(0, fraction))
+            projection = start[0] + fraction * dx, start[1] + fraction * dy
+            # Use the position sample only while it agrees with the current encoded segment to board resolution.
+            if math.dist(measured, projection) <= 2 / TICKS_PER_MM:
+                point, source = projection, "controller-position"
+        return {"planId": progress.plan_id, "page": progress.page, "index": index,
+                "x": progress.start_x + point[0] - COORDINATE_OFFSET_MM, "y": point[1] - COORDINATE_OFFSET_MM,
+                "kind": "cut" if drawing else "travel", "source": source}
+
     def read_live(self):
         expected_roll = self.roll
         expected_progress = self.cut_progress
@@ -736,6 +770,8 @@ class PlotterState:
                         "x": progress.start_x + position["x"] - COORDINATE_OFFSET_MM,
                         "y": position["y"] - COORDINATE_OFFSET_MM,
                     }
+                    if not self.demo_mode and (route_position := self._live_route_position(progress, result)):
+                        result["routePosition"] = route_position
             result.update(self.cut_status())
         return result
 
@@ -1037,7 +1073,7 @@ class PlotterState:
             previous_events = previous_progress.events if previous and previous_progress else ()
             self.cut_progress = CutProgress(preview["planId"], filename, page_number, len(preview["pages"]),
                                             first_page, job.point_count, page["startX"], page["endX"],
-                                            completed_pages=completed_pages, events=previous_events)
+                                            completed_pages=completed_pages, events=previous_events, route=job)
             if is_roll:
                 self.roll = RollRun(preview["planId"], page_number, len(preview["pages"]), first_page,
                                     page["feedAfterMm"], "transferring", completed_pages, job.point_count)

@@ -1118,7 +1118,8 @@ class ServerFlowTests(unittest.TestCase):
         self.report_live(second, 8, "ready")
         self.controller.operate.return_value = {"sent": True, "run": {"state": "starting", "startedAt": 21}}
         self.start(plan, second)
-        report = self.report_live(second, 3, "running", startedAt=21)
+        report = self.report_live(second, 3, "running", index=2, completedIndex=1, startedAt=21,
+                                  startedReceipt=second["jobReceipt"])
         report["position"] = {"x": 40.01, "y": 50.01, "z": 0}
         live = self.request("/api/controller-live", {})
         point = live["drawingPosition"]
@@ -1126,6 +1127,11 @@ class ServerFlowTests(unittest.TestCase):
         self.assertAlmostEqual(point["x"], plan["pages"][1]["startX"] + 40)
         self.assertAlmostEqual(point["y"], 50)
         self.assertEqual(live["position"], report["position"])
+        route = live["routePosition"]
+        self.assertEqual((route["page"], route["index"]), (2, 1))
+        expected_x, expected_y = plan["pages"][1]["paths"][0]["points"][0]
+        self.assertAlmostEqual(route["x"], expected_x)
+        self.assertAlmostEqual(route["y"], expected_y)
         self.report_live(second, 3, "running", startedAt=21)["busy"] = True
         self.assertNotIn("drawingPosition", self.request("/api/controller-live", {}))
         self.report_live(second, 4, "completed", startedAt=21, endedAt=22, completedPages=1)
@@ -1152,6 +1158,41 @@ class ServerFlowTests(unittest.TestCase):
         live = self.request("/api/controller-live", {})
         self.assertEqual(live["cutProgress"]["state"], "completed")
         self.assertEqual(live["cutJournal"][-1]["kind"], "cut_completed")
+
+    def test_live_route_position_uses_only_the_bound_run_and_current_encoded_segment(self):
+        workspace = drawing()
+        self.save(workspace)
+        plan = self.preview(workspace)
+        upload = self.upload(plan)
+        self.controller.operate.return_value = {"sent": True, "run": {"state": "starting", "startedAt": 11}}
+        self.start(plan, upload)
+        receipt = {"startedAt": 11, "startedReceipt": upload["jobReceipt"]}
+
+        self.report_live(upload, 3, "running", index=1, completedIndex=0, **receipt)
+        self.assertNotIn("routePosition", self.request("/api/controller-live", {}))
+
+        report = self.report_live(upload, 3, "running", index=2, completedIndex=1, **receipt)
+        report["position"] = {"x": 125, "y": 330, "z": 0}
+        live = self.request("/api/controller-live", {})
+        self.assertEqual(live["position"], report["position"])
+        self.assertEqual(live["routePosition"], {"planId": plan["planId"], "page": 1, "index": 1,
+                                                "x": 20, "y": 30, "kind": "cut", "source": "completed-index"})
+        self.assertEqual(self.request("/api/controller-live", {})["routePosition"], live["routePosition"])
+
+        report = self.report_live(upload, 9, "paused", index=3, completedIndex=2, **receipt)
+        report["position"] = {"x": 35.01, "y": 45.01, "z": 0}
+        point = self.request("/api/controller-live", {})["routePosition"]
+        self.assertEqual((point["index"], point["kind"], point["source"]), (2, "travel", "controller-position"))
+        self.assertAlmostEqual(point["x"], 35)
+        self.assertAlmostEqual(point["y"], 45)
+
+        for overrides in ({"startedReceipt": "another"}, {"startedAt": 12}, {"fresh": False},
+                          {"indexRegressed": True}, {"index": 1}, {"indexLimit": upload["points"] + 1}):
+            with self.subTest(overrides=overrides):
+                self.report_live(upload, 3, "running", **{**receipt, "completedIndex": 2, "index": 3, **overrides})
+                live = self.request("/api/controller-live", {})
+                self.assertNotIn("routePosition", live)
+                self.assertEqual(live["cutProgress"]["index"], 2)
 
     def test_roll_can_start_at_selected_page_and_only_advance_from_there(self):
         _, _, plan = self.roll_plan()

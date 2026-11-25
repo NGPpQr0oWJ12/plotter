@@ -20,7 +20,6 @@ from run_monitor import RunMonitor
 
 
 PAGE_ADD_MM = 0.12
-GRAPH_POINT = re.compile(rb"\(([01]),\d+,([\d.]+),([\d.]+),[\d.]+\)")
 
 
 @dataclass
@@ -310,10 +309,9 @@ class DemoController:
                 raise ControllerError("Параметры демозагрузки изменились. Подготовьте задание заново.")
             points, tool_down = [], []
             for chunk in job.chunks:
-                # Exclude the CRC trailer, whose bytes are outside the graph text.
-                for draw, x, y in GRAPH_POINT.findall(chunk.payload[:-5]):
-                    points.append((float(x), float(y)))
-                    tool_down.append(draw == b"1")
+                for point, drawing in chunk.vertices():
+                    points.append(point)
+                    tool_down.append(drawing)
             if not points or len(points) != job.point_count:
                 raise ControllerError("Не удалось прочитать точки демонстрационного задания.")
             verification_required = len(points) == len(self._points)

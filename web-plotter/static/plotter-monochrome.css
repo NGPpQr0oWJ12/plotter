@@ -327,7 +327,6 @@ a.button:focus-visible {
 .page-seam-core { fill: #222; }
 .page-seam-group.is-active .page-seam-dot { fill: #fff; stroke: #080808; }
 .page-seam-line { stroke: #444; }
-.cut-trace,
 .simulation-cut { stroke: #171717; }
 .simulation-feed { stroke: #222; stroke-dasharray: 9 3 2 3; }
 #simulation-layer.show-short-cuts .simulation-cut.simulation-short { stroke: #050505; stroke-dasharray: 2 1; }

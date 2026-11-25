@@ -65,6 +65,8 @@ class RunMonitor:
                   "events": list(self.events)}
         if fresh and self.index is not None:
             result["index"] = self.index
+        if self.index_regressed:
+            result["indexRegressed"] = True
         return result
 
     def begin_upload(self, filename):

@@ -980,6 +980,7 @@ class ControllerTests(unittest.TestCase):
         monitor.observe(3, "Начата обработка", (0, 1, 12), busy=False)
         monitor.observe(3, "Начата обработка", (10, 1, 12), busy=False)
         self.assertEqual(monitor.snapshot()["completedIndex"], 3)
+        self.assertIs(monitor.snapshot()["indexRegressed"], True)
         monitor.observe(4, "Обработка завершена", None, busy=False)
         self.assertEqual(monitor.snapshot()["completedIndex"], 3)
         monitor.observe(4, "Обработка завершена", (0, 1, 12), busy=False)

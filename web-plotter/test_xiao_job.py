@@ -40,6 +40,9 @@ class XiaoJobTests(unittest.TestCase):
         self.assertTrue(job.chunks[1].payload.startswith(b"[34](1,4,134.010,"))
         self.assertTrue(job.chunks[3].payload.startswith(b"[80](0,4,0.010,"))
         self.assertTrue(all(len(chunk.payload) < 1000 for chunk in job.chunks))
+        self.assertEqual(job.vertex(34), ((133.01, 1000.01), True))
+        self.assertEqual(job.vertex(35), ((134.01, 1000.01), True))
+        self.assertEqual(job.vertex(81), ((0.01, 0.01), False))
 
     def test_invalid_geometry_units_and_tool_are_rejected(self):
         at_edge = Contour(((0, 0), (2400, 20)), False, "Крой")
