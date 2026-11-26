@@ -4,6 +4,8 @@ import { confirmAction } from "/confirm-action.js";
 const $ = (id) => document.getElementById(id);
 const labels = { folder: "Папка", drawing: "Чертёж", part: "Деталь", kit: "Комплект" };
 const states = { pending: "Ожидает", active: "В работе", done: "Выполнен" };
+const orderStateRank = { pending: 0, done: 1, active: 2, draft: 3 };
+const ordersPerPage = 10;
 const kitPartDragType = "application/x-plotter-kit-part";
 
 function registryIcon(kind) {
@@ -238,6 +240,16 @@ function orderContext(order) {
   return [product, `${order.quantity} шт.`].filter(Boolean).join(" · ");
 }
 
+function orderState(order) {
+  if (!order.published) return "draft";
+  if (order.total > 0 && order.done === order.total) return "done";
+  return order.active || order.done ? "active" : "pending";
+}
+
+function normalizeOrderSearch(text) {
+  return text.toLocaleLowerCase("ru-RU").replaceAll("ё", "е");
+}
+
 const metricNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 const metricDate = new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" });
 const noMetric = "Нет данных";
@@ -385,6 +397,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   let registryTreeHidden = false;
   let cad = null;
   let selectedOrder = null;
+  const orderList = { query: "", filter: "", page: 1 };
   let analysisPeriod = defaultAnalysisPeriod();
   let analysisDeltaDescending = true;
   let analysisSeries = "fabricMetersPerHour";
@@ -1682,6 +1695,104 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     panel.append(summaryGrid, analysisChart(days), analysisOrders(orders));
   }
 
+  function renderOrderCard(order, state) {
+    const card = el("article", "", "workplace-card workplace-order-card");
+    card.dataset.orderStatus = state;
+    enableCardOpen(card, `Открыть наряд № ${order.number}`, execute(() => openOrder(order.id)));
+    const identity = el("div", el("h2", `Наряд № ${order.number}`), "workplace-card-identity");
+    identity.prepend(el("span", state === "draft" ? "Черновик" : states[state], `workplace-chip ${state}`));
+    const detail = orderContext(order);
+    if (detail) identity.append(el("p", detail));
+    const summary = el("div", "", "workplace-card-materials");
+    summary.append(el("span", "Ткани", "workplace-order-label"));
+    const fabrics = order.materials?.map(material => material.widthMm == null ? material.name : `${material.name} · ${material.widthMm} мм`);
+    summary.append(el("span", fabrics?.join(", ") || "Ткани не добавлены"));
+    const header = el("header", identity, "workplace-card-heading");
+    header.append(orderDates(order));
+    card.append(header, summary, progressRow(order.done, order.total), workStats(order.stats, {
+      order: true, finished: state === "done", draft: !order.published,
+    }));
+    if (order.notes) card.append(el("p", order.notes, "workplace-card-notes"));
+    return card;
+  }
+
+  function renderOrderList(orders, operator) {
+    const sorted = orders.map(order => ({
+      order,
+      state: orderState(order),
+      search: normalizeOrderSearch([`Наряд № ${order.number}`, order.designation, order.modelName,
+        ...(order.materials ?? []).map(material => material.name)].join(" ")),
+    })).sort((a, b) => orderStateRank[a.state] - orderStateRank[b.state]
+      || (b.order.placedOn ?? "").localeCompare(a.order.placedOn ?? ""));
+
+    const tools = el("div", "", "workplace-order-tools");
+    const search = input("search", orderList.query, { placeholder: "Номер, изделие или ткань" });
+    search.setAttribute("aria-label", "Поиск нарядов");
+    const searchField = el("label", registryIcon("search"), "workplace-order-search");
+    searchField.append(search);
+    const filters = el("div", "", "workplace-order-filters");
+    filters.setAttribute("role", "group");
+    filters.setAttribute("aria-label", "Статус наряда");
+    const options = [["", "Все"], ["pending", states.pending], ["done", "Выполнена"], ["active", states.active]];
+    const controls = options.map(([value, title]) => button(title, () => {
+      orderList.filter = value;
+      orderList.page = 1;
+      showResults();
+    }));
+    filters.append(...controls);
+    tools.append(searchField, filters);
+
+    const cards = el("div", "", "workplace-cards workplace-order-list");
+    cards.tabIndex = -1;
+    const pages = el("nav", "", "workplace-order-pages");
+    pages.setAttribute("aria-label", "Страницы нарядов");
+    const pageStatus = el("span");
+    pageStatus.setAttribute("role", "status");
+    const previous = button("Назад", () => changePage(-1));
+    const next = button("Далее", () => changePage(1));
+    pages.append(previous, pageStatus, next);
+    const results = el("div", pages, "workplace-order-results");
+    results.append(cards);
+    panel.append(tools, results);
+
+    search.addEventListener("input", () => {
+      orderList.query = search.value;
+      orderList.page = 1;
+      showResults();
+    });
+
+    function changePage(direction) {
+      orderList.page += direction;
+      showResults();
+      page.scrollTop = 0;
+      cards.focus({ preventScroll: true });
+    }
+
+    function showResults() {
+      const words = normalizeOrderSearch(orderList.query).trim().split(/\s+/).filter(Boolean);
+      const matches = sorted.filter(({ state, search }) => (!orderList.filter || state === orderList.filter)
+        && words.every(word => search.includes(word)));
+      const pageCount = Math.max(1, Math.ceil(matches.length / ordersPerPage));
+      orderList.page = Math.min(orderList.page, pageCount);
+      const offset = (orderList.page - 1) * ordersPerPage;
+      cards.replaceChildren(...matches.slice(offset, offset + ordersPerPage).map(({ order, state }) => renderOrderCard(order, state)));
+      if (!matches.length) {
+        const message = words.length || orderList.filter ? "Наряды не найдены."
+          : operator ? "Отправленные наряды появятся здесь." : "Создайте наряд и добавьте ткани.";
+        cards.append(el("p", message, "workplace-empty workplace-order-empty"));
+      }
+      controls.forEach((control, index) => control.setAttribute("aria-pressed", String(options[index][0] === orderList.filter)));
+      pages.hidden = pageCount === 1;
+      previous.disabled = orderList.page === 1;
+      next.disabled = orderList.page === pageCount;
+      pageStatus.textContent = `Страница ${orderList.page} из ${pageCount}`;
+      clearInterval(workClock);
+      updateWorkClocks();
+    }
+
+    showResults();
+  }
+
   async function render() {
     const epoch = ++renderEpoch;
     clearInterval(workClock);
@@ -1720,32 +1831,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       await showLayout(id ? { mode: "operator", id, order, name: material?.name } : { mode: "standalone" });
     })));
     panel.append(workHeading(operator ? "Наряды на раскрой" : "Наряды", "", actions));
-    const cards = el("div", "", "workplace-cards workplace-order-list");
-    for (const order of result.orders) {
-      const card = el("article", "", "workplace-card workplace-order-card");
-      enableCardOpen(card, `Открыть наряд № ${order.number}`, execute(() => openOrder(order.id)));
-      const identity = el("div", el("h2", `Наряд № ${order.number}`), "workplace-card-identity");
-      const finished = order.total > 0 && order.done === order.total;
-      const state = !order.published ? "draft" : finished ? "done" : order.active || order.done ? "active" : "pending";
-      identity.prepend(el("span", state === "draft" ? "Черновик" : states[state], `workplace-chip ${state}`));
-      const detail = orderContext(order);
-      if (detail) identity.append(el("p", detail));
-      const summary = el("div", "", "workplace-card-materials");
-      summary.append(el("span", "Ткани", "workplace-order-label"));
-      const fabrics = order.materials?.map(material => material.widthMm == null ? material.name : `${material.name} · ${material.widthMm} мм`);
-      summary.append(el("span", fabrics?.join(", ") || "Ткани не добавлены"));
-      const progress = progressRow(order.done, order.total);
-      const header = el("header", identity, "workplace-card-heading");
-      header.append(orderDates(order));
-      card.append(header, summary, progress, workStats(order.stats, {
-        order: true, finished, draft: !order.published,
-      }));
-      if (order.notes) card.append(el("p", order.notes, "workplace-card-notes"));
-      cards.append(card);
-    }
-    if (!cards.children.length) cards.append(el("p", operator ? "Отправленные наряды появятся здесь." : "Создайте наряд и добавьте ткани.", "workplace-empty"));
-    panel.append(cards);
-    updateWorkClocks();
+    renderOrderList(result.orders, operator);
   }
 
   function saveRole(role) {
@@ -1810,6 +1896,8 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     cad = null;
     tab = selectedOrder = selectedFolder = null;
     registrySearch = registryKind = "";
+    orderList.query = orderList.filter = "";
+    orderList.page = 1;
     designerView = "registry";
     analysisPeriod = defaultAnalysisPeriod();
     clearInterval(workClock);

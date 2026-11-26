@@ -169,8 +169,14 @@
             <defs>
               <pattern id="plotter-cloth-weave" width="7" height="7" patternUnits="userSpaceOnUse">
                 <rect width="7" height="7" fill="#eeede7"/>
-                <path d="M0 1.5h7M0 5h7" stroke="#e2e1da" stroke-width=".65"/>
-                <path d="M1.5 0v3m3.5 0v4" stroke="#f4f3ee" stroke-width=".75"/>
+                <g id="plotter-cloth-threads">
+                  <path d="M0 1.5h7M0 5h7" stroke="#e2e1da" stroke-width=".65"/>
+                  <path d="M1.5 0v3m3.5 0v4" stroke="#f4f3ee" stroke-width=".75"/>
+                </g>
+              </pattern>
+              <pattern id="plotter-part-weave" width="7" height="7" patternUnits="userSpaceOnUse">
+                <rect width="7" height="7" fill="#a9bdc8"/>
+                <use href="#plotter-cloth-threads" opacity=".36"/>
               </pattern>
               <pattern id="plotter-vacuum-bed" width="10" height="10" patternUnits="userSpaceOnUse">
                 <rect width="10" height="10" fill="#cdceca"/>

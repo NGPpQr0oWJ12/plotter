@@ -85,6 +85,10 @@ def _valid_mm(value: object) -> bool:
     return type(value) in (int, float) and 0 <= value < math.inf
 
 
+def xiao_coordinates(x: float, y: float) -> tuple[str, str]:
+    return f"{x + COORDINATE_OFFSET_MM:.3f}", f"{y + COORDINATE_OFFSET_MM:.3f}"
+
+
 def _point_coordinates(contour: Contour, number: int, width: float, height: float) -> list[tuple[str, str]]:
     if type(contour) is not Contour or type(contour.points) is not tuple or type(contour.closed) is not bool:
         raise JobEncodingError(f"Контур {number}: ожидается подготовленная геометрия.")
@@ -98,14 +102,15 @@ def _point_coordinates(contour: Contour, number: int, width: float, height: floa
         x, y = point
         if not (_valid_mm(x) and _valid_mm(y) and x <= width and y <= height):
             raise JobEncodingError(f"Контур {number} выходит за рабочее поле.")
-        x_text = f"{x + COORDINATE_OFFSET_MM:.3f}"
-        y_text = f"{y + COORDINATE_OFFSET_MM:.3f}"
+        x_text, y_text = xiao_coordinates(x, y)
         if float(x_text) > width or float(y_text) > height:
             raise JobEncodingError(f"Контур {number} выходит за рабочее поле после преобразования Xiao.")
         result.append((x_text, y_text))
 
-    if len(set(result)) < (3 if contour.closed else 2):
-        raise JobEncodingError(f"Контур {number} вырождается после округления координат Xiao.")
+    minimum = 3 if contour.closed else 2
+    if len(set(result)) < minimum:
+        raise JobEncodingError(f"Контур {number}: после округления координат Xiao до 0,001 мм "
+                               f"для реза нужно хотя бы {minimum} разных точек. Проверьте исходный чертёж.")
     return result
 
 

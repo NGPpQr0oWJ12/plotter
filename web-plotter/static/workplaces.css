@@ -195,46 +195,133 @@
   .workplace-clickable-card:hover { border-color: #555; background: #fafafa; box-shadow: inset 0 0 0 1px #555; }
 }
 
-/* Each pair of metric cells shares one track for its labels and one for its values. */
-@supports (grid-template-rows: subgrid) {
-  .workplace-order-list { row-gap: 0; }
+.workplace-order-tools, .workplace-order-filters, .workplace-order-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.workplace-order-tools { gap: 8px 16px; }
+.workplace-order-search {
+  display: flex;
+  flex: 1 1 15rem;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 24rem;
+  min-height: 44px;
+  padding: 0 11px;
+  border: 1px solid #aaa;
+  border-radius: 4px;
+  color: #393939;
+  background: #fff;
+}
+.workplace-order-search input { width: 100%; min-width: 0; padding: 7px 0; border: 0; outline: none; color: #171717; background: transparent; font-size: 16px; }
+.workplace-order-search:focus-within,
+:is(.workplace-order-filters, .workplace-order-pages) .button:focus-visible { outline: 2px solid #171717; outline-offset: 2px; }
+.workplace-order-filters .button[aria-pressed="true"] { border-color: #171717; background: #171717; color: #fff; }
+.workplace-order-results { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.workplace-order-pages { gap: 8px 12px; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.workplace-order-list > .workplace-order-empty { margin: 0; padding: 16px; border: 1px dashed #aaa; border-radius: 8px; color: #4b4b4b; }
+
+@media (min-width: 1050px) {
+  .workplace-order-results:has(> .workplace-order-pages:not([hidden])) { grid-template-columns: minmax(0, 1fr) max-content; }
+  .workplace-order-results > .workplace-order-list { grid-area: 1 / 1; }
+  .workplace-order-results > .workplace-order-pages {
+    position: sticky;
+    top: 12px;
+    grid-area: 1 / 2;
+    align-self: start;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 10px;
+    border: 1px solid #c4c4c4;
+    border-radius: 8px;
+    background: #f8f8f7;
+    text-align: center;
+  }
+}
+
+.workplace-cards.workplace-order-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.workplace-order-card { gap: 10px; padding: 12px clamp(12px, 1.5vw, 20px); }
+.workplace-order-card[data-order-status="pending"] {
+  --order-card-edge: #2864bd;
+  --order-card-ink: #1b4d98;
+  --order-card-hover: #f5f9ff;
+  --order-card-chip: #eaf2ff;
+  --order-card-dot-glow: 0 0 0 3px #c9ddff;
+}
+.workplace-order-card[data-order-status="active"] {
+  --order-card-edge: #167746;
+  --order-card-ink: #125a36;
+  --order-card-hover: #f4faf6;
+  --order-card-chip: #e8f7ee;
+  --order-card-dot-glow: 0 0 0 3px #c0ebcf;
+}
+.workplace-order-card[data-order-status="done"] {
+  --order-card-edge: #777d84;
+  --order-card-ink: #454a52;
+  --order-card-hover: #f7f7f8;
+  --order-card-chip: #f0f1f3;
+  --order-card-border-style: dashed;
+}
+.workplace-order-card:is([data-order-status="pending"], [data-order-status="active"], [data-order-status="done"]) {
+  border: 2px var(--order-card-border-style, solid) var(--order-card-edge);
+}
+.workplace-order-card:has(> .workplace-card-trigger:focus-visible) { outline-color: var(--order-card-edge, #171717); }
+@media (hover: hover) {
+  .workplace-order-card:is([data-order-status="pending"], [data-order-status="active"], [data-order-status="done"]):hover {
+    border-color: var(--order-card-edge);
+    background: var(--order-card-hover);
+    box-shadow: none;
+  }
+}
+.workplace-order-card .workplace-card-heading { align-items: center; gap: 6px 12px; }
+.workplace-order-card .workplace-card-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; }
+.workplace-order-card .workplace-card-identity p { flex-basis: 100%; margin: 0; font-size: 15px; }
+.workplace-order-card .workplace-card-heading h2 { color: #171717; font-size: clamp(21px, 2vw, 27px); }
+.workplace-order-card .workplace-chip { margin: 0; padding: 4px 8px; font-size: 13px; }
+.workplace-order-card:is([data-order-status="pending"], [data-order-status="active"], [data-order-status="done"]) .workplace-chip {
+  border-color: var(--order-card-edge);
+  background: var(--order-card-chip);
+  color: var(--order-card-ink);
+}
+.workplace-order-card:is([data-order-status="pending"], [data-order-status="active"], [data-order-status="done"]) .workplace-chip::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--order-card-edge);
+  box-shadow: var(--order-card-dot-glow, none);
+}
+.workplace-order-card .workplace-order-dates {
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid #c4c4c4;
+  border-radius: 6px;
+  background: #f6f6f6;
+}
+.workplace-order-card .workplace-order-dates > span { min-width: 0; gap: 2px; }
+.workplace-order-card .workplace-order-dates svg { width: 22px; height: 22px; }
+.workplace-order-card .workplace-order-dates time { font-size: clamp(20px, 2vw, 24px); line-height: 1.1; font-weight: 750; }
+.workplace-order-card > .workplace-progress { padding: 7px 10px 8px; }
+.workplace-order-card .workplace-stats { gap: 8px 14px; }
+.workplace-order-card .workplace-metrics { padding-top: 8px; }
+.workplace-order-card .workplace-metrics-title { margin-bottom: 6px; }
+.workplace-order-card .workplace-metric-note { grid-column: 1 / -1; }
+
+@media (min-width: 620px) {
+  .workplace-order-card .workplace-stats { grid-template-columns: minmax(0, 4fr) minmax(0, 5fr); }
+}
+@media (min-width: 960px) {
   .workplace-order-card {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: subgrid;
-    /* Header 3, fabrics 2, progress 2, material 5, time 7, and two optional notes. */
-    grid-row: span 21;
-    row-gap: 0;
-    margin-block-end: 16px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr);
+    grid-template-rows: auto auto 1fr;
+    grid-template-areas: "heading heading" "materials stats" "progress stats";
+    gap: 8px 22px;
   }
-  .workplace-order-card :is(.workplace-card-heading, .workplace-card-materials, .workplace-progress,
-    .workplace-stats, .workplace-metrics, .workplace-metrics dl, .workplace-metrics dl > div) {
-    display: grid;
-    grid-template-rows: subgrid;
-    row-gap: 0;
-  }
-  .workplace-order-card .workplace-card-heading { grid-row: span 3; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; }
-  .workplace-order-card .workplace-card-identity { display: contents; }
-  .workplace-order-card .workplace-chip { grid-area: 1 / 1; align-self: center; margin: 0; }
-  .workplace-order-card .workplace-order-dates { grid-area: 1 / 2; justify-self: end; align-self: center; min-width: 0; gap: 6px; }
-  .workplace-order-card .workplace-order-dates > span { display: flex; flex-wrap: wrap; justify-content: end; align-items: baseline; gap: 2px 5px; }
-  .workplace-order-card .workplace-card-heading h2 { grid-area: 2 / 1 / 3 / -1; margin-top: 8px; }
-  .workplace-order-card .workplace-card-identity p { grid-area: 3 / 1 / 4 / -1; }
-  .workplace-order-card .workplace-card-materials { grid-row: span 2; margin-top: 12px; }
-  .workplace-order-card .workplace-card-materials .workplace-order-label { margin-bottom: 3px; }
-  .workplace-order-card .workplace-progress { grid-row: span 2; margin-top: 12px; }
-  .workplace-order-card .workplace-progress progress { margin-top: 6px; }
-  .workplace-order-card .workplace-stats { grid-row: span 13; }
-  .workplace-order-card .workplace-metrics { grid-row: span 5; margin-top: 12px; padding-top: 10px; }
-  .workplace-order-card .workplace-metrics:nth-of-type(2) { grid-row: span 7; }
-  .workplace-order-card .workplace-metrics-title { margin-bottom: 8px; }
-  .workplace-order-card .workplace-metrics dl { grid-row: 2 / -1; column-gap: 0; }
-  .workplace-order-card .workplace-metrics dl > div { grid-row: span 2; align-items: start; }
-  .workplace-order-card .workplace-metrics dl > div:nth-child(odd) { padding-inline-end: 10px; }
-  .workplace-order-card .workplace-metrics dl > div:nth-child(even) { border-inline-start: 1px solid #d6d6d6; padding-inline-start: 10px; }
-  .workplace-order-card .workplace-metrics dl > div:nth-child(n + 3) { margin-top: 6px; padding-top: 6px; border-top: 1px solid #d6d6d6; }
-  .workplace-order-card .workplace-metric-note { grid-row: -2 / -1; margin-top: 8px; }
-  .workplace-order-card > .workplace-card-notes { grid-row: -2 / -1; margin-top: 10px; }
+  .workplace-order-card .workplace-card-heading { grid-area: heading; }
+  .workplace-order-card .workplace-card-materials { grid-area: materials; }
+  .workplace-order-card > .workplace-progress { grid-area: progress; align-self: start; }
+  .workplace-order-card .workplace-stats { grid-area: stats; }
+  .workplace-order-card .workplace-metrics dl { grid-template-columns: repeat(auto-fit, minmax(min(7.5rem, 100%), 1fr)); }
 }
 
 .registry-columns { display: grid; grid-template-columns: clamp(235px, 20vw, 375px) minmax(0, 1fr); gap: 0; flex: 1; min-height: 0; border: 1px solid #bfbfbf; }
