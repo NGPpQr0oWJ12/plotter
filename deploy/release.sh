@@ -98,8 +98,9 @@ copy_state() {
             if [[ -f $state/$file ]]; then cp -- "$state/$file" "$dest/$file"; fi
         done
     ) 8<"$state/workspace.json.lock"
-    if [[ -f $state/production.sqlite3 ]]; then
-        python3 - "$state/production.sqlite3" "$dest/production.sqlite3" <<'PY'
+    for file in production.sqlite3 labels.sqlite3; do
+        if [[ ! -f $state/$file ]]; then continue; fi
+        python3 - "$state/$file" "$dest/$file" <<'PY'
 from contextlib import closing
 from pathlib import Path
 import sqlite3
@@ -109,7 +110,7 @@ with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True))
     with closing(sqlite3.connect(sys.argv[2])) as target:
         source.backup(target)
 PY
-    fi
+    done
 }
 
 check_state() {

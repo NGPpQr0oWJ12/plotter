@@ -256,18 +256,19 @@ class ProductionTests(unittest.TestCase):
             default = self.store.workspace(material["id"], "design")["workspace"]
             self.assertEqual(default["paths"][0]["points"], before["workspace"]["paths"][0]["points"])
 
-    def test_existing_kit_layout_recovers_part_names_per_copy(self):
-        loose = self.store.save_registry({"kind": "part", "name": "Вставка", "entities": self.part["entities"]})
-        kit = self.store.save_registry({**self.kit, "members": [self.member(self.part, 2), self.member(loose)]})
+    def test_existing_kit_layout_recovers_display_numbers_by_part_identity(self):
+        loose = self.store.save_registry({"kind": "part", "name": self.part["name"], "entities": self.part["entities"]})
+        kit = self.store.save_registry({**self.kit, "members": [self.member(loose, 3), self.member(self.part, 2)]})
         draft = self.store.kit_layout(kit["id"], 1500, 1)
         for path in draft["workspace"]["paths"]:
             path["points"] = [[50 * path["partNumber"] - y, x + 10] for x, y in path["points"]]
             path["partAngle"] = 90
         saved = self.store.save_kit_layout(draft, verify_arrangement)
         paths = saved["workspace"]["paths"]
-        self.assertEqual([(p["partNumber"], p["partName"], p.get("productName")) for p in paths],
-                         [(1, "Сиденье", "Диван"), (2, "Сиденье", "Диван"), (3, "Вставка", None)])
-        legacy = {**saved["workspace"], "paths": [{k: v for k, v in path.items() if k not in ("partName", "productName")}
+        self.assertEqual([(p["partNumber"], p["partDisplayNumber"], p["partName"], p.get("productName")) for p in paths],
+                         [(1, "3/1", "Сиденье", None), (2, "3/2", "Сиденье", None), (3, "3/3", "Сиденье", None),
+                          (4, "5/1", "Сиденье", "Диван"), (5, "5/2", "Сиденье", "Диван")])
+        legacy = {**saved["workspace"], "paths": [{k: v for k, v in path.items() if k != "partDisplayNumber"}
                                                    for path in paths]}
         with self.store.connect(write=True) as db:
             db.execute("UPDATE kit_layouts SET data=? WHERE kit_id=?", (json.dumps(legacy), kit["id"]))
@@ -283,6 +284,7 @@ class ProductionTests(unittest.TestCase):
         for path in legacy["paths"]:
             path.pop("partName")
             path.pop("productName")
+            path.pop("partDisplayNumber")
         legacy["paths"][0]["points"][1][0] += 5
         with self.store.connect(write=True) as db:
             db.execute("UPDATE workspaces SET data=? WHERE cut_id=? AND mode='operator'", (json.dumps(legacy), cut_id))
@@ -290,6 +292,7 @@ class ProductionTests(unittest.TestCase):
         actual = restored["workspace"]["paths"]
         self.assertEqual([(p.get("partName"), p.get("productName")) for p in actual],
                          [(None, None), *(("Сиденье", "Диван"),) * 3])
+        self.assertEqual([p.get("partDisplayNumber") for p in actual], [None, "4/2", "4/3", "4/4"])
         self.assertEqual(restored["cutRevision"], saved["cutRevision"])
         persisted = self.store.save_workspace({"cutId": cut_id, **restored}, "operator", verify_arrangement)
         self.assertEqual(persisted["cutRevision"], saved["cutRevision"])

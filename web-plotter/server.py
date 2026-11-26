@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from base64 import b64encode
+from bisect import bisect_right
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from email.message import Message
@@ -20,7 +22,9 @@ import shutil
 import ssl
 import subprocess
 from struct import unpack_from
-from threading import Lock, Thread, Timer
+from sys import platform
+from threading import Event, Lock, Thread, Timer
+from time import monotonic
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
@@ -36,10 +40,11 @@ from cad import MAX_FILE_BYTES, dwg_available, import_drawing, repair_closed_con
 from controller import (ACTIVE_CONTROLLER_EVENTS, CONTROLLER_PORT, EXTERNAL_CUT_EVENTS, HOLD_LEASE_SECONDS, TICKS_PER_MM,
                         Controller)
 from cut_journal import MAX_EVENTS, CutJournal
-from cut_plan import EPSILON_MM, prepare_cut_plan
+from cut_plan import DEFAULT_WASTE_MARGIN_MM, prepare_cut_plan, section_local_limit, section_local_x
 from demo_controller import DemoController
 from designer_cad import edit_design, import_design, prepare_design
 from fit_jobs import FitJobs
+from label_queue import LabelQueue, part_ends
 from machine import PlotterError, Simulator, build_plan, number
 from nesting import MAX_PART_NUMBER, NestingFitError, annotate_notches, identify_parts, nest_paths
 from order_analysis import analysis_period, order_analysis
@@ -48,6 +53,7 @@ from panel_readback import PanelReadback
 from production_store import RECORD_REVISION_MESSAGE, ProductionStore, RecordNotFound, key, verify_arrangement
 from registry_archive import (MAX_REGISTRY_ARCHIVE, RAR_MIME, RAR_SIGNATURE, RegistryArchiveTooLarge,
                               read_registry_archive, write_registry_archive)
+from run_monitor import timestamp
 from sketchup_design import MAX_MARKUP_BYTES, MAX_SKP_BYTES, check_surface_edit, import_model, markup, transfer_manifest
 from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, WORKSPACE_REVISION_CONFLICT, WORKSPACE_REVISION_MESSAGE,
                        WorkspaceConflict, WorkspaceStore, drawing_paths, excluded_paths, validate_workspace)
@@ -63,14 +69,16 @@ LOCALIZED_XIAO = ROOT.parent / "builds" / "Xiao-RU-2022-09-18-v1" / "xiao.exe"
 STAGING = ROOT / "staging"
 LOCAL_ADDRESS = "127.0.0.1"
 DEFAULT_PORT = 8765
-API_VERSION = 22
+API_VERSION = 27
 COMPANION_PORT = 8767
 COMPANION_PROTOCOL = 1
+DIRECT_LABEL_ROUTES = frozenset({"/api/label-printers", "/api/label-print-part", "/api/labels-auto-relay"})
 HARDWARE_ROUTES = frozenset({"/api/status", "/api/cut-plan", "/api/controller", "/api/controller-live",
     "/api/controller-position", "/api/controller-job", "/api/controller-feed-mode", "/api/control-session",
     "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset",
     "/api/panel-snapshot", "/api/panel-compare", "/api/reachability", "/api/open-in-xiao", "/api/prepare-xiao",
-    "/api/cut-context"})
+    "/api/cut-context", "/api/labels-status", "/api/labels-print", "/api/labels-settings",
+    "/api/labels-pdf", "/api/labels-image", "/api/labels-auto"}) | DIRECT_LABEL_ROUTES
 RESTART_SAFE_ACTIONS = {
     "/api/controller-hold": "stop", "/api/controller-operation": "cancel-cut", "/api/control-session": "disarm",
 }
@@ -80,12 +88,17 @@ ROLL_PASS_LENGTH_MM = 2450
 PREVIEW_PAGE_ADD_MM = 0.12
 WORKSPACE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "Plotter" / "workspace.json"
 MAX_JSON = 16 * 1024 * 1024
+DEMO_CUT_CAPACITY = 32
+DEMO_CUT_IDLE_SECONDS = 15 * 60
 MIME = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/simulation.js": ("simulation.js", "text/javascript; charset=utf-8"),
     "/workplaces.js": ("workplaces.js", "text/javascript; charset=utf-8"),
+    "/labels.js": ("labels.js", "text/javascript; charset=utf-8"),
+    "/label-printer-settings.js": ("label-printer-settings.js", "text/javascript; charset=utf-8"),
+    "/labels.css": ("labels.css", "text/css; charset=utf-8"),
     "/confirm-action.js": ("confirm-action.js", "text/javascript; charset=utf-8"),
     "/workplaces.css": ("workplaces.css", "text/css; charset=utf-8"),
     "/designer-cad.js": ("designer-cad.js", "text/javascript; charset=utf-8"),
@@ -301,14 +314,18 @@ def drawing_key(job, filename, width, height, page_add, *, roll=False):
     paths = [{"layer": path.get("layer", "0"), "closed": path.get("closed", False),
               "points": [[float(x), float(y)] for x, y in path["points"]]} for path in job["paths"]]
     optimize = job.get("optimize", True)
-    if roll or optimize:
+    trims_planned = job.get("materialWidthMm") is not None
+    if roll or optimize or trims_planned:
         for source, path in zip(job["paths"], paths):
             part_number = source.get("partNumber")
             if type(part_number) is int and 1 <= part_number <= MAX_PART_NUMBER:
                 path["partNumber"] = part_number
-            if optimize and source.get("notch") is True:
+            if (optimize or trims_planned) and source.get("notch") is True:
                 path["notch"] = True
     document = [filename, width, height, page_add, CUT_TOOL, paths, optimize]
+    if trims_planned:
+        margin = job.get("materialMarginMm") or DEFAULT_WASTE_MARGIN_MM
+        document.append(["waste-trim-v1", float(job["materialWidthMm"]), float(margin)])
     if roll:
         document.append(ROLL_PASS_LENGTH_MM)
     if "cutContext" in job:
@@ -317,14 +334,9 @@ def drawing_key(job, filename, width, height, page_add, *, roll=False):
 
 
 def translated_page_paths(page, max_x):
-    start_x = page["startX"]
-
-    def local_x(x):
-        local = x - start_x
-        # Subtraction at a late roll boundary can round just beyond the working span.
-        return max_x if max_x < local <= max_x + EPSILON_MM else local
-
-    return [{**path, "points": [[local_x(x), y] for x, y in path["points"]]} for path in page["paths"]]
+    paths = [*page["paths"], *page.get("wasteTrim", {}).get("paths", [])]
+    return [{**path, "points": [[section_local_x(x, page["startX"], max_x), y] for x, y in path["points"]]}
+            for path in paths]
 
 
 def describe_section_continuations(plan, job):
@@ -356,9 +368,7 @@ def describe_section_continuations(plan, job):
 
 
 def encode_cut_section(page, width, height, page_add):
-    local_limit = width - max(page_add, COORDINATE_OFFSET_MM)
-    if local_limit + page_add > width:
-        local_limit = math.nextafter(local_limit, 0)
+    local_limit = section_local_limit(width, page_add)
     plan = build_plan({"paths": translated_page_paths(page, local_limit)}, width, height)
     return prepare_single_page(plan, tool=CUT_TOOL, width=width, height=height, page_add_mm=page_add)
 
@@ -461,12 +471,13 @@ def single_page_xiao_settings(executable, machine_ip):
 
 
 class PlotterState:
-    def __init__(self, profile, workspace, workspace_lock, *, demo=False, central=False, companion=False):
+    def __init__(self, profile, workspace, workspace_lock, *, demo=False, central=False, companion=False, demo_cut_id=None):
         config = profile["observedComputerConfiguration"]
         board = profile.get("observedControllerConfiguration", {})
         bounds = board.get("workrectMm", config["workrectMm"])
         width, height = bounds["x"], bounds["y"]
         self.demo_mode = demo
+        self.demo_cut_id = demo_cut_id
         self.central_mode = central
         self.companion_mode = companion
         self.simulator = Simulator(width, height)
@@ -481,6 +492,12 @@ class PlotterState:
         self.loaded_plan = None
         self.roll = None
         self.cut_progress = None
+        self.label_run = None
+        self.label_thresholds = {}
+        self.label_position = None
+        self.label_monitor = None
+        self.label_shutdown = Event()
+        self.last_live_read = 0
         self.cut_journal = CutJournal(None if demo else workspace.path.with_name("cut-journal.json"))
         if demo:
             self.controller = DemoController(width, height)
@@ -641,6 +658,57 @@ class PlotterState:
                 )
             progress = replace(progress, state=state)
         self.cut_progress = progress
+        self.observe_labels(progress)
+
+    def observe_labels(self, progress):
+        if self.label_run and progress.state == "cancelled":
+            self.close_label_run()
+            return
+        if not self.label_run or not progress.fresh or progress.started_at is None:
+            return
+        if progress.state not in ("running", "paused", "pausing", "resuming", "advance", "completed"):
+            return
+        index = bisect_right(self.label_thresholds.get(progress.page, ()), progress.index)
+        completed = progress.state == "completed"
+        position = (progress.page, index, completed)
+        if position != self.label_position:
+            try:
+                self.labels.observe(self.label_run, progress.page, progress.index, complete=completed,
+                                    completed_ms=progress.ended_at)
+                self.label_position = position
+            except Exception:
+                LOGGER.exception("Не удалось обновить очередь бирок")
+
+    def watch_label_progress(self):
+        # A closed browser must not leave verified pieces unlabelled. Use the usual
+        # readback if the operator UI is not already reading from the controller.
+        while not self.label_shutdown.wait(0.5):
+            progress = self.cut_progress
+            if (self.label_run and progress and progress.state not in ("cancelled", "advance", "completed")
+                    and monotonic() - self.last_live_read >= 1):
+                try:
+                    self.read_live()
+                except Exception:
+                    LOGGER.exception("Не удалось прочитать состояние реза для бирок")
+
+    def register_label_run(self, source, preview, previous, previous_progress):
+        cut, revision = source["cutContext"]
+        # Reloading a ready page and advancing a roll retain the same physical run.
+        if self.label_run and (previous or previous_progress and previous_progress.state == "ready"
+                               and previous_progress.plan_id == preview["planId"]):
+            return
+        ends = part_ends(source["paths"], preview["pages"])
+        run = self.labels.begin(cut, "demo" if self.demo_mode else "operator", revision,
+                                self.cut_progress.first_page, ends)
+        self.label_run, self.label_position = run, None
+        self.label_thresholds = {}
+        for _, _, _, page, vertex in ends:
+            self.label_thresholds.setdefault(page, []).append(vertex)
+        for vertices in self.label_thresholds.values():
+            vertices.sort()
+        if self.label_monitor is None:
+            self.label_monitor = Thread(target=self.watch_label_progress, name="label-cut-observer", daemon=True)
+            self.label_monitor.start()
 
     def verify_roll_advance(self, *, positioning=False):
         # Completion was already recorded before the operator moved the fabric.
@@ -754,6 +822,7 @@ class PlotterState:
                 "kind": "cut" if drawing else "travel", "source": source}
 
     def read_live(self):
+        self.last_live_read = monotonic()
         expected_roll = self.roll
         expected_progress = self.cut_progress
         result = self.controller.read_live()
@@ -763,6 +832,8 @@ class PlotterState:
             if self.cut_progress is expected_progress:
                 self.observe_cut_progress(result)
                 progress = self.cut_progress
+                if progress and progress.state == "completed":
+                    self.observe_labels(progress)
                 if (result.get("position") and not result.get("busy") and progress and progress.fresh and progress.state in
                         ("ready", "starting", "running", "pausing", "paused", "resuming", "cancelling")):
                     position = result["position"]
@@ -799,9 +870,18 @@ class PlotterState:
             return self.cut_status()
 
     def clear_cut(self):
+        self.close_label_run()
         self.roll = None
         self.loaded_plan = None
         self.cut_progress = None
+
+    def close_label_run(self):
+        if self.label_run:
+            try:
+                self.labels.abandon(self.label_run)
+            except Exception:
+                LOGGER.exception("Не удалось закрыть очередь бирок для раскроя")
+            self.label_run = self.label_position = None
 
     def owns_drawing(self):
         return (self.loaded_plan is not None and self.cut_progress is None
@@ -898,11 +978,19 @@ class PlotterState:
         cut_id = data.get("cutId")
         if cut_id is not None:
             key(cut_id)
+        if self.demo_cut_id is not None and cut_id != self.demo_cut_id:
+            raise WorkspaceConflict("Выбран другой материал демораскроя.")
         action = data.get("action")
+        resume_only = data.get("resumeOnly", False)
+        if type(resume_only) is not bool:
+            raise ValueError("Проверьте режим возобновления демораскроя.")
         if action not in ("select", "finish", "release") or action != "select" and (cut_id is None or self.demo_mode):
             raise ValueError("Выберите допустимое действие для раскроя.")
         with request_lock(self.motion_start_lock, "Дождитесь текущего действия."), \
                 request_lock(self.upload_lock, "Дождитесь завершения передачи."), self.workspace_lock:
+            if resume_only and (not self.demo_mode or self.demo_cut_id is not None or action != "select"
+                                or cut_id is None or cut_id != self.selected_cut):
+                raise WorkspaceConflict("Прежняя демосессия больше не открыта для этого материала.")
             if action == "release":
                 if cut_id != self.selected_cut or not self.can_release_cut():
                     raise WorkspaceConflict("Вернуть в очередь можно только открытый здесь раскрой, ещё не переданный на станок.")
@@ -967,7 +1055,7 @@ class PlotterState:
         if page_add is None or not plan["canPrepareXiao"]:
             return plan
         for page in plan["pages"]:
-            if not page["paths"]:
+            if not page["paths"] and not page.get("wasteTrim", {}).get("paths"):
                 plan["uploadIssue"] = (f"На проходе {page['number']} нет резов. Сдвиньте детали ближе к началу "
                                        "раскладки или откройте раскладку в Xiao.")
                 return plan
@@ -976,7 +1064,11 @@ class PlotterState:
             except (PlotterError, JobEncodingError) as error:
                 plan["uploadIssue"] = f"Проход {page['number']} нельзя загрузить. {error}"
                 return plan
-            page["pathEndIndices"] = list(encoded[0].path_end_indices)
+            ends = encoded[0].path_end_indices
+            part_paths = len(page["paths"])
+            page["pathEndIndices"] = list(ends[:part_paths])
+            if "wasteTrim" in page:
+                page["wasteTrim"]["pathEndIndices"] = list(ends[part_paths:])
             if encoded_pages is not None:
                 encoded_pages.append(encoded)
         plan["canUpload"] = True
@@ -1107,6 +1199,12 @@ class PlotterState:
                 self.cut_progress = self.record_cut_event(
                     self.cut_progress, "page_ready", f"Проход {page_number} загружен.",
                 )
+                if source.get("cutContext"):
+                    try:
+                        self.register_label_run(source, preview, previous, previous_progress)
+                    except Exception:
+                        self.label_run = None
+                        LOGGER.exception("Не удалось подготовить бирки для загруженного раскроя")
             elif result.get("uploadUncertain"):
                 self.cut_progress = replace(self.cut_progress, state="unknown")
             else:
@@ -1237,6 +1335,13 @@ class PlotterState:
             message = "Проверка ping недоступна или истекло время ожидания."
         return {"reachable": reachable, "ip": self.machine_ip, "message": message}
 
+@dataclass
+class DemoCutScope:
+    plotter: PlotterState
+    last_used: float
+    requests: int = 0
+
+
 class PlotterServer(PlotterState, ThreadingHTTPServer):
     def __init__(self, port, workspace_path=WORKSPACE_PATH, *, profile_path=None, public_origin=None,
                  companion_origin=None, central_ca=None, companion_installer=None):
@@ -1258,7 +1363,18 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         PlotterState.__init__(self, profile, workspace, workspace_lock, central=bool(self.public_origin),
                               companion=bool(self.companion_origin))
         self.demo = PlotterState(profile, workspace, workspace_lock, demo=True, central=self.central_mode)
+        self.demo_profile = profile
+        self.demo_scopes = {}
+        self.demo_scopes_lock = Lock()
+        self.demo_saves = set()
+        self.legacy_demo_selection = None
+        self.demo_scopes_closed = False
         self.production = self.demo.production = ProductionStore(Path(workspace_path).with_name("production.sqlite3"))
+        self.labels = self.demo.labels = LabelQueue(
+            Path(workspace_path).with_name("labels.sqlite3"), self.label_bundle, local_spool=self.local_label_spooling,
+            relay=self.label_auto_relay if isinstance(workspace, CompanionWorkspace) else None,
+        )
+        self.labels.resume_pending()
         self.production.configure_metrics(self.verify_production_layout)
         self.sketchup_design = os.name == "nt" and not (self.central_mode or self.companion_mode)
         self.sketchup_lock = Lock()
@@ -1278,6 +1394,159 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
             self.hosts.add(urlsplit(self.public_origin).netloc)
             if urlsplit(self.public_origin).port is None:
                 self.hosts.add(urlsplit(self.public_origin).netloc + ":443")
+
+    @staticmethod
+    def demo_scope_idle(scope):
+        state = scope.plotter
+        if scope.requests or not state.workspace_lock.acquire(blocking=False):
+            return False
+        try:
+            if state.owns_drawing() or state.controller.control_is_armed():
+                return False
+            try:
+                state.verify_new_cut_idle(state.controller.read_live())
+            except RequestError:
+                return False
+            return True
+        finally:
+            state.workspace_lock.release()
+
+    def evict_demo_scopes(self, now):
+        evicted = []
+        for cut_id, scope in sorted(self.demo_scopes.items(), key=lambda item: item[1].last_used):
+            if now - scope.last_used < DEMO_CUT_IDLE_SECONDS and len(self.demo_scopes) < DEMO_CUT_CAPACITY:
+                break
+            if self.demo_scope_idle(scope):
+                state = self.demo_scopes.pop(cut_id).plotter
+                state.label_shutdown.set()
+                evicted.append(state)
+        return evicted
+
+    def detach_empty_legacy_demo(self, cut_id):
+        state = self.demo
+        with ExitStack() as stack:
+            for lock in (state.motion_start_lock, state.upload_lock, state.workspace_lock):
+                if not lock.acquire(blocking=False):
+                    return False
+                stack.callback(lock.release)
+            if state.selected_cut != cut_id:
+                return True
+            if state.roll or state.cut_progress or state.loaded_plan or state.controller.control_is_armed():
+                return False
+            try:
+                state.verify_new_cut_idle(state.controller.read_live())
+            except RequestError:
+                return False
+            state.selected_cut = state.releasable_cut = None
+            return True
+
+    def check_demo_cut_available(self, cut_id, *, takeover=False):
+        if self.demo_scopes_closed:
+            raise RequestError("Демостанок останавливается.", HTTPStatus.SERVICE_UNAVAILABLE)
+        if (cut_id == self.legacy_demo_selection or cut_id == self.demo.selected_cut
+                and not (takeover and self.detach_empty_legacy_demo(cut_id))):
+            raise WorkspaceConflict("Этот материал открыт в прежней демосессии.", code="demo_legacy_cut")
+
+    @contextmanager
+    def select_legacy_demo(self, cut_id):
+        key(cut_id)
+        with self.demo_scopes_lock:
+            scope = self.demo_scopes.get(cut_id)
+            if (scope and (scope.plotter.selected_cut is None or monotonic() - scope.last_used >= DEMO_CUT_IDLE_SECONDS)
+                    and self.demo_scope_idle(scope)):
+                self.demo_scopes.pop(cut_id).plotter.label_shutdown.set()
+                scope = None
+            if scope:
+                raise WorkspaceConflict("Этот материал открыт в другой демосессии.", code="demo_cut_in_use")
+            if self.legacy_demo_selection is not None:
+                raise WorkspaceConflict("Дождитесь открытия демораскроя.")
+            self.legacy_demo_selection = cut_id
+        try:
+            yield
+        finally:
+            with self.demo_scopes_lock:
+                self.legacy_demo_selection = None
+
+    @contextmanager
+    def scoped_demo(self, cut_id):
+        evicted = []
+        with self.demo_scopes_lock:
+            scope = self.demo_scopes.get(cut_id)
+            if scope:
+                self.check_demo_cut_available(cut_id)
+                scope.requests += 1
+        if not scope:
+            # Network validation on a companion must leave other virtual cutters accessible.
+            self.read_production(cut_id, "demo")
+            with self.demo_scopes_lock:
+                scope = self.demo_scopes.get(cut_id)
+                if scope:
+                    self.check_demo_cut_available(cut_id)
+                else:
+                    if cut_id in self.demo_saves:
+                        raise WorkspaceConflict("Дождитесь сохранения раскладки для этого материала.")
+                    now = monotonic()
+                    evicted = self.evict_demo_scopes(now)
+                    if len(self.demo_scopes) >= DEMO_CUT_CAPACITY:
+                        raise WorkspaceConflict("Все виртуальные станки заняты. Завершите один из демораскроев.")
+                    self.check_demo_cut_available(cut_id, takeover=True)
+                    state = PlotterState(self.demo_profile, self.workspace, Lock(), demo=True, central=self.central_mode,
+                                         demo_cut_id=cut_id)
+                    state.production, state.labels = self.production, self.labels
+                    scope = self.demo_scopes[cut_id] = DemoCutScope(state, now)
+                scope.requests += 1
+        try:
+            deadline = monotonic() + 0.1
+            for state in evicted:
+                if state.label_monitor:
+                    state.label_monitor.join(timeout=max(0, deadline - monotonic()))
+            yield scope.plotter
+        finally:
+            with self.demo_scopes_lock:
+                scope.requests -= 1
+                scope.last_used = monotonic()
+
+    @contextmanager
+    def guard_demo_workspace(self, cut_id, *, write=False, part_correction=False):
+        key(cut_id)
+        with self.demo_scopes_lock:
+            scope = self.demo_scopes.get(cut_id)
+            if write and cut_id in self.demo_saves:
+                raise WorkspaceConflict("Дождитесь сохранения раскладки для этого материала.")
+            if write:
+                self.demo_saves.add(cut_id)
+            if scope:
+                scope.requests += 1
+        try:
+            scoped = scope.plotter if scope else None
+            with ExitStack() as stack:
+                if write and part_correction:
+                    targets = [self.demo] if self.demo.selected_cut == cut_id else []
+                    if scoped:
+                        targets.append(scoped)
+                    for target in targets:
+                        stack.enter_context(request_lock(target.motion_start_lock, "Дождитесь текущего действия."))
+                        stack.enter_context(request_lock(target.upload_lock, "Дождитесь завершения передачи задания."))
+                if write:
+                    stack.enter_context(self.workspace_lock)
+                if scoped:
+                    stack.enter_context(scoped.workspace_lock)
+                if write and any(state and state.selected_cut == cut_id
+                                 and (state.owns_drawing() or state.controller.upload_in_progress)
+                                 for state in (self.demo, scoped)):
+                    raise WorkspaceConflict("Раскладка используется виртуальным станком. Завершите или сбросьте раскрой.",
+                                            code=WORKSPACE_IN_USE)
+                yield
+        finally:
+            with self.demo_scopes_lock:
+                if write:
+                    self.demo_saves.remove(cut_id)
+                if scope:
+                    scope.requests -= 1
+
+    def active_plotters(self):
+        with self.demo_scopes_lock:
+            return (self, self.demo, *(scope.plotter for scope in self.demo_scopes.values()))
 
     @contextmanager
     def guard_part_correction(self, cut_id, plotters):
@@ -1306,6 +1575,8 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         return result
 
     def new_cut(self, plotter, data):
+        if plotter.demo_cut_id is not None:
+            raise WorkspaceConflict("Откройте самостоятельный раскрой перед очисткой.")
         if data.get("stopped") is not True:
             raise RequestError("Подтвердите, что плоттер остановлен.")
         revision = data.get("revision")
@@ -1333,14 +1604,41 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
                 other.clear_cut()
                 return {**result, **plotter.cut_status()}
 
+    def label_bundle(self, cut, mode, revision=None):
+        if isinstance(self.workspace, CompanionWorkspace):
+            return self.workspace.production_request("/api/label-source", {"cutId": cut, "mode": mode,
+                                                                           "cutRevision": revision})
+        from label_layout import store_label_context
+        context = store_label_context(self.production, cut, mode)
+        if revision is not None and revision != context["cutRevision"]:
+            raise WorkspaceConflict("Раскладка изменилась с момента загрузки. Сверьте бирки с нарядом.")
+        return {**context, **self.labels.templates()}
+
+    def local_label_spooling(self):
+        return platform == "win32" and (not self.public_origin
+                                       or urlsplit(self.public_origin).hostname in (LOCAL_ADDRESS, "localhost"))
+
+    def label_auto_relay(self, data):
+        return self.workspace.production_request("/api/labels-auto-source", data)
+
     def server_close(self):
+        with self.demo_scopes_lock:
+            self.demo_scopes_closed = True
+        plotters = self.active_plotters()
+        for state in plotters:
+            state.label_shutdown.set()
+        deadline = monotonic() + 2
+        for state in plotters:
+            if state.label_monitor:
+                state.label_monitor.join(timeout=max(0, deadline - monotonic()))
+        self.labels.close()
         self.fit_jobs.close()
-        self.controller.stop_active_hold()
-        self.demo.controller.stop_active_hold()
+        for state in plotters:
+            state.controller.stop_active_hold()
         super().server_close()
 
     def verify_update_idle(self):
-        for plotter in (self, self.demo):
+        for plotter in self.active_plotters():
             if plotter.owns_drawing() or plotter.controller.control_is_armed():
                 raise UpdateError("Завершите текущий раскрой и выключите управление станком.")
             try:
@@ -1402,23 +1700,33 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("Недопустимый адрес запроса.")
             path = result.path
             self.plotter = self.server
+            self.demo_cut_scope = None
             if (self.server.companion_mode and not self.server.local_companion_ui
-                    and path not in HARDWARE_ROUTES | {"/api/new-cut"}):
+                    and path not in HARDWARE_ROUTES | {"/api/new-cut"}
+                    and not (path.startswith("/demo/api/") and path.removeprefix("/demo") in DIRECT_LABEL_ROUTES)):
                 raise RequestError("Этот запрос обслуживает сервер раскладки.", HTTPStatus.NOT_FOUND)
             if path.startswith("/demo/api/"):
                 self.plotter = self.server.demo
                 path = path.removeprefix("/demo")
                 if path in ("/api/open-in-xiao", "/api/stage", "/api/reveal"):
                     raise RequestError("В демо-режиме можно скачать DXF.", HTTPStatus.FORBIDDEN)
-            elif self.server.central_mode and path in HARDWARE_ROUTES - {"/api/status", "/api/cut-plan", "/api/prepare-xiao", "/api/controller-live", "/api/cut-context"}:
+                demo_cut = self.headers.get("X-Plotter-Demo-Cut")
+                if demo_cut is not None:
+                    if (self.headers.get("Sec-Fetch-Site") in ("same-site", "cross-site")
+                            or self.server.companion_mode and not self.server.local_companion_ui):
+                        raise RequestError("Откройте демораскрой на этом сервере.", HTTPStatus.FORBIDDEN)
+                    self.demo_cut_scope = key(demo_cut)
+            elif self.server.central_mode and path in HARDWARE_ROUTES - DIRECT_LABEL_ROUTES - {
+                    "/api/status", "/api/cut-plan", "/api/prepare-xiao", "/api/controller-live", "/api/cut-context", "/api/labels-pdf"}:
                 raise RequestError("Для управления станком подключите помощник на компьютере оператора.", HTTPStatus.FORBIDDEN)
             if self.server.central_mode and path in ("/api/stage", "/api/reveal"):
                 raise RequestError("Скачайте DXF на компьютер оператора.", HTTPStatus.FORBIDDEN)
-            if (self.server.app_updates.supported and self.command == "POST"
-                    and path not in RESTART_SAFE_ACTIONS and path not in ("/api/app-update", "/api/controller-live")):
-                with self.server.app_updates.protected_request():
-                    route(path, result.query)
-            else:
+            with ExitStack() as stack:
+                if (self.server.app_updates.supported and self.command == "POST"
+                        and path not in RESTART_SAFE_ACTIONS and path not in ("/api/app-update", "/api/controller-live")):
+                    stack.enter_context(self.server.app_updates.protected_request())
+                if self.demo_cut_scope and path in HARDWARE_ROUTES | {"/api/workspace", "/api/new-cut", "/api/command", "/api/plan"}:
+                    self.plotter = stack.enter_context(self.server.scoped_demo(self.demo_cut_scope))
                 route(path, result.query)
         except UpdateError as error:
             self.json_response({"error": str(error)}, HTTPStatus.CONFLICT)
@@ -1453,7 +1761,8 @@ class Handler(BaseHTTPRequestHandler):
             name, content_type = MIME[path]
             self.respond((ROOT / "static" / name).read_bytes(), content_type)
         elif path == "/api/status":
-            self.json_response({**self.plotter.status(), "companionRevision": self.server.app_updates.revision})
+            self.json_response({**self.plotter.status(), "companionRevision": self.server.app_updates.revision,
+                                "localLabelPrinting": self.local_label_printing(), "scopedDemoCuts": True})
         elif path == "/api/app-update":
             self.json_response({**self.server.app_updates.status(), "companionDownload": self.companion_download_available()})
         elif path == "/api/release-notes":
@@ -1466,7 +1775,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/demo":
             self.json_response(demo_drawing())
         elif path == "/api/workspace":
-            self.json_response(self.plotter.workspace.read())
+            result = (self.plotter.read_production(self.demo_cut_scope, "demo") if self.demo_cut_scope
+                      else self.plotter.workspace.read())
+            self.json_response(result)
+        elif path == "/api/label-templates":
+            self.json_response(self.server.workspace.production_request(path) if self.server.local_companion_ui
+                               else self.server.labels.templates())
+        elif path == "/api/label-printers":
+            self.direct_label_command(path)
         elif path == "/api/cad/3d/fit":
             self.require_sketchup_design()
             identifier = parse_qs(query, max_num_fields=2).get("id", [""])[0]
@@ -1550,7 +1866,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_companion_file(payload, "application/zip", COMPANION_UPDATE)
 
     def post(self, path, query):
-        if path == "/api/app-update":
+        if path == "/api/workspace" and self.demo_cut_scope:
+            raise WorkspaceConflict("Сохраните раскладку в текущем материале демораскроя.")
+        if path in ("/api/label-templates", "/api/label-preview", "/api/label-source"):
+            self.label_design(path)
+        elif path in ("/api/labels-status", "/api/labels-settings", "/api/labels-print",
+                      "/api/labels-image", "/api/labels-pdf", "/api/labels-auto"):
+            self.operator_labels(path)
+        elif path in DIRECT_LABEL_ROUTES:
+            self.direct_label_command(path, self.json_body(4096))
+        elif path == "/api/labels-auto-source":
+            if not self.server.central_mode or self.server.local_label_spooling():
+                raise RequestError("Передача автоматических бирок доступна центральному демораскрою.", HTTPStatus.FORBIDDEN)
+            data = self.json_body(4096)
+            self.json_response(self.server.labels.relay_source(key(data.get("cutId")), data.get("relayKey"), data.get("station"),
+                                                               data.get("take"), data.get("jobId"), data.get("status")))
+        elif path == "/api/app-update":
             data = self.json_body(4096)
             self.server.app_updates.start(data.get("version"), self.server.verify_update_idle, revision=data.get("revision"))
             self.json_response(self.server.app_updates.status(), HTTPStatus.ACCEPTED)
@@ -1582,7 +1913,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/registry-backup":
             self.post_registry_backup()
         elif path == "/api/cut-context":
-            self.json_response(self.plotter.change_cut_context(self.json_body(4096)))
+            data = self.json_body(4096)
+            if self.plotter is self.server.demo and data.get("action") == "select" and data.get("cutId") is not None:
+                with self.server.select_legacy_demo(data["cutId"]):
+                    result = self.plotter.change_cut_context(data)
+            else:
+                result = self.plotter.change_cut_context(data)
+            self.json_response(result)
         elif path == "/api/close-contours":
             data = self.json_body(MAX_WORKSPACE_BYTES)
             paths = drawing_paths(data.get("paths"))
@@ -1674,7 +2011,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/controller-feed-mode":
                 self.json_response(self.plotter.controller.read_feed_mode())
             elif path == "/api/controller-upload":
-                self.json_response(self.plotter.upload(data))
+                result = self.plotter.upload(data)
+                if result.get("jobReceipt"):
+                    try:
+                        result.update(self.remote_label_offer(data.get("cutId")))
+                    except Exception:
+                        LOGGER.exception("Не удалось получить разрешение передачи автоматических бирок")
+                self.json_response(result)
             elif path == "/api/reveal":
                 self.reveal(data.get("filename"))
             else:
@@ -1698,6 +2041,122 @@ class Handler(BaseHTTPRequestHandler):
     def require_sketchup_design(self):
         if not self.server.sketchup_design:
             raise RequestError("Работа с моделями SketchUp доступна в локальном Plotter для Windows.", HTTPStatus.NOT_FOUND)
+
+    def label_design(self, path):
+        from label_layout import editable_template, master_label_fields, render_label
+        data = self.json_body(MAX_JSON)
+        if self.server.local_companion_ui:
+            self.json_response(self.server.workspace.production_request(path, data))
+            return
+        kind = data.get("kind")
+        if path == "/api/label-templates":
+            self.json_response(self.server.labels.save_template(kind, data.get("template"), data.get("revision")))
+            return
+        cut = key(data.get("cutId"))
+        mode = data.get("mode", "preview" if path == "/api/label-preview" else "operator")
+        if mode not in (("preview", "operator", "demo") if path == "/api/label-preview" else ("operator", "demo")):
+            raise ValueError("Выберите режим раскроя.")
+        bundle = self.server.label_bundle(cut, mode, data.get("cutRevision"))
+        if path == "/api/label-source":
+            self.json_response(bundle)
+            return
+        if kind not in ("part", "master"):
+            raise ValueError("Выберите шаблон бирки.")
+        templates, parts = bundle["templates"], bundle["parts"]
+        chosen = data.get("partKey") or next(iter(parts), None)
+        if kind == "part" and (not isinstance(chosen, str) or chosen not in parts):
+            raise ValueError("В материале нет выбранной детали.")
+        fields = parts[chosen] if kind == "part" else master_label_fields(bundle["master"], timestamp())
+        image, warnings = render_label(editable_template(kind, data.get("template", templates[kind])), fields)
+        self.json_response({"image": "data:image/png;base64," + b64encode(image).decode("ascii"), "warnings": warnings,
+                            "parts": [{"key": k, "name": f["name"], "number": f["number"]} for k, f in parts.items()]})
+
+    def operator_labels(self, path):
+        from label_layout import label_pdf, render_label
+        data = self.json_body(MAX_JSON)
+        cut = key(data.get("cutId"))
+        state = self.plotter
+        mode = "demo" if state.demo_mode else "operator"
+        queue = state.labels
+        if path == "/api/labels-settings":
+            # Drain any already-confirmed progress under the old setting first.
+            active = state.selected_cut == cut and state.label_run and state.cut_progress
+            if active and active.state not in ("ready", "advance", "completed", "cancelled"):
+                state.read_live()
+            with state.workspace_lock:
+                progress = state.cut_progress
+                if (data.get("enabled") is True and state.selected_cut == cut and progress
+                        and progress.state not in ("ready", "advance", "completed", "cancelled") and not progress.fresh):
+                    raise WorkspaceConflict("Для включения печати дождитесь подтверждения позиции плоттера.")
+                queue.configure(cut, mode, data.get("enabled"))
+        elif path == "/api/labels-print":
+            queue.manual(cut, mode, data.get("runId"), data.get("keys"), data.get("requestId"))
+        elif path == "/api/labels-pdf":
+            ids, part_key = data.get("ids"), data.get("key")
+            if ids is not None and part_key is not None:
+                raise ValueError("Выберите деталь или бирки из ленты.")
+            pages = (queue.pages(cut, mode, ids) if ids is not None
+                     else queue.manual_pages(cut, mode, part_key, data.get("cutRevision")))
+            self.respond(label_pdf(pages), "application/pdf", filename="labels.pdf", fallback_filename="labels.pdf")
+            return
+        elif path == "/api/labels-auto":
+            # Older clients used this endpoint to download automatic PDFs.
+            self.respond(b"", "text/plain", HTTPStatus.NO_CONTENT)
+            return
+        elif path == "/api/labels-image":
+            page, = queue.pages(cut, mode, [data.get("id")])
+            image, warnings = render_label(*page)
+            self.json_response({"image": "data:image/png;base64," + b64encode(image).decode("ascii"), "warnings": warnings})
+            return
+        status = queue.status(cut, mode)
+        controlled = path == "/api/labels-settings" and data.get("enabled") is True and data.get("relay") is True
+        if state.demo_mode and state.selected_cut == cut and self.server.central_mode and data.get("controlToken"):
+            try:
+                state.controller.require_control(data["controlToken"])
+            except ValueError:
+                pass
+            else:
+                controlled = True
+        status["autoRelay"] = False
+        if controlled and status["enabled"]:
+            status.update(self.remote_label_offer(cut))
+        self.json_response(status)
+
+    def remote_label_offer(self, cut):
+        state = self.plotter
+        if (not cut or cut != state.selected_cut or not state.demo_mode or not self.server.central_mode
+                or self.server.local_label_spooling() or not state.label_run):
+            return {}
+        token = state.labels.relay_key(cut, state.label_run)
+        return {"autoRelay": True, "enabled": True, "relayKey": token} if token else {}
+
+    def local_label_printing(self):
+        host = self.headers.get("Host", "").lower()
+        return self.server.local_label_spooling() and host in {f"{LOCAL_ADDRESS}:{self.server.server_port}",
+                                                               f"localhost:{self.server.server_port}"}
+
+    def direct_label_command(self, path, data=None):
+        if not self.local_label_printing():
+            raise RequestError("Прямая печать доступна в локальном Plotter для Windows или через помощник.",
+                               HTTPStatus.FORBIDDEN)
+        queue = self.server.labels
+        if path == "/api/labels-auto-relay":
+            queue.register_relay(key(data.get("cutId")), data.get("relayKey"))
+            result = {"registered": True}
+        elif path == "/api/label-printers":
+            try:
+                result = queue.printer_settings() if data is None else queue.select_printer(data.get("printer"))
+            except OSError as error:
+                raise RequestError("Не удалось получить список принтеров Windows.", HTTPStatus.SERVICE_UNAVAILABLE) from error
+        else:
+            mode = data.get("mode")
+            if data.get("confirmed") is not True:
+                raise ValueError("Подтвердите печать одной бирки на выбранном принтере.")
+            if mode not in ("operator", "demo") or self.plotter.demo_mode and mode != "demo":
+                raise ValueError("Проверьте режим раскроя для печати бирки.")
+            result = queue.print_part(key(data.get("cutId")), mode, data.get("cutRevision"), data.get("partKey"),
+                                      data.get("printer"), data.get("requestId"))
+        self.json_response(result)
 
     def post_sketchup_design(self, path, query):
         self.require_sketchup_design()
@@ -1859,6 +2318,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_production(self, path, query):
         params = {key: values[0] for key, values in parse_qs(query, max_num_fields=4).items()}
+        if path == "/api/operator-workspace" and params.get("mode") == "demo":
+            cut_id = params.get("cutId")
+            with self.server.guard_demo_workspace(cut_id):
+                result = self.server.read_production(cut_id, "demo")
+            self.json_response(result)
+            return
         if self.server.local_companion_ui:
             self.json_response(self.server.workspace.production_request(path + "?" + urlencode(params)))
             return
@@ -1888,6 +2353,12 @@ class Handler(BaseHTTPRequestHandler):
         action = data.get("action")
         mode = data.get("mode")
         part_correction = data.get("partCorrection") is True
+        if path == "/api/operator-workspace" and action == "save" and mode == "demo":
+            with self.server.guard_demo_workspace(data.get("cutId"), write=True, part_correction=part_correction):
+                result = (self.server.workspace.production_request(path, data) if self.server.local_companion_ui else
+                          self.server.production.save_workspace(data, mode, self.server.verify_production_layout))
+            self.json_response(result)
+            return
         if self.server.local_companion_ui:
             if path == "/api/operator-workspace" and action == "save" and mode in ("operator", "demo"):
                 plotter = self.server.demo if mode == "demo" else self.server
@@ -2009,16 +2480,24 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError("Некорректные параметры запроса.") from error
         if not isinstance(value, dict):
             raise RequestError("Параметры запроса должны быть объектом JSON.")
+        if self.demo_cut_scope:
+            if "cutId" in value and value["cutId"] != self.demo_cut_scope:
+                raise WorkspaceConflict("Выбран другой материал демораскроя.")
+            job = value.get("job")
+            if isinstance(job, dict) and "cutContext" in job:
+                context = job["cutContext"]
+                if not isinstance(context, list) or not context or context[0] != self.demo_cut_scope:
+                    raise WorkspaceConflict("Раскладка относится к другому материалу демораскроя.")
         return value
 
     def json_response(self, value, status=HTTPStatus.OK):
         self.respond(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
-    def respond(self, contents, content_type, status=HTTPStatus.OK, filename=None):
-        self.response_headers(len(contents), content_type, status, filename)
+    def respond(self, contents, content_type, status=HTTPStatus.OK, filename=None, *, fallback_filename="plotter.dxf", extra_headers=()):
+        self.response_headers(len(contents), content_type, status, filename, fallback_filename, extra_headers=extra_headers)
         self.wfile.write(contents)
 
-    def response_headers(self, size, content_type, status, filename=None, fallback_filename="plotter.dxf", *, encoding=None):
+    def response_headers(self, size, content_type, status, filename=None, fallback_filename="plotter.dxf", *, encoding=None, extra_headers=()):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(size))
@@ -2037,9 +2516,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Plotter-Companion")
-            self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-Plotter-Label-Id, X-Plotter-Label-Claim")
         if filename:
             self.send_header("Content-Disposition", f"attachment; filename={fallback_filename}; filename*=UTF-8''{quote(filename, safe='')}")
+        for name, value in extra_headers:
+            self.send_header(name, value)
         self.end_headers()
 
     def log_request(self, code="-", size="-"):

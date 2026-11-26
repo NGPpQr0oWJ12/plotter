@@ -1,10 +1,14 @@
 """Prepare the geometry shown by the simulator before using a real controller."""
 
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from dataclasses import replace
 from itertools import pairwise
-from math import dist
+from math import dist, nextafter
 import re
+
+from shapely import LineString, Polygon, STRtree, box, get_parts
+from shapely.errors import GEOSException
 
 from machine import FEED_SPEED, MAX_PATHS, MAX_POINTS, PlotterError, build_plan, cut_route, number
 from route_optimizer import optimize_page_route
@@ -16,6 +20,20 @@ MAX_ROLL_PAGES = 128
 MAX_PLANNED_POINTS = MAX_POINTS * 2
 EPSILON_MM = 1e-6
 MAX_UNSPLIT_MARK_MM = 10
+XIAO_GRID_MM = 0.001
+TRIM_CLEARANCE_MM = XIAO_GRID_MM + EPSILON_MM
+DEFAULT_WASTE_MARGIN_MM = 10
+
+
+def section_local_limit(width, page_add):
+    limit = width - max(page_add, COORDINATE_OFFSET_MM)
+    return nextafter(limit, 0) if limit + page_add > width else limit
+
+
+def section_local_x(x, start_x, local_limit):
+    local = x - start_x
+    # Subtraction at a late roll boundary can round just beyond the working span.
+    return local_limit if local_limit < local <= local_limit + EPSILON_MM else local
 
 
 def _drawing_extents(job):
@@ -189,16 +207,209 @@ def _stationary_notch(contour, is_notch, start_x):
     return all(xiao_coordinates(x - start_x, y) == start for x, y in points)
 
 
+def _intersection_bands(shape, slice_):
+    return [(part.bounds[1], part.bounds[3]) for part in get_parts(shape.intersection(slice_)) if not part.is_empty]
+
+
+def _encoded_trim_ring(contour, boundary, start, local_limit, *, next_pass=False):
+    # Match the splitter, including its newly inserted vertex at a pass edge.
+    origin = boundary if next_pass else start
+    points = []
+    for first, second in pairwise((*contour.points, contour.points[0])):
+        points.append(first)
+        (x1, y1), (x2, y2) = first, second
+        if min(x1, x2) < boundary < max(x1, x2):
+            points.append((boundary, y1 + (y2 - y1) * (boundary - x1) / (x2 - x1)))
+    rounded = [xiao_coordinates(section_local_x(x, origin, local_limit), y) for x, y in points]
+    return Polygon([(float(x) + (origin - start), float(y) - COORDINATE_OFFSET_MM) for x, y in rounded])
+
+
+def _trim_contact_vertices(page, boundary):
+    contacts = defaultdict(list)
+    for path in page["paths"]:
+        contacts[path["index"]].extend(y for x, y in path["points"] if x == boundary)
+    return contacts
+
+
+def _ambiguous_trim_groups(shapes, contours, outlines, part_numbers, notch_flags):
+    outline_indices = [index for index, valid in enumerate(outlines) if valid]
+    outline_tree = STRtree([shapes[index] for index in outline_indices])
+    markers = [not contour.closed and notch for contour, notch in zip(contours, notch_flags)]
+    for index, (contour, part_number) in enumerate(zip(contours, part_numbers)):
+        if not contour.closed and not markers[index] and part_number is not None:
+            owners = outline_tree.query(shapes[index], predicate="covered_by")
+            markers[index] = any(part_numbers[outline_indices[owner]] == part_number for owner in owners)
+    unresolved = {index for index, outline in enumerate(outlines) if not outline and not markers[index]}
+    groups = {part_numbers[index] for index in unresolved}
+    ranges = {}
+    for index, (part_number, shape) in enumerate(zip(part_numbers, shapes)):
+        if index not in unresolved and (part_number is None or part_number not in groups):
+            continue
+        x0, y0, x1, y1 = shape.bounds
+        low_x, low_y, high_x, high_y = ranges.get(part_number, (x0, y0, x1, y1))
+        ranges[part_number] = (min(x0, low_x), min(y0, low_y), max(x1, high_x), max(y1, high_y))
+    return markers, ranges
+
+
+def _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, page,
+                        boundary, machine_x, local_limit, fabric_end, final):
+    start = page["startX"]
+    effective_x = start + machine_x - COORDINATE_OFFSET_MM
+    rounding = XIAO_GRID_MM / 2 + EPSILON_MM
+    # Protect the intended footprint and any part of it that can reach the line
+    # when a source X is rounded on either side of the feed boundary.
+    min_x, max_x = min(boundary, effective_x - rounding), max(boundary, effective_x + rounding)
+    blocked = []
+    for part_number, (x0, y0, x1, y1) in uncertain.items():
+        if x0 <= max_x and x1 >= min_x:
+            if part_number is None:
+                return None, False
+            blocked.append((y0 - TRIM_CLEARANCE_MM, y1 + TRIM_CLEARANCE_MM))
+    ambiguous = bool(blocked)
+    strip = box(min_x, -TRIM_CLEARANCE_MM, max_x, fabric_end + TRIM_CLEARANCE_MM)
+    raw_line = LineString([(boundary, -TRIM_CLEARANCE_MM), (boundary, fabric_end + TRIM_CLEARANCE_MM)])
+    rounded_line = LineString([(machine_x, -TRIM_CLEARANCE_MM), (machine_x, fabric_end + TRIM_CLEARANCE_MM)])
+    contacts = _trim_contact_vertices(page, boundary)
+    for index in tree.query(strip):
+        shape, contour = shapes[index], contours[index]
+        if markers[index]:
+            # A known notch is a protected mark, even when Xiao suppresses it.
+            blocked.append((shape.bounds[1] - TRIM_CLEARANCE_MM, shape.bounds[3] + TRIM_CLEARANCE_MM))
+            continue
+        if not outlines[index]:
+            continue
+        raw_ends = [y for low, high in _intersection_bands(shape, raw_line) if high - low > EPSILON_MM
+                    for y in (low, high)]
+        valid_contacts = [y for y in contacts.get(index, ())
+                          if any(abs(y - end) <= EPSILON_MM for end in raw_ends)]
+        encoded_contacts = [float(xiao_coordinates(0, y)[1]) - COORDINATE_OFFSET_MM for y in valid_contacts]
+        raw_bands = _intersection_bands(shape, strip)
+        rounded_bands = []
+        for next_pass in ((False,) if final else (False, True)):
+            ring = _encoded_trim_ring(contour, boundary, start, local_limit, next_pass=next_pass)
+            if not ring.is_valid or ring.area == 0:
+                return None, ambiguous
+            rounded_bands.extend(_intersection_bands(ring, rounded_line))
+        for bands, allowed in ((raw_bands, valid_contacts), (rounded_bands, encoded_contacts)):
+            for low, high in bands:
+                # A tangent or an edge from the next pass cannot be a trim endpoint.
+                meets = high - low > EPSILON_MM
+                blocked.append((low if meets and any(abs(y - low) <= EPSILON_MM for y in allowed)
+                                else low - TRIM_CLEARANCE_MM,
+                                high if meets and any(abs(y - high) <= EPSILON_MM for y in allowed)
+                                else high + TRIM_CLEARANCE_MM))
+    return blocked, ambiguous
+
+
+def _trim_free_bands(blocked, fabric_end):
+    start = 0.0
+    for low, high in sorted(blocked):
+        if low >= fabric_end:
+            break
+        if low > start:
+            yield start, low
+        start = max(start, high)
+    if start < fabric_end:
+        yield start, fabric_end
+
+
+def _inward_trim_y(y, *, upward):
+    encoded_y = float(xiao_coordinates(0, y)[1]) - COORDINATE_OFFSET_MM
+    if upward and encoded_y < y - EPSILON_MM:
+        return round(encoded_y + XIAO_GRID_MM, 3)
+    if not upward and encoded_y > y + EPSILON_MM:
+        return round(encoded_y - XIAO_GRID_MM, 3)
+    return y
+
+
+def _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags):
+    pages = result["pages"]
+    for page in pages:
+        page["wasteTrim"] = {"paths": [], "issues": []}
+
+    def skip_all(message):
+        for page in pages:
+            page["wasteTrim"]["issues"].append(message)
+
+    if "materialWidthMm" not in job:
+        skip_all("Укажите ширину полотна для отреза отходов.")
+        return
+    fabric = number(job["materialWidthMm"], "Ширина полотна, мм", 1, max(height, 1_000_000))
+    margin = number(job.get("materialMarginMm", 0), "Отступ от края, мм", 0, 100) or DEFAULT_WASTE_MARGIN_MM
+    fabric_end = _inward_trim_y(fabric, upward=False)
+    encoded_end = float(xiao_coordinates(0, fabric_end)[1])
+    if fabric_end > height or encoded_end > height:
+        skip_all("Отрез через всю ширину полотна выходит за рабочее поле по Y.")
+        return
+    if plan.bounds["maxY"] > fabric + EPSILON_MM:
+        skip_all("Контуры выходят за указанную ширину полотна. Отрез отходов пропущен.")
+        return
+
+    contours = plan.contours
+    shapes = [Polygon(contour.points) if contour.closed else LineString(contour.points) for contour in contours]
+    outlines = [contour.closed and shape.is_valid and shape.area > 0 for contour, shape in zip(contours, shapes)]
+    if not any(outlines):
+        skip_all("Не удалось подтвердить внешние границы деталей для отреза отходов.")
+        return
+    tree = STRtree(shapes)
+    markers, uncertain = _ambiguous_trim_groups(shapes, contours, outlines, part_numbers, notch_flags)
+    local_limit = section_local_limit(width, page_add)
+    points_total = sum(len(path["points"]) + path["closed"] for page in pages for path in page["paths"])
+    for page in pages:
+        trim = page["wasteTrim"]
+        final = page is pages[-1]
+        x = plan.bounds["maxX"] + margin if final else page["endX"]
+        local_x = section_local_x(x, page["startX"], local_limit)
+        encoded_x = float(xiao_coordinates(local_x, 0)[0])
+        if (not 0 <= local_x <= local_limit or local_x > result["passLimitMm"] + EPSILON_MM
+                or encoded_x > width or encoded_x - COORDINATE_OFFSET_MM > result["passLimitMm"] + EPSILON_MM):
+            trim["issues"].append("Отрез отходов выходит за рабочую длину прохода по X.")
+            continue
+        try:
+            blocked, ambiguous = _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, page,
+                                                     x, encoded_x, local_limit, fabric_end, final)
+        except GEOSException:
+            blocked, ambiguous = None, False
+        if blocked is None:
+            trim["issues"].append("Граница прохода пересекает незамкнутый или неоднозначный контур.")
+            continue
+        if final and any(low <= fabric_end and high >= 0 for low, high in blocked):
+            trim["issues"].append("После округления Xiao не осталось свободной линии для полного отреза отходов.")
+            continue
+        paths = []
+        for low, high in _trim_free_bands(blocked, fabric_end):
+            low, high = _inward_trim_y(low, upward=True), _inward_trim_y(high, upward=False)
+            if high - low > EPSILON_MM and xiao_coordinates(local_x, low) != xiao_coordinates(local_x, high):
+                paths.append({"points": [[x, low], [x, high]], "closed": False,
+                              "operation": "wasteTrim", "layer": "waste-trim"})
+        if not paths:
+            trim["issues"].append("На границе прохода нет свободных участков для отреза отходов.")
+            continue
+        regular_points = sum(len(path["points"]) + path["closed"] for path in page["paths"])
+        if (len(page["paths"]) + len(paths) > MAX_PATHS or regular_points + len(paths) * 2 > MAX_POINTS
+                or points_total + len(paths) * 2 > MAX_PLANNED_POINTS):
+            trim["issues"].append("Отрез отходов превысил бы допустимое число контуров или точек Xiao.")
+            continue
+        trim["paths"] = paths
+        if ambiguous:
+            trim["issues"].append("Участки возле незамкнутых или неоднозначных деталей не отрезаются.")
+        points_total += len(paths) * 2
+
+
 def _prepare_route(result, plan, part_numbers, optimize, notch_flags):
     if not optimize:
         return
     before = after = 0.0
     fixed_sources = {seam["index"] for seam in result["seams"]}
     for page in result["pages"]:
-        page["paths"], old, new = optimize_page_route(page["paths"], (page["startX"], 0.0),
-                                                      plan.contours, fixed_sources, part_numbers, notch_flags)
-        before += old
-        after += new
+        start = (page["startX"], 0.0)
+        trims = page["wasteTrim"]["paths"]
+        terminal = trims[0]["points"][0] if trims else None
+        page["paths"], old, new = optimize_page_route(page["paths"], start, plan.contours, fixed_sources,
+                                                      part_numbers, notch_flags, terminal=terminal)
+        between_trims = sum(dist(first["points"][-1], second["points"][0]) for first, second in pairwise(trims))
+        before += old + between_trims
+        after += new + between_trims
     result["routeOptimization"] = {"beforeMm": before, "afterMm": after}
 
 
@@ -212,7 +423,7 @@ def _calculate_totals(result, plan, job, height):
     for page in result["pages"]:
         page_cut = page_travel = 0.0
         position = (page["startX"], 0.0)
-        for path in page["paths"]:
+        for path in (*page["paths"], *page["wasteTrim"]["paths"]):
             points = path["points"]
             route = points + [points[0]] if path["closed"] else points
             page_travel += dist(position, route[0])
@@ -315,6 +526,7 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
         page = _page(1, 0.0, last_x, 0.0)
         page["paths"] = [_path(index, contour.layer, contour.points, contour.closed) for index, contour in indexed]
         result["pages"] = [page]
+        _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags)
         _prepare_route(result, plan, part_numbers, optimize, notch_flags)
         _calculate_totals(result, plan, job, height)
         return result
@@ -360,6 +572,7 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
             pages[page_index]["paths"].append(_path(index, contour.layer, points, closed))
         result["seams"].extend({"x": x, "y": y, "index": index} for x, y in seams)
     result["pages"] = pages
+    _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags)
     _prepare_route(result, plan, part_numbers, optimize, notch_flags)
     _calculate_totals(result, plan, job, height)
     return result

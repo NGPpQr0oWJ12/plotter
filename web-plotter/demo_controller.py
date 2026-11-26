@@ -176,7 +176,10 @@ class DemoController:
                     self._event = 4
             if done:
                 self._motion = None
-                if motion.action == "move-to":
+                if motion.action == "home":
+                    self._coordinate_move = None
+                    self._event = 2
+                elif motion.action == "move-to":
                     self._coordinate_move["state"] = "reached"
                     self._event = 48
                 elif motion.action == "range":
@@ -297,7 +300,7 @@ class DemoController:
             else:
                 result = {"session": session, "phase": "cancelled", "sent": False}
                 return self._remember_hold(session, result) if action == "stop" else result
-            return {"session": session, "phase": "holding", "sent": True}
+            return {"session": session, "phase": "holding", "sent": True, "position": self._position.copy()}
 
     def upload_job(self, job, finalization, page_add, token=None, ready=None, auto_run_off=None, control_token=None,
                    *, filename=None):
@@ -340,7 +343,7 @@ class DemoController:
             self._material_offset_mm += distance_mm
             return {"feedMm": distance_mm, "materialOffsetMm": self._material_offset_mm}
 
-    def _move_to(self, x, y):
+    def _move_to(self, x, y, *, action="move-to"):
         self._require_clearance()
         target = []
         for axis, value in (("x", x), ("y", y)):
@@ -351,7 +354,7 @@ class DemoController:
         distance = dist(self._xy(), target)
         self._coordinate_move = {"x": x, "y": y, "state": "moving" if distance else "reached"}
         if distance:
-            self._motion = Motion("move-to", (self._xy(), tuple(target)), min(2.0, max(0.25, distance / 300)))
+            self._motion = Motion(action, (self._xy(), tuple(target)), min(2.0, max(0.25, distance / 300)))
         return bool(distance)
 
     def _start_job(self, action, receipt, verified, message):
@@ -397,7 +400,7 @@ class DemoController:
                 if not self._motion and not self._jog:
                     raise ControllerError("Активное движение в деморежиме не подтверждено.")
                 self._finish_hold("cancelled")
-                if self._motion and self._motion.action == "move-to":
+                if self._motion and self._motion.action in ("move-to", "home"):
                     self._coordinate_move = None
                 self._motion = None
                 self._position["z"] = 0.0
@@ -406,8 +409,10 @@ class DemoController:
             elif action == "move-to":
                 sent = self._move_to(x, y)
             elif action == "home":
-                self._position = dict.fromkeys(AXES, 0.0)
-                self._coordinate_move = None
+                for axis in ("z", "w", "a"):
+                    self._position[axis] = 0.0
+                if not self._move_to(0.0, 0.0, action="home"):
+                    self._coordinate_move = None
                 self._clear_receipt()
                 self._event = 2
             elif action == "set-zero":

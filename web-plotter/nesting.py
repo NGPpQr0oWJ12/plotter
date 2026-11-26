@@ -101,6 +101,7 @@ class Path:
     notch: bool
     part_name: str | None
     product_name: str | None
+    part_display_number: str | None
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,7 @@ def _paths(value):
         except ValueError as error:
             raise PlotterError(f"Контур {index}: {error}") from error
         paths.append(Path(vertices, _bounds(vertices), layer, closed, part_number, part_rotation, part_angle, notch,
-                          labels.get("partName"), labels.get("productName")))
+                          labels.get("partName"), labels.get("productName"), labels.get("partDisplayNumber")))
     return paths
 
 
@@ -1371,6 +1372,8 @@ def nest_paths(paths, *, width_mm, gap_mm, margin_mm, rotation, page_length_mm, 
                 result[member]["partName"] = path.part_name
             if path.product_name:
                 result[member]["productName"] = path.product_name
+            if path.part_display_number:
+                result[member]["partDisplayNumber"] = path.part_display_number
     if end_x + margin > MAX_ABS_COORDINATE_MM:
         raise PlotterError("Раскладка слишком длинная. Разбейте работу на несколько чертежей.")
     return {

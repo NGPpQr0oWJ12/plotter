@@ -34,7 +34,7 @@ const ROTATION_SNAP_STEP = 45;
 const MEASUREMENT_SNAP_PX = 14;
 const MEASUREMENT_AXIS_THRESHOLD_PX = 5;
 const MEASUREMENT_COLORS = ["#171717", "#535353", "#6c6c6c", "#343434", "#808080"];
-const sectionColors = ["#373737", "#5a5a5a", "#444444", "#686868"];
+const sectionColors = ["#286487", "#765185"];
 const trackedHeadStates = new Set(["ready", "starting", "running", "pausing", "paused", "resuming", "cancelling"]);
 const number = (value) => formatNumber.format(value);
 const included = () => placed.filter((_, index) => !excluded.has(index));
@@ -45,11 +45,15 @@ const rollResetDialog = $("roll-reset-dialog");
 const moveToDialog = $("move-to-dialog");
 
 let demoMode = readStoredBoolean("plotter.demoMode");
+let demoCutScope = null;
+let scopedDemoCuts = false;
 const companionAddress = "http://127.0.0.1:8767";
 const companionRoutes = new Set(["/api/status", "/api/cut-plan", "/api/controller-live", "/api/control-session",
-  "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset", "/api/cut-context"]);
+  "/api/controller-hold", "/api/controller-operation", "/api/controller-upload", "/api/roll-reset", "/api/cut-context",
+  "/api/labels-status", "/api/labels-settings", "/api/labels-auto", "/api/labels-print", "/api/labels-pdf", "/api/labels-image"]);
 let managedCut = null;
 let workplaces = null;
+let labelStation = null;
 let hardwareCutId = null;
 const layoutVisible = () => !$("layout-workplace").hidden;
 const layoutReadOnly = () => managedCut?.mode === "preview" || managedCut?.mode === "operator" && managedCut?.status === "done";
@@ -90,6 +94,7 @@ let coordinateMove = null;
 let actuatorEpoch = null;
 let actuatorRevision = -1;
 let operationRefreshUntil = 0;
+let manualHeadReadUntil = 0;
 const materialOperations = new Set(["clamp", "raise-clamp", "vacuum", "vacuum-off"]);
 let activeHold = null;
 let uploadUncertain = false;
@@ -114,6 +119,7 @@ let paintedSectionKey = "";
 let followedSectionKey = "";
 let headSample = null;
 let headStaleTimer;
+let headAnimationFrame = null;
 let liveRoutePosition = null;
 let trackedRun = readTrackedRun();
 const runStatistics = new CutStatistics($("run-statistics"), formatDuration, number);
@@ -128,6 +134,7 @@ let pathBoxes = [];
 let drawingParts = new Map();
 const partLegendRows = new Map();
 const partLegendProducts = new Map();
+let readOnlyLabelKeys = null;
 let drawingPartsReady = true;
 let partDiscovery = null;
 let menuPartNumber = null;
@@ -231,7 +238,8 @@ function snapshotRunPlan(plan, indexLimit, pageNumber = 1) {
   let index = 0;
   let seconds = 0;
   let position = [page.startX, 0];
-  for (const path of page.paths) {
+  const route = executionPaths(page);
+  for (const path of route) {
     const end = path.points.length + Number(path.closed);
     for (let vertex = 0; vertex < end; vertex++) {
       const point = path.points[vertex] ?? path.points[0];
@@ -242,9 +250,9 @@ function snapshotRunPlan(plan, indexLimit, pageNumber = 1) {
       if (index % stride === 0) samples.push(seconds);
     }
   }
-  const preciseCounts = !Array.isArray(page.pathEndIndices) || page.pathEndIndices.length === page.paths.length
-    && page.pathEndIndices.every((end, i) =>
-      end - (page.pathEndIndices[i - 1] || 0) === page.paths[i].points.length + Number(page.paths[i].closed));
+  const ends = page.pathEndIndices?.concat(page.wasteTrim?.pathEndIndices ?? []);
+  const preciseCounts = !ends || ends.length === route.length && ends.every((end, i) =>
+    end - (ends[i - 1] || 0) === route[i].points.length + Number(route[i].closed));
   if (index !== indexLimit || !preciseCounts) samples.length = 0;
   else if (index % stride) samples.push(seconds);
   return { material, estimatedWorkSeconds, cutDistanceMm, travelDistanceMm, indexLimit, stride, samples,
@@ -315,16 +323,23 @@ function updateControl(node, property, value) {
   if (node[property] !== value) node[property] = value;
 }
 
-async function checkedFetch(url, options = {}, useCompanion = companionRoutes.has(url)) {
+async function checkedFetch(url, { demoCut = demoCutScope, ...options } = {}, useCompanion = companionRoutes.has(url)) {
   let response;
   try {
     const path = demoMode && url.startsWith("/api/") && !systemRoutes.has(url) ? "/demo" + url : url;
+    if (path !== url && demoCut) {
+      options = { ...options, headers: { ...options.headers, "X-Plotter-Demo-Cut": demoCut } };
+    }
     response = !demoMode && centralMode && companionConnected && useCompanion
       ? await companionFetch(url, options) : await fetch(path, { cache: "no-store", ...options });
   } catch (error) {
     if (error instanceof TypeError) throw new Error("Локальный сервер недоступен. Проверьте, что он запущен.");
     throw error;
   }
+  return checkedResponse(response);
+}
+
+async function checkedResponse(response) {
   if (response.ok) return response;
   let details;
   try { details = await response.json(); } catch { /* An HTTP error can have an empty body. */ }
@@ -352,8 +367,8 @@ async function connectCompanion() {
     const status = await response.json();
     if (modeEpoch !== machineModeEpoch || demoMode) return;
     if (!status.companionMode || status.companionProtocol !== 1) throw new Error();
-    if (status.apiVersion < 22) {
-      setMachineError("Обновите помощник Plotter до версии 2.0, чтобы открыть раскрой из наряда.");
+    if (status.apiVersion < 23) {
+      setMachineError("Обновите помощник Plotter для запуска проходов с автоматической обрезкой.");
       return;
     }
     if (status.machine.width !== machine.width || status.machine.height !== machine.height) {
@@ -645,13 +660,23 @@ function fabricBedOffsetY() {
   return fabric ? (machine.height - fabric) / 2 : 0;
 }
 
+function passDrawingEnd(page) {
+  return Math.max(page?.endX ?? 0, page?.wasteTrim?.paths[0]?.points[0][0] ?? 0);
+}
+
+function renderedFabricLength() {
+  const plan = cutPlan ?? pendingCanvasPlan;
+  return Math.max(machine.width, includedBounds?.maxX ?? 0, passDrawingEnd(plan?.pages.at(-1)));
+}
+
 function renderTable() {
   if (!camera) return;
   const { width, height } = machine;
-  const length = Math.max(width, includedBounds?.maxX || 0);
+  const plan = cutPlan ?? pendingCanvasPlan;
+  const length = renderedFabricLength();
   const layer = $("table-layer");
   const units = camera.width / Math.max(svg.clientWidth, 1);
-  const pageStart = canvasSection(cutPlan ?? pendingCanvasPlan)?.page.startX ?? 0;
+  const pageStart = canvasSection(plan)?.page.startX ?? 0;
   const bed = { x: -height, y: -pageStart - width, width: height, height: width };
   const trim = plotterTrim(units);
   const bedTransform = `translate(${fabricBedOffsetY()} 0)`;
@@ -729,10 +754,15 @@ function renderTable() {
   }
   feeder.append(element("path", { d: `M${-height + 7 * trim} ${rollerY + 4 * trim}H${-7 * trim}`,
     class: "plotter-roller-glint", "vector-effect": "non-scaling-stroke" }));
-  const rollerIndex = element("svg", { x: -height * .77, y: rollerY + trim, width: 15 * trim, height: 13 * trim,
-    viewBox: "0 0 15 13", overflow: "hidden", "aria-hidden": "true" });
-  rollerIndex.append(element("path", { d: "M2 -6h11M2 4h11M2 14h11", class: "plotter-roller-index" }));
-  feeder.append(rollerIndex);
+  for (const center of [-height * .75, -height * .25]) {
+    const grip = element("svg", { x: center - 15 * trim, y: rollerY, width: 30 * trim, height: 18 * trim,
+      viewBox: "0 0 30 18", overflow: "hidden", "aria-hidden": "true" });
+    grip.append(
+      element("rect", { x: .5, y: .5, width: 29, height: 17, rx: 1.5, class: "plotter-roller-grip" }),
+      element("path", { d: "M3-13l12 4 12-4M3-3l12 4 12-4M3 7l12 4 12-4M3 17l12 4 12-4", class: "plotter-roller-index" }),
+    );
+    feeder.append(grip);
+  }
   $("feed-roller-layer").replaceChildren(feeder);
 
   const rulers = [];
@@ -791,7 +821,13 @@ function updateCanvasSection() {
     updateControl($("section-next"), "disabled", locked || page.number === plan.pages.length);
   }
   const pageKey = section ? `${plan.planId}/${section.page.number}` : "";
-  const paintKey = section ? `${pageKey}/${section.kind}/${Boolean(cutPlan)}` : "";
+  const trim = (section?.page ?? plan?.pages[0])?.wasteTrim;
+  const note = [trim?.paths.length ? "Обрезка отхода в конце прохода" : "", ...(trim?.issues ?? [])].filter(Boolean).join(". ");
+  const info = $("waste-trim-info");
+  updateText(info, note);
+  updateControl(info, "hidden", !note);
+  info.classList.toggle("has-trim", Boolean(trim?.paths.length));
+  const paintKey = section ? `${pageKey}/${section.kind}/${Boolean(cutPlan)}` : plan?.planId ?? "";
   if (paintKey === paintedSectionKey) return;
   paintedSectionKey = paintKey;
   if (pageKey !== followedSectionKey) {
@@ -829,7 +865,7 @@ function openCanvasSection(page) {
   return true;
 }
 
-function renderSeamMarkers(plan, selected, units, elements, tags) {
+function renderSeamMarkers(plan, selected, units, tags) {
   const pages = plan.pages;
   const seamsByBoundary = new Map();
   for (const seam of plan.seams || []) {
@@ -845,9 +881,6 @@ function renderSeamMarkers(plan, selected, units, elements, tags) {
   });
   if (!boundaries.length) return;
   boundaries.sort((a, b) => b.active - a.active);
-  const bedRight = fabricBedOffsetY();
-  const left = Math.min(bedRight - machine.height, -(includedBounds?.maxY ?? 0));
-  const right = Math.max(bedRight, -(includedBounds?.minY ?? 0));
   for (const { previous, page, seams, y, active } of boundaries) {
     const activeClass = active ? " is-active" : "";
     const description = `Граница проходов ${previous.number} и ${page.number}. Раскрой детали продолжается на следующем проходе.`;
@@ -855,9 +888,6 @@ function renderSeamMarkers(plan, selected, units, elements, tags) {
     const title = element("title");
     title.textContent = description;
     marker.append(title);
-    elements.push(element("path", {
-      d: `M${left} ${y}H${right}`, class: "page-seam-line" + activeClass, "vector-effect": "non-scaling-stroke",
-    }));
     const points = [...new Set(seams.map(({ y: across }) => -across))]
       .filter((x) => x >= camera.x - 10 * units && x <= camera.x + camera.width + 10 * units);
     for (const [kind, radius] of [["halo", 10], ["dot", 7.5], ["core", 2.5]]) {
@@ -871,24 +901,31 @@ function renderPages() {
   const layer = $("page-layer");
   const annotations = $("page-annotation-layer");
   const plan = cutPlan ?? pendingCanvasPlan;
+  const trimLines = [];
+  if (camera && plan) {
+    for (const page of plan.pages) {
+      for (const path of page.wasteTrim?.paths ?? []) {
+        const y = -path.points[0][0];
+        if (y < camera.y || y > camera.y + camera.height) continue;
+        trimLines.push(element("path", { d: pathData(path), class: "waste-trim-line", "data-page": page.number,
+          "vector-effect": "non-scaling-stroke" }));
+      }
+    }
+  }
+  $("waste-trim-layer").replaceChildren(...trimLines);
   if (!camera || plan?.mode !== "roll") {
     layer.replaceChildren();
+    $("pass-boundaries").replaceChildren();
     annotations.replaceChildren();
     return;
   }
   const units = camera.width / Math.max(svg.clientWidth, 1);
   const elements = [];
+  const boundaries = [];
   const tags = [];
   const section = canvasSection(plan);
   const selected = section?.page;
   const width = Math.min(plan.material?.widthMm ?? machine.height, machine.height);
-  if (selected) {
-    const highlight = element("rect", {
-      x: -width, y: -selected.endX, width, height: selected.endX - selected.startX,
-      class: `page-highlight is-${section.kind}`, "vector-effect": "non-scaling-stroke",
-    });
-    elements.push(colorCutSection(highlight, selected.number));
-  }
   const tagHeight = 40;
   const bedRight = fabricBedOffsetY();
   const dimensionX = bedRight - machine.height - 9 * units;
@@ -896,29 +933,36 @@ function renderPages() {
   const visibleBottom = camera.y + camera.height - 20 * units;
   const viewingLocked = section?.kind === "current" || section?.kind === "next";
   for (const page of plan.pages) {
-    if (-page.startX < camera.y || -page.endX > camera.y + camera.height) continue;
+    const end = passDrawingEnd(page);
+    if (-page.startX < camera.y || -end > camera.y + camera.height) continue;
+    const zone = colorCutSection(element("g", { class: `pass-zone${page === selected ? " is-active" : ""}` }), page.number);
+    zone.append(
+      element("rect", { x: -width, y: -end, width, height: end - page.startX, class: "pass-band" }),
+      element("path", { d: `M${dimensionX} ${-page.startX}V${-end}`, class: "pass-rail", "vector-effect": "non-scaling-stroke" }),
+    );
+    elements.push(zone);
     if (page.number > 1) {
-      elements.push(element("path", {
-        d: `M${bedRight} ${-page.startX}h${-machine.height}`, class: "page-boundary", "vector-effect": "non-scaling-stroke",
-      }));
+      boundaries.push(colorCutSection(element("path", {
+        d: `M${dimensionX} ${-page.startX}H${bedRight}`, class: "page-boundary", "vector-effect": "non-scaling-stroke",
+      }), page.number));
     }
     const name = `Проход ${page.number}`;
-    const length = `${number(page.endX - page.startX)} мм`;
+    const length = `${number(end - page.startX)} мм`;
     const tagWidth = Math.max(92, 16 + Math.ceil(Math.max(name.length, length.length) * 8.5));
     const tagX = dimensionX - (tagWidth + 5) * units;
-    if (page.endX <= page.startX || tagX < camera.x + 6 * units
-        || dimensionX > camera.x + camera.width || (page.endX - page.startX) / units < tagHeight + 5) continue;
-    const y1 = -page.endX;
+    if (end <= page.startX || tagX < camera.x + 6 * units
+        || dimensionX > camera.x + camera.width || (end - page.startX) / units < tagHeight + 5) continue;
+    const y1 = -end;
     const y2 = -page.startX;
     const center = Math.max(y1 + tagHeight * units / 2, visibleTop + tagHeight * units / 2);
     const bottom = Math.min(y2 - tagHeight * units / 2, visibleBottom - tagHeight * units / 2);
     if (center > bottom) continue;
     const y = Math.min(bottom, Math.max(center, (y1 + y2) / 2));
     const tick = 4 * units;
-    tags.push(element("path", {
-      d: `M${dimensionX} ${y1}V${y2} M${dimensionX - tick} ${y1}h${2 * tick} M${dimensionX - tick} ${y2}h${2 * tick} M${dimensionX} ${y}h${-5 * units}`,
+    tags.push(colorCutSection(element("path", {
+      d: `M${dimensionX - tick} ${y1}h${2 * tick} M${dimensionX - tick} ${y2}h${2 * tick} M${dimensionX} ${y}h${-5 * units}`,
       class: "page-dimension", "vector-effect": "non-scaling-stroke",
-    }));
+    }), page.number));
     const tag = element("g", {
       class: `page-tag${page === selected ? " is-active" : ""}`,
       transform: `translate(${tagX} ${y - tagHeight * units / 2}) scale(${units})`,
@@ -929,13 +973,15 @@ function renderPages() {
     });
     tag.append(
       element("rect", { width: tagWidth, height: tagHeight, rx: 4, class: "page-tag-surface" }),
+      element("rect", { x: 1, y: 1, width: 4, height: tagHeight - 2, rx: 2, class: "page-tag-stripe" }),
       rulerText(name, 8, 16, 14, "start", "page-tag-title"),
       rulerText(length, 8, 33, 14, "start", "page-tag-size"),
     );
     tags.push(colorCutSection(tag, page.number));
   }
-  renderSeamMarkers(plan, selected, units, elements, tags);
+  renderSeamMarkers(plan, selected, units, tags);
   layer.replaceChildren(...elements);
+  $("pass-boundaries").replaceChildren(...boundaries);
   annotations.replaceChildren(...tags);
 }
 
@@ -946,14 +992,8 @@ function createHeadMarker() {
     element("path", { class: "plotter-slide-rail", "vector-effect": "non-scaling-stroke" }),
     element("use", { href: "#plotter-bridge-shoe", y: -28 }),
     element("use", { href: "#plotter-bridge-shoe", y: -28 }),
-    element("path", { d: "M-18-40l5-5h24l7 6v19l-4 5h-26l-6-7Z", class: "plotter-carriage" }),
-    element("path", { d: "M-14-38l4-3h16v19h-16l-4-4Z", class: "plotter-carriage-cover" }),
-    element("path", { d: "M-10-35H2m-12 4H2m-12 4h9", class: "plotter-carriage-vents" }),
-    element("use", { href: "#plotter-fixing", x: 12, y: -36 }),
-    element("use", { href: "#plotter-fixing", x: 12, y: -22 }),
-    element("path", { d: "M-6-20H6v10L3-6h-6l-3-4Z", class: "plotter-tool-holder" }),
-    element("path", { d: "M-5-16H5m-10 4H5", class: "plotter-tool-ring" }),
-    element("circle", { r: 3.7, class: "head-halo", "vector-effect": "non-scaling-stroke" }),
+    element("use", { href: "#plotter-tool-carriage", class: "plotter-carriage-assembly" }),
+    element("circle", { r: 4, class: "head-halo", "vector-effect": "non-scaling-stroke" }),
     element("path", { d: "M-2.4-7H2.4L0 0Z", class: "plotter-blade" }),
     element("path", { d: "M-9 0h3m12 0h3M0 6v3", class: "head-cross", "vector-effect": "non-scaling-stroke" }),
     element("circle", { r: 1.15, class: "head-marker" }),
@@ -968,8 +1008,8 @@ function positionHeadMarker(marker, x, y, units, simulatedFeed) {
   const railOffset = 8 * plotterTrim(units) / units;
   const left = (bedRight - machine.height - x) / units - railOffset;
   const right = (bedRight - x) / units + railOffset;
-  updateAttribute(marker.children[0], "d", `M${left} -33H${right}v10H${left}Z`);
-  updateAttribute(marker.children[1], "d", `M${left} -31H${right}M${left} -25H${right}`);
+  updateAttribute(marker.children[0], "d", `M${left} -34H${right}v6H${left}ZM${left} -25H${right}v2H${left}Z`);
+  updateAttribute(marker.children[1], "d", `M${left} -32H${right}`);
   updateAttribute(marker.children[2], "x", String(left));
   updateAttribute(marker.children[3], "x", String(right));
 }
@@ -999,7 +1039,50 @@ function matchesRoutePosition(point, tracked) {
     && Number.isFinite(point.x) && Number.isFinite(point.y);
 }
 
-function observeHeadPosition(position, drawingPosition) {
+function sampleOnRoute(vertices, index, { x, y, kind }) {
+  if (!vertices || !Number.isInteger(index) || index < 0 || index >= vertices.length) return null;
+  if (index === 0) return { point: [x, y], index, kind };
+  const start = vertices[index], end = vertices[index + 1] ?? start;
+  const dx = end[0] - start[0], dy = end[1] - start[1];
+  const lengthSquared = dx * dx + dy * dy;
+  const projected = lengthSquared ? ((x - start[0]) * dx + (y - start[1]) * dy) / lengthSquared : 0;
+  const fraction = Math.max(0, Math.min(1, projected));
+  const point = [start[0] + fraction * dx, start[1] + fraction * dy];
+  // Encoded coordinates are rounded to 0.001 mm. A point off this segment cannot extend its trace.
+  return Math.hypot(x - point[0], y - point[1]) <= 0.002 ? { point, index, kind } : null;
+}
+
+// Follow every confirmed vertex between readings, including the travel to the next contour.
+function confirmedMotion(vertices, from, to, duration) {
+  if (!vertices || !Number.isInteger(from.index) || !Number.isInteger(to.index)
+      || to.index < from.index || to.index >= vertices.length) return null;
+  const stops = [{ ...from, distance: 0 }];
+  function append(point, index) {
+    const last = stops.at(-1);
+    const distance = last.distance + Math.hypot(point[0] - last.point[0], point[1] - last.point[1]);
+    stops.push({ point, index, distance });
+  }
+  for (let index = from.index + 1; index <= to.index; index++) append(vertices[index], index);
+  append(to.point, to.index);
+  return stops.at(-1).distance > 0 ? { stops, duration } : null;
+}
+
+function motionPosition(motion, elapsed) {
+  const { stops, duration } = motion;
+  if (elapsed >= duration) return stops.at(-1);
+  const distance = Math.max(0, elapsed) / duration * stops.at(-1).distance;
+  let low = 0, high = stops.length - 1;
+  while (low + 1 < high) {
+    const mid = (low + high) >>> 1;
+    if (stops[mid].distance <= distance) low = mid;
+    else high = mid;
+  }
+  const start = stops[low], end = stops[high];
+  const fraction = (distance - start.distance) / (end.distance - start.distance);
+  return { index: start.index, point: start.point.map((v, axis) => v + (end.point[axis] - v) * fraction) };
+}
+
+function observeHeadPosition(position, drawingPosition, stopped = false) {
   const frame = liveHeadFrame();
   if (!frame) {
     headSample = null;
@@ -1008,12 +1091,45 @@ function observeHeadPosition(position, drawingPosition) {
   const point = frame.tracked ? (demoMode ? drawingPosition : liveRoutePosition) : position;
   if (frame.tracked && (!matchesRoutePosition(point, frame.tracked)
       || (!demoMode && (point.index !== frame.tracked.index || !frame.tracked.fresh)))) {
-    if (headSample?.key === frame.key) headSample.confirmed = false;
+    if (headSample?.key === frame.key) {
+      headSample.confirmed = false;
+      headSample.motion = null;
+    }
     return;
   }
-  if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return;
-  headSample = { key: frame.key, point: projectPoint(point.x, point.y), at: performance.now(), confirmed: true,
-    indexed: point.source === "completed-index" };
+  if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
+    if (headSample?.key === "table") headSample.confirmed = false;
+    return;
+  }
+  const at = performance.now();
+  const tracked = frame.tracked;
+  const vertices = tracked && drawingProgressModel?.plan.planId === tracked.planId
+    ? drawingProgressModel.verticesByPage.get(tracked.page) : null;
+  const routeCursor = sampleOnRoute(vertices, tracked?.index, point);
+  const cursor = routeCursor ?? { point: [point.x, point.y] };
+  const running = Boolean(routeCursor && tracked.state === "running" && tracked.fresh);
+  const interval = at - (headSample?.at ?? at);
+  let motion = null;
+  const indexed = point.source === "completed-index";
+  if (running && headSample?.running && headSample.confirmed && headSample.key === frame.key
+      && (!indexed || tracked.index > headSample.display.index) && interval > 0 && interval <= 1200) {
+    motion = confirmedMotion(vertices, headSample.display, cursor, interval);
+  } else if (!tracked && headSample?.key === frame.key && headSample.confirmed && !stopped
+      && interval > 0 && interval <= 2800) {
+    const last = headSample.cursor.point;
+    const from = headSample.motion ? motionPosition(headSample.motion, interval).point : last;
+    const remaining = Math.hypot(last[0] - from[0], last[1] - from[1]);
+    const distance = remaining + Math.hypot(point.x - last[0], point.y - last[1]);
+    if (distance > 0) {
+      const stops = [{ point: from, distance: 0 }];
+      if (remaining > 0) stops.push({ point: last, distance: remaining });
+      stops.push({ ...cursor, distance });
+      motion = { stops, duration: Math.min(interval, 350) };
+      if (at < manualHeadReadUntil) manualHeadReadUntil = at + 3000;
+    }
+  }
+  headSample = { key: frame.key, cursor, display: motion ? headSample.display : cursor, motion, at,
+    confirmed: true, running, indexed };
 }
 
 function renderHead(now = performance.now()) {
@@ -1024,7 +1140,7 @@ function renderHead(now = performance.now()) {
   const frame = liveHeadFrame();
   const age = headSample ? Math.max(0, now - headSample.at) : Infinity;
   const freshFor = frame?.tracked && frame.tracked.state !== "ready" ? 1200 : 2800;
-  const visibleFor = 4000;
+  const visibleFor = frame?.tracked ? 4000 : Infinity;
   const stale = !headSample?.confirmed || (!headSample.indexed && !live.positionFresh)
     || live.busy || !live.responded || age >= freshFor;
   const hidden = !camera || simulation.active || !frame || headSample?.key !== frame.key || age >= visibleFor;
@@ -1040,11 +1156,25 @@ function renderHead(now = performance.now()) {
   headMarker.classList.toggle("is-stale", stale);
   headMarker.classList.toggle("is-indexed", !hidden && headSample.indexed);
   clearTimeout(headStaleTimer);
+  if (headAnimationFrame !== null) cancelAnimationFrame(headAnimationFrame);
+  headAnimationFrame = null;
   if (!hidden) {
-    const [x, y] = headSample.point;
+    const moving = headSample.motion && !stale && !document.hidden && (!frame.tracked || frame.tracked.state === "running");
+    headSample.display = moving ? motionPosition(headSample.motion, age) : headSample.cursor;
+    const [x, y] = projectPoint(...headSample.display.point);
     const units = camera.width / Math.max(svg.clientWidth, 1);
     positionHeadMarker(headMarker, x, y, units);
-    headStaleTimer = setTimeout(renderHead, Math.max(1, (stale ? visibleFor : freshFor) - age));
+    if (moving && age < headSample.motion.duration) {
+      headAnimationFrame = requestAnimationFrame((timestamp) => {
+        headAnimationFrame = null;
+        renderHead(timestamp);
+        if (frame.tracked) renderCutProgress();
+      });
+    } else {
+      headSample.motion = null;
+      const expires = stale ? visibleFor : freshFor;
+      if (Number.isFinite(expires)) headStaleTimer = setTimeout(renderHead, Math.max(1, expires - age));
+    }
   }
 }
 
@@ -1110,7 +1240,7 @@ function resizeCamera({ keepView = false } = {}) {
   const bedRight = fabricBedOffsetY();
   const content = {
     minX: Math.min(0, includedBounds?.minX || 0), minY: Math.min(-bedRight, includedBounds?.minY ?? 0),
-    maxX: Math.max(machine.width, includedBounds?.maxX || 0), maxY: Math.max(machine.height - bedRight, includedBounds?.maxY ?? 0),
+    maxX: renderedFabricLength(), maxY: Math.max(machine.height - bedRight, includedBounds?.maxY ?? 0),
   };
   const previousBase = baseCamera;
   if (keepView && camera) {
@@ -1932,6 +2062,7 @@ function indexDrawingParts() {
     part.rotation = path.partRotation === "quarter" ? "any" : path.partRotation ?? part.rotation;
     part.name ||= path.partName;
     part.product ||= path.productName;
+    part.displayNumber ||= path.partDisplayNumber;
     part.box.minX = Math.min(part.box.minX, box.minX);
     part.box.minY = Math.min(part.box.minY, box.minY);
     part.box.maxX = Math.max(part.box.maxX, box.maxX);
@@ -1954,14 +2085,24 @@ function partProgressKey(index) {
 function makeDrawingProgressModel(plan, includedIndices) {
   const totals = new Map();
   const pathsByPage = new Map();
+  const verticesByPage = new Map();
   const pathTotals = new Map();
   const pathsByPart = new Map();
   for (const page of plan.pages) {
     const sections = [];
+    // Controller index 1 is the first reached vertex. Index 0 is the initial approach.
+    const vertices = [null];
     let previousPoint = null;
-    for (const [ordinal, path] of page.paths.entries()) {
+    const ends = page.pathEndIndices?.concat(page.wasteTrim?.pathEndIndices ?? []);
+    for (const [ordinal, path] of executionPaths(page).entries()) {
       const entryFrom = previousPoint;
+      for (const point of path.points) vertices.push(point);
+      if (path.closed) vertices.push(path.points[0]);
       previousPoint = path.closed ? path.points[0] : path.points.at(-1);
+      if (path.operation === "wasteTrim") {
+        sections.push({ path, end: ends?.[ordinal], entryFrom, trace: "", travel: "" });
+        continue;
+      }
       const index = includedIndices[path.index];
       if (index === undefined) continue;
       const key = partProgressKey(index);
@@ -1969,11 +2110,12 @@ function makeDrawingProgressModel(plan, includedIndices) {
       pathTotals.set(index, (pathTotals.get(index) || 0) + 1);
       if (!pathsByPart.has(key)) pathsByPart.set(key, new Set());
       pathsByPart.get(key).add(index);
-      sections.push({ index, key, path, end: page.pathEndIndices?.[ordinal], entryFrom, trace: "", travel: "" });
+      sections.push({ index, key, path, end: ends?.[ordinal], entryFrom, trace: "", travel: "" });
     }
     pathsByPage.set(page.number, sections);
+    if (vertices.length - 1 === ends?.at(-1)) verticesByPage.set(page.number, vertices);
   }
-  return { plan, totals, pathsByPage, pathTotals, pathsByPart, signature: "", count: 0, total: totals.size };
+  return { plan, totals, pathsByPage, verticesByPage, pathTotals, pathsByPart, signature: "", count: 0, total: totals.size };
 }
 
 function executedTravel(section) {
@@ -1983,16 +2125,41 @@ function executedTravel(section) {
   return section.travel ||= pathData({ points: [from, to] });
 }
 
-function renderActiveRouteSegment(tracking, section, verifiedVertices) {
+let verifiedSection = null;
+let paintedVertices = 0;
+
+function renderVerifiedVertices(section, count) {
+  if (section === verifiedSection && count === paintedVertices) return;
+  const layer = $("live-verified-vertices");
+  if (section !== verifiedSection || count < paintedVertices) {
+    layer.replaceChildren();
+    paintedVertices = 0;
+    verifiedSection = section;
+  }
+  updateAttribute($("live-entry-travel"), "d", count && section ? executedTravel(section) : "");
+  // Bound the amount of already-cut geometry that SVG has to parse on each update.
+  const chunkSize = 128;
+  for (let chunk = Math.floor(Math.max(0, paintedVertices - 1) / chunkSize);
+       chunk * chunkSize + 1 < count; chunk++) {
+    let path = layer.children[chunk];
+    if (!path) {
+      path = element("path", { class: "cut-trace", "vector-effect": "non-scaling-stroke" });
+      layer.append(path);
+    }
+    const first = chunk * chunkSize;
+    updateAttribute(path, "d", pathData({ points: section.path.points.slice(first, Math.min(first + chunkSize + 1, count)) }));
+  }
+  paintedVertices = count;
+}
+
+function renderActiveRouteSegment(cursor, section, verifiedVertices) {
   const segment = $("live-active-segment");
-  const point = liveRoutePosition;
   let route = "";
-  if (!demoMode && tracking?.fresh && section && matchesRoutePosition(point, tracking)
-      && point.index === tracking.index && point.source === "controller-position") {
+  if (cursor && section) {
     const kind = verifiedVertices > 0 ? "cut" : "travel";
     const from = kind === "cut" ? section.path.points[verifiedVertices - 1] : section.entryFrom;
-    if (from && point.kind === kind) {
-      route = pathData({ points: [from, [point.x, point.y]] });
+    if (from && (!cursor.kind || cursor.kind === kind)) {
+      route = pathData({ points: [from, cursor.point] });
       updateAttribute(segment, "class", kind === "cut" ? "cut-trace" : "travel-trace");
     }
   }
@@ -2005,19 +2172,23 @@ function renderCutProgress() {
   const firstPage = tracking?.firstPage ?? 1;
   const lastDone = firstPage + (tracking?.completedPages ?? 0) - 1;
   const currentSections = model?.pathsByPage.get(tracking?.page) || [];
+  const cursor = tracking?.fresh && live.responded && !live.busy && headSample?.confirmed
+    && headSample.key === liveHeadFrame()?.key && headSample.cursor.index === tracking.index
+    && (!headSample.indexed || headSample.motion) ? headSample.display : null;
+  const displayedIndex = cursor?.index ?? tracking?.index;
   let prefix = 0;
   let upper = currentSections.length;
   while (prefix < upper) {
     const mid = (prefix + upper) >>> 1;
     const end = currentSections[mid].end;
-    if (Number.isInteger(end) && tracking.index >= end) prefix = mid + 1;
+    if (Number.isInteger(end) && displayedIndex >= end) prefix = mid + 1;
     else upper = mid;
   }
   const current = currentSections[prefix];
   const vertexCount = current ? current.path.points.length + Number(Boolean(current.path.closed)) : 0;
-  const verifiedVertices = Number.isInteger(current?.end) && Number.isInteger(tracking.index)
-    ? Math.max(0, Math.min(vertexCount, vertexCount - (current.end - tracking.index))) : 0;
-  const signature = tracking ? `${tracking.page}/${firstPage}/${lastDone}/${prefix}/${verifiedVertices}` : "none";
+  const verifiedVertices = Number.isInteger(current?.end) && Number.isInteger(displayedIndex)
+    ? Math.max(0, Math.min(vertexCount, vertexCount - (current.end - displayedIndex))) : 0;
+  const signature = tracking ? `${tracking.page}/${firstPage}/${lastDone}/${prefix}` : "none";
   const layer = $("live-trace-layer");
   const cutTrace = $("live-cut-trace");
   const travelTrace = $("live-travel-trace");
@@ -2035,24 +2206,18 @@ function renderCutProgress() {
         if (pageNumber < firstPage) continue;
         for (const [ordinal, section] of sections.entries()) {
           const { index, key, path } = section;
-          sessionParts.add(key);
+          if (key !== undefined) sessionParts.add(key);
           if (pageNumber <= lastDone || pageNumber === tracking.page && ordinal < prefix) {
-            done.set(key, (done.get(key) || 0) + 1);
-            cutPaths.set(index, (cutPaths.get(index) || 0) + 1);
+            if (key !== undefined) {
+              done.set(key, (done.get(key) || 0) + 1);
+              cutPaths.set(index, (cutPaths.get(index) || 0) + 1);
+            }
             section.trace ||= pathData(path);
             verifiedTrace.push(section.trace);
             const travel = executedTravel(section);
             if (travel) verifiedTravel.push(travel);
           }
         }
-      }
-      // The controller's proof excludes the next target. Draw only the visited prefix of the open trace.
-      if (verifiedVertices > 1) {
-        verifiedTrace.push(pathData({ points: current.path.points.slice(0, verifiedVertices), closed: false }));
-      }
-      if (verifiedVertices > 0) {
-        const travel = executedTravel(current);
-        if (travel) verifiedTravel.push(travel);
       }
       for (const [index, count] of cutPaths) if (count === model.pathTotals.get(index)) nextPaths.add(index);
       for (const [key, count] of done) if (count === model.totals.get(key)) nextParts.add(key);
@@ -2088,12 +2253,15 @@ function renderCutProgress() {
       renderPartLabels();
     }
   }
-  renderActiveRouteSegment(tracking, current, verifiedVertices);
+  renderVerifiedVertices(current, verifiedVertices);
+  renderActiveRouteSegment(cursor, current, verifiedVertices);
   layer.toggleAttribute("hidden", simulation.active);
   const activeTrace = $("live-active-segment");
-  $("live-route-legend").hidden = simulation.active || !tracking
-    || ![cutTrace, travelTrace, activeTrace].some(path => path.getAttribute("d"));
-  if (!simulation.active) $("canvas-cut-status").hidden = true;
+  const hideLegend = simulation.active || !tracking
+    || !(prefix || lastDone >= firstPage || verifiedVertices > 1 || activeTrace.getAttribute("d")
+      || (verifiedVertices && current?.travel));
+  updateControl($("live-route-legend"), "hidden", hideLegend);
+  if (!simulation.active) updateControl($("canvas-cut-status"), "hidden", true);
   return tracking ? { count: model.count, total: model.total } : null;
 }
 
@@ -2197,20 +2365,58 @@ function setPartLegendExpanded(expanded) {
   partLegend.classList.toggle("is-collapsed", !expanded);
 }
 
+function originalLabelKeys(paths, omitted) {
+  if (!paths.some(path => !path.partNumber)) return null;
+  let includedIndex = 0;
+  return paths.map((path, index) => {
+    if (omitted.has(index)) return null;
+    const key = path.partNumber ? String(path.partNumber) : `path:${includedIndex}`;
+    includedIndex++;
+    return key;
+  });
+}
+
+function legendLabelKey(part) {
+  if (!readOnlyLabelKeys) return String(part.number);
+  // A read-only legacy cut keeps its original keys after the canvas numbers the contours.
+  const keys = part.indices.map(index => readOnlyLabelKeys[index]).filter(Boolean);
+  return keys.find(key => !key.startsWith("path:")) ?? keys[0];
+}
+
+function partLabelPrintButton(part) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "part-label-print";
+  const display = [partNumberLabel(part), part.name].filter(Boolean).join(" · ");
+  button.disabled = !part.indices.some(i => !excluded.has(i) && !placed[i].notch);
+  button.title = button.disabled ? "Деталь исключена из раскроя" : `Отправить на печать · ${display}`;
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-haspopup", "dialog");
+  const icon = element("svg", { class: "icon", "aria-hidden": "true" });
+  icon.append(element("use", { href: "#i-printer" }));
+  button.append(icon, document.createTextNode("Отправить на печать"));
+  button.onclick = async () => {
+    if (labelStation && layoutVisible()) await labelStation.printPart(legendLabelKey(part), display);
+  };
+  return button;
+}
+
 function renderPartLegend() {
   partLegend.hidden = !drawingParts.size;
   partLegendRows.clear();
   partLegendProducts.clear();
-  const query = partLegendSearch.value.trim().toLocaleLowerCase().replace(/^№\s*/, "");
+  const query = partLegendSearch.value.trim().toLocaleLowerCase().replace(/^[№#]\s*/, "");
   const partsByProduct = new Map();
-  for (const part of [...drawingParts.values()].sort((a, b) => a.number - b.number)) {
+  const displayBase = (part) => part.displayNumber ? Number.parseInt(part.displayNumber, 10) : part.number;
+  for (const part of [...drawingParts.values()].sort((a, b) => displayBase(a) - displayBase(b) || a.number - b.number)) {
     const product = part.product || "";
     if (!partsByProduct.has(product)) partsByProduct.set(product, []);
     partsByProduct.get(product).push(part);
   }
   const lists = document.createDocumentFragment();
   for (const [product, parts] of partsByProduct) {
-    const visible = parts.filter((part) => !query || `${part.number} ${part.name || ""} ${product}`.toLocaleLowerCase().includes(query));
+    const visible = parts.filter((part) => !query ||
+      `${part.displayNumber ?? part.number} ${part.name || ""} ${product}`.toLocaleLowerCase().includes(query));
     if (!visible.length) continue;
     const list = document.createElement("ul");
     const addButton = () => {
@@ -2232,10 +2438,14 @@ function renderPartLegend() {
       const button = addButton();
       const number = document.createElement("strong");
       number.className = "part-legend-number";
-      number.textContent = `№${part.number}`;
+      number.textContent = partNumberLabel(part);
       button.append(number);
       if (part.name) button.append(document.createTextNode(part.name));
       button.onclick = () => selectLegendParts([part]);
+      if (managedCut?.id && ["operator", "demo"].includes(managedCut.mode) && part.indices.some(i => !placed[i].notch)) {
+        button.parentElement.className = "part-legend-row";
+        button.after(partLabelPrintButton(part));
+      }
       partLegendRows.set(part.number, button);
     }
     lists.append(list);
@@ -2292,6 +2502,10 @@ partLegend.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && selection.size && event.target !== partLegendSearch) setSelection(new Set());
 });
 
+function partNumberLabel(part) {
+  return `№${part.displayNumber ?? part.number}`;
+}
+
 function renderPartLabels() {
   const layer = $("part-label-layer");
   if (drag?.labels) return;
@@ -2318,7 +2532,7 @@ function renderPartLabels() {
   const shown = new Set();
   for (const { part, px, py, center, active } of visible) {
     if (occupied.length >= 200) break;
-    const label = `№${part.number}`;
+    const label = partNumberLabel(part);
     const complete = completedDrawingParts.has(part.number);
     const width = 28 + (label.length - 1) * 10 + (part.rotation || complete ? 19 : 0);
     const left = px - width / 2;
@@ -2336,7 +2550,7 @@ function renderPartLabels() {
     }
     const { node } = entry;
     const marker = complete ? "complete" : part.rotation;
-    if (entry.marker !== marker || entry.name !== part.name || !node.firstChild) {
+    if (entry.marker !== marker || entry.name !== part.name || entry.label !== label || !node.firstChild) {
       const title = element("title");
       title.textContent = `${label} · ${part.name || "Деталь"} · ${complete ? "Рез завершён" : partRotationText(part.rotation)}`;
       const text = element("text", { x: 7, y: 18.2 });
@@ -2350,6 +2564,7 @@ function renderPartLabels() {
       }
       entry.marker = marker;
       entry.name = part.name;
+      entry.label = label;
     }
     entry.center = center;
     entry.units = units;
@@ -2944,7 +3159,7 @@ function buildJob() {
   if (!paths.length) throw new Error("Добавьте хотя бы один контур к заданию.");
   return {
     paths, ...(machine.apiVersion >= 14 ? { optimize: routeApplied } : {}),
-    materialWidthMm: Math.min(nestingSettings?.widthMm ?? machine.height, machine.height),
+    ...(Number.isFinite(nestingSettings?.widthMm) ? { materialWidthMm: nestingSettings.widthMm } : {}),
     materialMarginMm: nestingSettings?.marginMm ?? 0,
   };
 }
@@ -3123,6 +3338,7 @@ function applyWorkspace(response) {
   fabricNapPair = napPreviewOriginal = null;
   napChangePending = false;
   excluded = new Set(saved?.excluded || []);
+  readOnlyLabelKeys = layoutReadOnly() ? originalLabelKeys(placed, excluded) : null;
   routeApplied = saved?.optimization.routeApplied ?? true;
   $("optimize-join").checked = saved?.optimization.join ?? true;
   nestingSettings = saved?.optimization.nesting || null;
@@ -3336,6 +3552,7 @@ function readStoredBoolean(key) {
 }
 
 function machineStorageKey(name) {
+  if (demoMode && demoCutScope) return `plotter.demo.${demoCutScope}.${name}`;
   return demoMode ? "plotter.demo." + name : "plotter." + name;
 }
 
@@ -3438,22 +3655,22 @@ function canSwitchMachineMode() {
     && !live.stopAvailable && !live.busy && !coordinateMoveBlocksControl() && !needsMotionVerification() && !xiaoHandoff;
 }
 
-async function toggleDemoMode() {
-  if (!canSwitchMachineMode()) return;
-  switchingMachineMode = true;
+function changeMachineContext(isDemo, cutId = null) {
+  // Disarm using the old controller's address before binding this tab to the next one.
   disarmControl();
   clearTimeout(liveTimer);
   liveEpoch++;
   machineModeEpoch++;
-  demoMode = !demoMode;
-  try {
-    sessionStorage.setItem("plotter.demoMode", String(demoMode));
-  } catch { /* Session storage is optional. */ }
+  demoMode = isDemo;
+  demoCutScope = cutId;
+  hardwareCutId = null;
   machine = { ip: "—", width: machine.width, height: machine.height };
   live = { responded: false, busy: false, hold: {}, operations: {}, position: null };
   liveObserved = false;
   headSample = null;
+  liveRoutePosition = null;
   operationRefreshUntil = 0;
+  manualHeadReadUntil = 0;
   coordinateMove = null;
   actuatorEpoch = null;
   actuatorRevision = -1;
@@ -3472,6 +3689,15 @@ async function toggleDemoMode() {
   resetCutPlan();
   setMachineError();
   renderLive();
+}
+
+async function toggleDemoMode() {
+  if (!canSwitchMachineMode()) return;
+  switchingMachineMode = true;
+  changeMachineContext(!demoMode);
+  try {
+    sessionStorage.setItem("plotter.demoMode", String(demoMode));
+  } catch { /* Session storage is optional. */ }
   try {
     await readConfiguration();
   } finally {
@@ -3630,6 +3856,8 @@ function renderHistoryControls(importing = drawingLocked()) {
 }
 
 function renderControls() {
+  labelStation?.setContext(layoutVisible() ? managedCut : null, demoMode, centralMode && !demoMode && !companionConnected,
+    controlActive() ? control.token : null);
   renderAppUpdate();
   renderKitSave();
   renderFabricNap();
@@ -3944,6 +4172,10 @@ function applyLive(response) {
   if (simulation.active && runInProgress()) simulation.close();
   liveRoutePosition = response.responded && !response.busy ? response.routePosition ?? null : null;
   if (response.responded && !response.busy) observeHeadPosition(response.position, response.drawingPosition);
+  else if (headSample) {
+    headSample.confirmed = false;
+    headSample.motion = null;
+  }
   renderLive();
 }
 
@@ -3952,13 +4184,14 @@ async function readConfiguration() {
   const modeEpoch = machineModeEpoch;
   try {
     const { machine: configuration, apiVersion, appVersion, roll, cutProgress: progress, demoAvailable: available,
-      demoMode: reportedMode, centralMode: central, companionMode: companion, selectedCut } =
+      demoMode: reportedMode, centralMode: central, companionMode: companion, selectedCut, scopedDemoCuts: scoped } =
       await getJson("/api/status", { signal: AbortSignal.timeout(3500) });
     if (modeEpoch !== machineModeEpoch || !configuration || (reportedMode === true) !== demoMode) return false;
     if (!appUpdate && typeof appVersion === "string") appUpdate = { version: appVersion };
     if (!companion) centralMode = central === true;
     hardwareCutId = selectedCut ?? null;
     demoAvailable = available === true;
+    scopedDemoCuts = scoped === true;
     machine = { ...configuration, apiVersion, verifiedJobUpload: configuration.verifiedJobUpload === true };
     const { actuators, ...jobConfiguration } = configuration;
     applyJobStatus(jobConfiguration);
@@ -4026,10 +4259,10 @@ async function readLive() {
     const settling = performance.now() < operationRefreshUntil && (live.busy || !live.positionFresh);
     const cutting = activeRun?.state === "running" || live.externalMotion === "running";
     let delay = 2000;
-    if (coordinateMove?.state === "moving") delay = 350;
+    if (coordinateMove?.state === "moving" || performance.now() < manualHeadReadUntil) delay = demoMode ? 120 : 350;
     else if (settling) delay = 250;
     else if (cutting) {
-      delay = Math.max(225, Math.min(1000, 2 * (performance.now() - readStarted)));
+      delay = Math.max(demoMode ? 120 : 225, Math.min(1000, 2 * (performance.now() - readStarted)));
       if (live.busy) delay = Math.max(delay, 500);
       else if (!live.positionFresh) delay = 1000;
     }
@@ -4049,7 +4282,7 @@ function applyPosition(response) {
   if (response.operations) live.operations = response.operations;
   if (Object.hasOwn(response, "autoRunOff")) live.autoRunOff = response.autoRunOff;
   applyJobStatus(response);
-  if (response.position && !response.busy) observeHeadPosition(response.position);
+  if (response.position && !response.busy) observeHeadPosition(response.position, undefined, response.positionStable === true);
   renderLive();
 }
 
@@ -4159,6 +4392,7 @@ async function startControllerHold(button, input) {
       void stopControllerHold(response.message || "Контроллер не начал движение.");
       return;
     }
+    if (demoMode && response.position) applyPosition(response);
     scheduleHoldRenew(hold);
   } catch (error) {
     if (activeHold === hold && !hold.released) void stopControllerHold(messageFrom(error));
@@ -4186,6 +4420,7 @@ async function renewControllerHold(hold) {
       void stopControllerHold(response.message || "Контроллер прекратил удержание.");
       return;
     }
+    if (demoMode && response.position) applyPosition(response);
     scheduleHoldRenew(hold, Math.max(0, 150 - (performance.now() - started)));
   } catch (error) {
     if (activeHold === hold && !hold.released) void stopControllerHold(messageFrom(error));
@@ -4301,6 +4536,7 @@ async function runControllerOperation(action, target) {
     if (action === "cut" && response.sent && response.run?.startedAt && statistics) {
       rememberRunStatistics(response.run, statistics);
     }
+    if (response.sent && ["move-to", "go-zero", "home"].includes(action)) manualHeadReadUntil = performance.now() + 3000;
     applyJobStatus(response);
     renderClamp();
     renderVacuum();
@@ -4458,6 +4694,7 @@ async function uploadControllerDrawing(intent) {
         verificationRequired: response.verificationRequired,
         page, statistics: snapshotRunPlan(plan, response.indexLimit, page),
       };
+      if (demoMode && response.autoRelay && response.relayKey) await labelStation?.registerUploadedRun(response);
       return currentUpload;
     } else if (uploaded) {
       setMachineError("Сеанс закончился. Включите управление и загрузите текущий чертёж заново.");
@@ -5468,7 +5705,7 @@ function openPartMenu(part, x, y) {
   cancelCanvasGesture();
   endFreeRotation();
   menuPartNumber = part.number;
-  updateText($("part-menu-title"), `Деталь №${part.number}`);
+  updateText($("part-menu-title"), `Деталь ${partNumberLabel(part)}`);
   const omit = part.indices.every((index) => excluded.has(index));
   const status = $("part-menu-status");
   updateText(status, omit ? "Исключена" : "В раскрое");
@@ -6120,7 +6357,7 @@ async function openLayoutPart(part) {
     closePartMenu();
     layout.hidden = true;
     renderControls();
-    const name = `№${part.number} · ${part.name || "Деталь"}`;
+    const name = `${partNumberLabel(part)} · ${part.name || "Деталь"}`;
     workplaces.openLayoutPart({ name, entities: layoutPartEntities(originals) }, {
       onBack() {
         layout.hidden = false;
@@ -6143,6 +6380,7 @@ async function openLayoutPart(part) {
             ...(part.rotation ? { partRotation: part.rotation } : {}),
             ...(part.name ? { partName: part.name } : {}),
             ...(part.product ? { productName: part.product } : {}),
+            ...(part.displayNumber ? { partDisplayNumber: part.displayNumber } : {}),
             ...(originals[0].partAngle !== undefined ? { partAngle: originals[0].partAngle } : {}),
           },
           excluded: allExcluded || Boolean(result.sourceIds?.[index]?.length && result.sourceIds[index].every(id => {
@@ -6194,7 +6432,7 @@ async function openLayoutPart(part) {
 }
 
 async function navigateLayout(next, { resume = false } = {}) {
-  if (busy() || (!resume && layoutVisible() && !layoutPreparation() && runInProgress())) {
+  if (busy() || (!resume && !demoCutScope && layoutVisible() && !layoutPreparation() && runInProgress())) {
     throw new Error("Дождитесь завершения текущего действия на плоттере.");
   }
   if (layoutVisible()) {
@@ -6227,6 +6465,10 @@ async function navigateLayout(next, { resume = false } = {}) {
     if (!next) {
       $("layout-workplace").hidden = true;
       $("workplace-page").hidden = false;
+      if (demoCutScope) {
+        changeMachineContext(true);
+        await readConfiguration();
+      }
       if (kitLayout()) {
         managedCut = null;
         applyWorkspace({ revision: null, workspace: null });
@@ -6235,16 +6477,33 @@ async function navigateLayout(next, { resume = false } = {}) {
       return;
     }
     let response;
-    if (next.mode === "operator") await readConfiguration();
+    if (next.mode === "operator" || (next.mode === "demo" && !scopedDemoCuts)) await readConfiguration();
     const interactive = ["operator", "demo"].includes(next.mode);
     const oldHardwareCut = hardwareCutId;
+    let nextDemoScope = next.mode === "demo" && scopedDemoCuts ? next.id : null;
     if (next.mode === "kit") {
       const query = new URLSearchParams({ id: next.kitId, mode: "kit-layout", widthMm: next.widthMm, quantity: next.quantity });
       response = await getJson(`/api/registry?${query}`);
     } else if (interactive) {
-      response = await getJson(workspaceQuery(next.id, next.mode));
+      response = await getJson(workspaceQuery(next.id, next.mode), { demoCut: nextDemoScope });
       if (response.status !== "done" || next.mode === "demo") {
-        const context = await getJson("/api/cut-context", jsonRequest({ action: "select", cutId: next.id }));
+        const selection = { action: "select", cutId: next.id };
+        let context;
+        try {
+          context = await getJson("/api/cut-context", { ...jsonRequest(selection), demoCut: nextDemoScope });
+        } catch (error) {
+          if (!nextDemoScope || error.details?.code !== "demo_legacy_cut") throw error;
+          // A tab opened before the update may still be cutting this exact material.
+          context = await getJson("/api/cut-context", { ...jsonRequest({ ...selection, resumeOnly: true }), demoCut: null });
+          nextDemoScope = null;
+        }
+        if (demoMode && demoCutScope !== nextDemoScope) {
+          changeMachineContext(true, nextDemoScope);
+          await readConfiguration();
+        }
+        if (next.mode === "demo") {
+          try { sessionStorage.setItem("plotter.lastDemoCut", next.id); } catch { /* Storage is optional. */ }
+        }
         response = { ...response, ...context, order: context.order ?? response.order };
         hardwareCutId = next.id;
       }
@@ -6292,7 +6551,8 @@ function addRegisteredParts(paths) {
   if (!layoutVisible() || layoutPreparation() || drawingLocked() || !paths.length) {
     throw new Error("Откройте рабочий стол раскроя для добавления деталей.");
   }
-  let number = placed.reduce((max, path) => Math.max(max, path.partNumber ?? 0), 0);
+  const previousNumber = placed.reduce((max, path) => Math.max(max, path.partNumber ?? 0), 0);
+  let number = previousNumber;
   const groups = new Map();
   for (const path of paths) {
     if (!groups.has(path.partNumber)) groups.set(path.partNumber, []);
@@ -6306,7 +6566,14 @@ function addRegisteredParts(paths) {
   for (const contours of groups.values()) {
     const box = bounds(contours);
     number++;
-    for (const path of contours) added.push({ ...translatePath(path, x - box.minX, margin - box.minY), partNumber: number });
+    for (const path of contours) {
+      const moved = { ...translatePath(path, x - box.minX, margin - box.minY), partNumber: number };
+      if (path.partDisplayNumber) {
+        const [base, copy] = path.partDisplayNumber.split("/");
+        moved.partDisplayNumber = copy ? `${previousNumber + Number(base)}/${copy}` : String(number);
+      }
+      added.push(moved);
+    }
     x += box.maxX - box.minX + gap;
   }
   rememberDrawing("добавление деталей из реестра");
@@ -6333,7 +6600,49 @@ async function releaseRegisteredCut() {
   managedCut.status = response.status;
 }
 
-void import("/workplaces.js").then(({ mountWorkplaces }) => {
+async function localPrinterRequest(url, payload) {
+  const options = payload === undefined ? {} : jsonRequest(payload);
+  if (url === "/api/labels-auto-relay") options.signal = AbortSignal.timeout(3500);
+  if (["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
+    return checkedFetch(url, options, false);
+  }
+  // On the shared site, printer enumeration and submission always target the operator's Windows helper.
+  // Its explicit print route takes the cut mode from the confirmed request, including in demo.
+  let response;
+  try { response = await companionFetch(url, options); }
+  catch (error) {
+    if (error instanceof TypeError) throw new Error("Для доступа к принтерам Windows запустите помощник Plotter на этом компьютере.");
+    throw error;
+  }
+  if (response.status === 404) throw new Error("Для печати бирок обновите помощник Plotter на этом компьютере.");
+  return checkedResponse(response);
+}
+
+async function labelRequest(url, payload) {
+  if (url === "/api/label-printers" || url === "/api/labels-auto-relay") return localPrinterRequest(url, payload);
+  const directPrint = url === "/api/label-print-part";
+  const exporting = url === "/api/labels-pdf";
+  const centralExport = exporting && centralMode && !companionConnected;
+  const requiredVersion = exporting ? 25 : 27;
+  if (!directPrint && !centralExport && Number.isInteger(machine.apiVersion) && machine.apiVersion < requiredVersion) {
+    throw new Error("Для печати бирок обновите локальный помощник плоттера.");
+  }
+  if (exporting || directPrint) {
+    const cut = managedCut, modeEpoch = machineModeEpoch;
+    if (!cut || cut.id !== payload.cutId || !layoutVisible()) throw new Error("Откройте раскладку материала.");
+    if (!layoutReadOnly() && workspaceChange !== workspaceSaved && !await persistWorkspace()) {
+      throw new Error("Сохраните раскладку перед печатью бирок.");
+    }
+    if (cut !== managedCut || modeEpoch !== machineModeEpoch || !layoutVisible()) throw new Error("Материал раскладки изменился.");
+    payload = { ...payload, cutRevision: cut.cutRevision };
+    if (directPrint) return localPrinterRequest(url, { ...payload, mode: demoMode ? "demo" : "operator" });
+  }
+  return checkedFetch(url, jsonRequest(payload));
+}
+
+void Promise.all([import("/workplaces.js"), import("/labels.js")]).then(([{ mountWorkplaces }, { mountLabelStation }]) => {
+  labelStation = mountLabelStation(labelRequest);
+  renderControls();
   workplaces = mountWorkplaces({ navigateLayout, addRegisteredParts, finishRegisteredCut, releaseRegisteredCut, onExit: disarmControl,
     flushLayout: persistWorkspace,
     layoutWidths: () => ({ defaultWidthMm: defaultFabricWidthMm(), maxWidthMm: machine.height }),
@@ -6343,6 +6652,13 @@ void import("/workplaces.js").then(({ mountWorkplaces }) => {
       return data;
     }),
     openFile: () => $("file-input").click(),
-    getActiveCut: async () => { await readConfiguration(); return hardwareCutId; },
+    getActiveCut: async () => {
+      await readConfiguration();
+      let id = hardwareCutId;
+      if (demoMode && scopedDemoCuts && !demoCutScope) {
+        try { id = sessionStorage.getItem("plotter.lastDemoCut"); } catch { id = null; }
+      }
+      return { id, mode: demoMode ? "demo" : "operator" };
+    },
   });
 }).catch(error => { $("workplace-page").textContent = `Не удалось открыть рабочие места. ${messageFrom(error)}`; });

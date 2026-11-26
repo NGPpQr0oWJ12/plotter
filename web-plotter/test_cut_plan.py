@@ -4,6 +4,7 @@ from math import dist, nextafter
 from unittest.mock import patch
 
 from cut_plan import prepare_cut_plan
+from xiao_job import COORDINATE_OFFSET_MM, xiao_coordinates
 
 
 def rectangle(x0, y0, x1, y1, layer="Крой"):
@@ -11,6 +12,133 @@ def rectangle(x0, y0, x1, y1, layer="Крой"):
 
 
 class CutPlanTests(unittest.TestCase):
+    def test_waste_trim_uses_free_intervals_between_full_part_footprints(self):
+        outer = rectangle(20, 10, 220, 40)
+        hole = rectangle(55, 15, 170, 30, "Отверстие")
+        second = rectangle(20, 50, 220, 65)
+        job = {"paths": [outer, hole, second], "materialWidthMm": 70}
+        plan = prepare_cut_plan(job, 100, 80, 1)
+        baseline = prepare_cut_plan({"paths": job["paths"]}, 100, 80, 1)
+        page = plan["pages"][0]
+        self.assertEqual(page["paths"], baseline["pages"][0]["paths"])
+        self.assertEqual(page["wasteTrim"]["issues"], [])
+        self.assertEqual([path["points"] for path in page["wasteTrim"]["paths"]],
+                         [[[99, 0], [99, 10]], [[99, 40], [99, 50]], [[99, 65], [99, 70]]])
+        self.assertTrue(all(not path["closed"] and path["operation"] == "wasteTrim" and path["layer"] == "waste-trim"
+                            for path in page["wasteTrim"]["paths"]))
+        self.assertEqual(plan["material"]["partsAreaMm2"], baseline["material"]["partsAreaMm2"])
+        self.assertAlmostEqual(page["cutDistanceMm"], baseline["pages"][0]["cutDistanceMm"] + 25)
+        self.assertAlmostEqual(plan["routeOptimization"]["afterMm"], plan["travelDistanceMm"])
+        self.assertGreater(plan["estimatedSeconds"], baseline["estimatedSeconds"])
+
+    def test_waste_trim_can_meet_cut_edge_but_never_overlaps_it(self):
+        for cut_edge, next_edge in ((99, 110), (65, 95), (65, 95.0006)):
+            with self.subTest(cut_edge=cut_edge, next_edge=next_edge):
+                job = {"paths": [rectangle(10, 10, cut_edge, 40), rectangle(next_edge, 10, 140, 40)],
+                       "materialWidthMm": 70}
+                page = prepare_cut_plan(job, 100, 80, 1)["pages"][0]
+                lower, upper = [path["points"] for path in page["wasteTrim"]["paths"]]
+                if cut_edge == 99:
+                    self.assertEqual((lower, upper), ([[99, 0], [99, 10]], [[99, 40], [99, 70]]))
+                else:
+                    self.assertEqual(page["endX"], next_edge)
+                    self.assertLess(lower[1][1], 10)
+                    self.assertGreater(upper[0][1], 40)
+
+    def test_waste_trim_preserves_tangencies_and_notches(self):
+        tangent = {"points": [[10, 10], [99, 25], [10, 40]], "closed": True}
+        notch = {"points": [[99, 45], [99, 50]], "notch": True}
+        job = {"paths": [tangent, notch, rectangle(110, 12, 140, 30)], "materialWidthMm": 60}
+        trim = prepare_cut_plan(job, 100, 80, 1)["pages"][0]["wasteTrim"]
+        below, middle, above = [path["points"] for path in trim["paths"]]
+        self.assertLess(below[1][1], 25)
+        self.assertGreater(middle[0][1], 25)
+        self.assertLess(middle[1][1], 45)
+        self.assertGreater(above[0][1], 50)
+
+    def test_waste_trim_protects_ambiguous_group_between_disjoint_strokes(self):
+        first = {"points": [[20, 20], [20, 30]]}
+        last = {"points": [[170, 25], [170, 55]]}
+        job = {"paths": [rectangle(110, 5, 145, 15), first, last], "materialWidthMm": 60}
+        page = prepare_cut_plan(job, 100, 80, 1)["pages"][0]
+        self.assertEqual(page["endX"], 99)
+        self.assertFalse(page["wasteTrim"]["paths"])
+        self.assertTrue(page["wasteTrim"]["issues"])
+        first["partNumber"] = last["partNumber"] = 2
+        trim = prepare_cut_plan(job, 100, 80, 1)["pages"][0]["wasteTrim"]
+        below, above = [path["points"] for path in trim["paths"]]
+        self.assertLess(below[1][1], 20)
+        self.assertGreater(above[0][1], 55)
+        self.assertTrue(trim["issues"])
+
+    def test_waste_trim_protects_invalid_closed_outline_envelope(self):
+        outline = {"closed": True, "partNumber": 2,
+                   "points": [[10, 20], [140, 45], [10, 45], [140, 20]]}
+        job = {"paths": [outline, rectangle(15, 5, 60, 10)], "materialWidthMm": 50}
+        trim = prepare_cut_plan(job, 100, 80, 1)["pages"][0]["wasteTrim"]
+        below, above = [path["points"] for path in trim["paths"]]
+        self.assertLess(below[1][1], 20)
+        self.assertGreater(above[0][1], 45)
+        self.assertTrue(trim["issues"])
+
+    def test_waste_trim_rounds_into_free_area_and_omits_sub_grid_gap(self):
+        job = {"paths": [rectangle(20, 10.0006, 130, 24.0001), rectangle(20, 24.0004, 130, 39.9994)],
+               "materialWidthMm": 70.0006}
+        plan = prepare_cut_plan(job, 100, 80, 1)
+        lower, upper = [path["points"] for path in plan["pages"][0]["wasteTrim"]["paths"]]
+        self.assertLessEqual(float(xiao_coordinates(*lower[-1])[1]) - COORDINATE_OFFSET_MM, 10.0006)
+        self.assertGreaterEqual(float(xiao_coordinates(*upper[0])[1]) - COORDINATE_OFFSET_MM, 39.9994)
+        self.assertLess(float(xiao_coordinates(*upper[-1])[1]) - COORDINATE_OFFSET_MM, 70.0006)
+
+    def test_waste_trim_final_margin_is_after_layout_inside_workable_window(self):
+        job = {"paths": [rectangle(20, 5, 95, 40)], "materialWidthMm": 70}
+        page, = prepare_cut_plan(job, 100, 80, 1)["pages"]
+        self.assertFalse(page["wasteTrim"]["paths"])
+        self.assertTrue(page["wasteTrim"]["issues"])
+        job["materialMarginMm"] = 3
+        page, = prepare_cut_plan(job, 100, 80, 1)["pages"]
+        trim, = page["wasteTrim"]["paths"]
+        self.assertEqual((page["endX"], page["feedAfterMm"], trim["points"]), (95, 0, [[98, 0], [98, 70]]))
+        job["materialMarginMm"] = .0001
+        page, = prepare_cut_plan(job, 100, 80, 1)["pages"]
+        self.assertFalse(page["wasteTrim"]["paths"])
+        self.assertTrue(page["wasteTrim"]["issues"])
+
+    def test_waste_trim_requires_declared_width_that_fits_encoded_field(self):
+        job = {"paths": [rectangle(10, 5, 50, 30)]}
+        for width in (None, 80, 27):
+            with self.subTest(width=width):
+                if width is not None:
+                    job["materialWidthMm"] = width
+                page, = prepare_cut_plan(job, 100, 80, 1)["pages"]
+                self.assertFalse(page["wasteTrim"]["paths"])
+                self.assertTrue(page["wasteTrim"]["issues"])
+        job["materialWidthMm"] = 45
+        page, = prepare_cut_plan(job, 100, 80, 1)["pages"]
+        trim, = page["wasteTrim"]["paths"]
+        self.assertEqual(trim["points"], [[60, 0], [60, 45]])
+
+    def test_waste_trim_can_run_on_empty_verified_pass(self):
+        plan = prepare_cut_plan({"paths": [rectangle(215, 10, 290, 40)], "materialWidthMm": 60}, 100, 80, 1)
+        page = plan["pages"][1]
+        self.assertEqual(page["paths"], [])
+        trim, = page["wasteTrim"]["paths"]
+        self.assertEqual(trim["points"], [[198, 0], [198, 60]])
+
+    def test_waste_trim_approach_is_included_in_route_choice(self):
+        outer = rectangle(10, 20, 60, 40)
+        outer["points"] = outer["points"][1:] + outer["points"][:1]
+        old = prepare_cut_plan({"paths": [outer]}, 100, 80, 1)
+        self.assertEqual(old["pages"][0]["paths"][0]["points"][0], [10, 20])
+        job = {"paths": [outer], "materialWidthMm": 70, "materialMarginMm": 25}
+        plan = prepare_cut_plan(job, 100, 80, 1)
+        self.assertEqual(plan["pages"][0]["paths"][0]["points"][0], [60, 20])
+        self.assertAlmostEqual(plan["routeOptimization"]["beforeMm"], plan["travelDistanceMm"])
+        self.assertAlmostEqual(plan["routeOptimization"]["afterMm"], plan["travelDistanceMm"])
+        job["paths"].append(rectangle(17, 25, 22, 30, "Отверстие"))
+        ordered = prepare_cut_plan(job, 100, 80, 1)["pages"][0]["paths"]
+        self.assertEqual([path["index"] for path in ordered], [1, 0])
+
     def test_single_page_keeps_placement_and_order_in_normalized_geometry(self):
         frame = rectangle(20, 30, 40, 50)
         frame["points"].extend([[20, 30], [20, 30]])

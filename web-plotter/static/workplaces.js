@@ -1,5 +1,6 @@
 import { mountCadEditor } from "/designer-cad.js";
 import { confirmAction } from "/confirm-action.js";
+import { createLabelDesigner } from "/labels.js";
 
 const $ = (id) => document.getElementById(id);
 const labels = { folder: "Папка", drawing: "Чертёж", part: "Деталь", kit: "Комплект" };
@@ -373,6 +374,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const page = $("workplace-page");
   const dock = $("workplace-dock");
   const xiaoActions = $("xiao-handoff");
+  const printerActions = $("label-actions");
   const picker = $("role-picker");
   const pickerStatus = $("role-picker-status");
   const topbar = $("workplace-topbar");
@@ -391,6 +393,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
   const expandedFolders = storedFolders();
   let tab = null;
   let designerView = "registry";
+  let labelDesigner = null;
   let selectedFolder = null;
   let registrySearch = "";
   let registryKind = "";
@@ -1375,7 +1378,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
         : next.id ? { cutId: next.id, mode: next.previewSource ?? mode } : { workspace: 1 };
       await downloadSewingPdf(params);
     })));
-    dock.append(xiaoActions);
+    dock.append(xiaoActions, printerActions);
     if (mode === "design") {
       dock.append(button("Предпросмотр", execute(() => showLayout({ ...next, mode: "preview", editable: true }))));
     } else if (mode === "preview") {
@@ -1802,18 +1805,24 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     if (showReport) {
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       report = await get("/api/order-analysis", { ...analysisPeriod, tz });
-    } else if (tab === "designer") await refreshRegistry();
+    } else if (tab === "designer" && designerView !== "labels") await refreshRegistry();
     if (epoch !== renderEpoch) return;
     const operator = tab === "operator";
     panel.replaceChildren();
     if (!operator) {
       const nav = el("nav", "", "workplace-subnav");
-      for (const [view, title] of [["registry", "Реестр"], ["orders", "Наряды"]]) {
+      for (const [view, title] of [["registry", "Реестр"], ["orders", "Наряды"], ["labels", "Конструктор бирок"]]) {
         const control = button(title, execute(async () => { designerView = view; await openOrder(null); }));
         control.setAttribute("aria-pressed", String(designerView === view || (view === "orders" && designerView === "analysis")));
         nav.append(control);
       }
       panel.append(nav);
+      if (designerView === "labels") {
+        labelDesigner ??= createLabelDesigner({ get, post });
+        panel.append(labelDesigner.element);
+        await labelDesigner.open();
+        return;
+      }
       if (designerView === "registry") { renderRegistry(); return; }
       if (showReport) { renderAnalysis(report); return; }
     }
@@ -1825,10 +1834,10 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
       : [button("Анализ", execute(async () => { designerView = "analysis"; await openOrder(null); }), { icon: "analysis" }),
         button("Новый наряд", () => orderDialog(null), { primary: true, icon: "plus" })];
     if (operator) actions.unshift(button("Продолжить раскрой", execute(async () => {
-      const id = await getActiveCut();
+      const { id, mode } = await getActiveCut();
       const order = id && result.orders.find(order => order.materials?.some(material => material.id === id));
       const material = order?.materials.find(material => material.id === id);
-      await showLayout(id ? { mode: "operator", id, order, name: material?.name } : { mode: "standalone" });
+      await showLayout(id && (mode !== "demo" || material) ? { mode, id, order, name: material?.name } : { mode: "standalone" });
     })));
     panel.append(workHeading(operator ? "Наряды на раскрой" : "Наряды", "", actions));
     renderOrderList(result.orders, operator);
@@ -1913,7 +1922,7 @@ export function mountWorkplaces({ request, navigateLayout, addRegisteredParts, f
     $(`${name}-tab`).onclick = execute(() => enterRole(name));
   }
   window.addEventListener("beforeunload", event => {
-    if (!cad?.hasUnsavedChanges()) return;
+    if (!cad?.hasUnsavedChanges() && !labelDesigner?.dirty()) return;
     event.preventDefault();
     event.returnValue = "";
   });

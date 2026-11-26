@@ -3,6 +3,10 @@
 const SHORT_CUT_LIMIT_MM = 10;
 const SHORT_CUT_EPSILON_MM = 1e-6;
 
+function executionPaths(page) {
+  return page.wasteTrim?.paths.length ? page.paths.concat(page.wasteTrim.paths) : page.paths;
+}
+
 class CutStatistics {
   constructor(root, formatDuration, number) {
     root.append(document.getElementById("cut-statistics-template").content.cloneNode(true));
@@ -146,10 +150,10 @@ class CutSimulation {
       const shortCuts = [];
       this.pages.push({ number: page.number, start: this.duration, firstMove: this.moves.length, origin, shortCuts, completedShort: 0 });
       let position = origin;
-      for (const path of page.paths) {
+      for (const path of executionPaths(page)) {
         const points = path.points;
         let length = 0;
-        if (!path.closed) {
+        if (!path.closed && path.operation !== "wasteTrim") {
           for (let i = 1; i < points.length && length <= SHORT_CUT_LIMIT_MM + SHORT_CUT_EPSILON_MM; i++) {
             length += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
           }

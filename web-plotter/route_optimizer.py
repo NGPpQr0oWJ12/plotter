@@ -179,7 +179,7 @@ def _entry_options(path, fixed):
     return options
 
 
-def _choose_entries(order, options, origin):
+def _choose_entries(order, options, origin, terminal=None):
     """Find the cheapest combination of entry choices for an ordered sequence."""
     previous = [(origin, origin, 0)]
     costs = [0.0]
@@ -195,6 +195,8 @@ def _choose_entries(order, options, origin):
             back.append(last)
         transitions.append(back)
         previous, costs = choices, next_costs
+    if terminal is not None:
+        costs = [cost + dist(end, terminal) for (_, end, _), cost in zip(previous, costs)]
     winner = min(range(len(costs)), key=costs.__getitem__)
     best = costs[winner]
     chosen = []
@@ -249,7 +251,7 @@ def _initial_order(options, predecessors, successors, origin, nearest=True):
     return order
 
 
-def _improve_order(order, chosen, predecessors, successors, fixed, origin):
+def _improve_order(order, chosen, predecessors, successors, fixed, origin, terminal=None):
     """Find the best legal reversal or single-cut relocation of the current route."""
     count = len(order)
     positions = {index: position for position, index in enumerate(order)}
@@ -260,7 +262,7 @@ def _improve_order(order, chosen, predecessors, successors, fixed, origin):
     span = count if count <= FULL_SEARCH_LIMIT else 24
     for left, (start, end, _) in enumerate(chosen):
         previous = chosen[left - 1][1] if left else origin
-        following = chosen[left + 1][0] if left + 1 < count else None
+        following = chosen[left + 1][0] if left + 1 < count else terminal
         removal = -dist(previous, start)
         if following is not None:
             removal += dist(previous, following) - dist(end, following)
@@ -268,8 +270,8 @@ def _improve_order(order, chosen, predecessors, successors, fixed, origin):
         for gap in range(max(left + 2, earliest[left] + 1), min(latest[left], left + span, count) + 1):
             gap_previous = chosen[gap - 1][1]
             delta = removal + dist(gap_previous, start)
-            if gap < count:
-                gap_next = chosen[gap][0]
+            gap_next = chosen[gap][0] if gap < count else terminal
+            if gap_next is not None:
                 delta += dist(end, gap_next) - dist(gap_previous, gap_next)
             if delta < best:
                 best, move = delta, ("relocate", left, gap - 1)
@@ -288,8 +290,8 @@ def _improve_order(order, chosen, predecessors, successors, fixed, origin):
                 break
             last_start, last_end, _ = chosen[right]
             delta = dist(previous, last_end) - dist(previous, start)
-            if right + 1 < count:
-                after = chosen[right + 1][0]
+            after = chosen[right + 1][0] if right + 1 < count else terminal
+            if after is not None:
                 delta += dist(start, after) - dist(last_end, after)
             if delta < best:
                 best, move = delta, ("reverse", left, right)
@@ -304,17 +306,18 @@ def _improve_order(order, chosen, predecessors, successors, fixed, origin):
     return updated
 
 
-def _travel(paths, origin):
+def _travel(paths, origin, terminal=None):
     total = 0.0
     for path in paths:
         points = path["points"]
         total += dist(origin, points[0])
         origin = points[0] if path["closed"] else points[-1]
-    return total
+    return total + (dist(origin, terminal) if terminal is not None else 0.0)
 
 
-def optimize_page_route(paths, origin, source, fixed_sources, part_numbers, notch_flags):
-    before = _travel(paths, origin)
+def optimize_page_route(paths, origin, source, fixed_sources, part_numbers, notch_flags, *, terminal=None):
+    """Order regular cuts, optionally ending at the first fixed following operation."""
+    before = _travel(paths, origin, terminal)
     if not paths:
         return paths, before, before
     try:
@@ -334,19 +337,22 @@ def optimize_page_route(paths, origin, source, fixed_sources, part_numbers, notc
         return paths, before, before
     best = None
     for order in candidates:
-        cost, chosen = _choose_entries(order, options, origin)
+        cost, chosen = _choose_entries(order, options, origin, terminal)
         # Each pass strictly reduces travel. Bound work for very large drawings.
         for _ in range(12 if len(paths) <= FULL_SEARCH_LIMIT else 2):
-            improved = _improve_order(order, chosen, predecessors, successors, fixed, origin)
+            improved = _improve_order(order, chosen, predecessors, successors, fixed, origin, terminal)
             if improved is None:
                 break
-            new_cost, new_choices = _choose_entries(improved, options, origin)
+            new_cost, new_choices = _choose_entries(improved, options, origin, terminal)
             if new_cost + EPSILON >= cost:
                 break
             order, cost, chosen = improved, new_cost, new_choices
         if best is None or cost + EPSILON < best[0]:
             best = cost, order, chosen
     cost, order, chosen = best
+    if (terminal is not None and cost > before + EPSILON
+            and all(not indices or max(indices) < index for index, indices in enumerate(predecessors))):
+        return paths, before, before
     result = []
     for index, (_, _, entry) in zip(order, chosen):
         path = paths[index]
