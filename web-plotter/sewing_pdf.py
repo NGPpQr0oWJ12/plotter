@@ -460,8 +460,12 @@ def _legend_cell(value, width):
     return _para(value[:low].rstrip() + "…*", size), True
 
 
+def _display_number(part):
+    return part.get("displayNumber", part["number"])
+
+
 def _piece_legend(entries, *, full=False, width=WIDTH * .76, size=11.5, compact=False):
-    numbered = not full or any(part["number"] for part, _ in entries)
+    numbered = not full or any(_display_number(part) for part, _ in entries)
     if numbered:
         columns = [.09, .25, .13, .53]
         fields = ("№", "Разработчик", "Дата", "Комментарии")
@@ -474,15 +478,16 @@ def _piece_legend(entries, *, full=False, width=WIDTH * .76, size=11.5, compact=
     for part, _ in entries:
         fields = _legend_fields(part)
         values = [value for _, value in fields]
+        number = _display_number(part)
         if numbered:
-            values.insert(0, part["number"])
+            values.insert(0, number)
         if full:
             data.append([_para(" ".join(str(value).split()) if compact else value, size) for value in values])
         else:
             cells = [_legend_cell(str(value), column - 12) for value, column in zip(values, columns)]
             data.append([paragraph for paragraph, _ in cells])
             if any(overflow for _, overflow in cells):
-                notes.append((f"№ {part['number']}  {part['name']}",
+                notes.append((f"№ {number}  {part['name']}",
                               "\n".join(f"{field}  {value}" for field, value in fields)))
     table = Table(data, colWidths=columns)
     table.setStyle(TableStyle([
@@ -507,7 +512,8 @@ def _piece_plan(entries):
         for index, (part, bounds) in enumerate(entries):
             x = LEFT if rows else LEFT + index * (card_width + SHEET_GAP)
             y = TOP - index * (card_height + SHEET_GAP) if rows else TOP
-            title = f"№ {part['number']}  {part['name']}" if part["number"] else part["name"]
+            number = _display_number(part)
+            title = f"№ {number}  {part['name']}" if number else part["name"]
             heading = _para(title, 14)
             _, caption_height = heading.wrap(card_width, card_height)
             diagram_height = card_height - caption_height - 4 * mm
@@ -565,7 +571,7 @@ def _seam_rows(parts):
     for part in parts:
         pattern = part.get("pattern") or {}
         if pattern.get("number"):
-            numbers[pattern["number"]].append(part["number"])
+            numbers[pattern["number"]].append(_display_number(part))
     rows = []
     for part in parts:
         for seam in (part.get("pattern") or {}).get("sewing", ()):
@@ -577,7 +583,7 @@ def _seam_rows(parts):
                 label += " (вне комплекта)"
             if seam.get("method") == "closure":
                 label += " · застёжка"
-            rows.append((part["number"], part["name"], label))
+            rows.append((_display_number(part), part["name"], label))
     return rows or [(EMPTY, EMPTY, "Сохранённых парных швов нет.")]
 
 
@@ -590,7 +596,7 @@ def _saved_paths(workspace):
 def _cut_rows(parts, workspace):
     if workspace is None:
         directions = {"grain": "Долевая", "nap": "Ворс", "free": "Свободное"}
-        return [(part["number"], part["name"], _size(_piece_bounds(part)),
+        return [(_display_number(part), part["name"], _size(_piece_bounds(part)),
                  directions.get((part.get("pattern") or {}).get("direction"), EMPTY)) for part in parts]
     paths, excluded = _saved_paths(workspace)
     included = {path.get("partNumber") for path in paths}
@@ -599,7 +605,7 @@ def _cut_rows(parts, workspace):
     for part in parts:
         number = part["number"]
         status = "Включена" if number in included else "Исключена" if number in omitted else "Не размещена"
-        rows.append((number, part["name"], _size(_piece_bounds(part)), status))
+        rows.append((_display_number(part), part["name"], _size(_piece_bounds(part)), status))
     return rows
 
 
@@ -609,7 +615,7 @@ def _material_width(context, workspace):
     return width if isinstance(width, (int, float)) and isfinite(width) and width > 0 else None
 
 
-def _layout_pages(workspace, context):
+def _layout_pages(workspace, context, display_numbers):
     paths, excluded = _saved_paths(workspace)
     extent = _bounds(paths)
     if extent is None:
@@ -627,7 +633,7 @@ def _layout_pages(workspace, context):
         start, end = x0 + page * step, x0 + (page + 1) * step
         visible = [path for path, box in source if box[2] >= start and box[0] <= end]
         yield "Раскладка полотна", partial(
-            _layout_sheet, visible, (start, y0, end, y1), len(excluded), page + 1, count, material_width)
+            _layout_sheet, visible, (start, y0, end, y1), len(excluded), page + 1, count, material_width, display_numbers)
 
 
 def _empty_layout(excluded, pdf):
@@ -635,7 +641,7 @@ def _empty_layout(excluded, pdf):
           LEFT, TOP, WIDTH, 11)
 
 
-def _layout_sheet(paths, bounds, excluded, page, count, material_width, pdf):
+def _layout_sheet(paths, bounds, excluded, page, count, material_width, display_numbers, pdf):
     start, y0, end, y1 = bounds
     caption = f"Участок {page} из {count}"
     if material_width:
@@ -662,7 +668,7 @@ def _layout_sheet(paths, bounds, excluded, page, count, material_width, pdf):
     for number, contours in groups.items():
         x0, low, x1, high = _bounds(contours)
         px, py = project(((max(x0, start) + min(x1, end)) / 2, (low + high) / 2))
-        label = f"№ {number}"
+        label = f"№ {display_numbers.get(number, number)}"
         size = pdfmetrics.stringWidth(label, FONT, 9)
         pdf.setFillColor(colors.white)
         pdf.rect(px - size / 2 - 2, py - 3, size + 4, 10, fill=1, stroke=0)
@@ -689,7 +695,7 @@ def render_sewing_pdf(title, parts, *, context=None, workspace=None):
         notes.extend(continued)
         pages.append(("Чертежи деталей", partial(_piece_sheet, drawings, legend, bool(continued))))
     pages.extend(_table_pages("Перечень деталей", ("№", "Наименование", "Габарит, мм"), (.10, .65, .25),
-                              [(part["number"], part["name"], _size(box)) for part, box in zip(parts, bounds)],
+                              [(_display_number(part), part["name"], _size(box)) for part, box in zip(parts, bounds)],
                               "Каждый номер соответствует одной физической детали."))
     if notes:
         pages.extend(_table_pages("Примечания к деталям", ("Деталь", "Основная надпись"), (.33, .67), notes, ""))
@@ -701,7 +707,7 @@ def render_sewing_pdf(title, parts, *, context=None, workspace=None):
     else:
         pages.extend(_table_pages("Карта раскроя", ("№", "Деталь", "Габарит, мм", "В раскладке"),
                                   (.08, .48, .24, .20), _cut_rows(parts, workspace), ""))
-        pages.extend(_layout_pages(workspace, context))
+        pages.extend(_layout_pages(workspace, context, {part["number"]: _display_number(part) for part in parts}))
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4, pageCompression=1)
     pdf.setTitle(title)

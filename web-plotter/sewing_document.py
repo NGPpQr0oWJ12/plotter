@@ -26,7 +26,9 @@ def _reference_notches(entities):
 
 def _part_sheet(number, paths, entry=None, *, source_geometry=False):
     title = next((path["partName"] for path in paths if path.get("partName")), None)
-    sheet = {"number": number, "name": title or (entry and entry["name"]) or "Деталь", "paths": paths}
+    display = next((path["partDisplayNumber"] for path in paths if path.get("partDisplayNumber")), number)
+    sheet = {"number": number, "displayNumber": display,
+             "name": title or (entry and entry["name"]) or "Деталь", "paths": paths}
     if entry:
         for field in ("partLegend", "pattern"):
             if field in entry:
@@ -67,7 +69,7 @@ def kit_document(store, kit_id, amount=1, width=None):
             part = records[number]
             if part["id"] not in templates:
                 templates[part["id"]] = _part_sheet(number, contours, part, source_geometry=True)
-            parts.append({**templates[part["id"]], "number": number})
+            parts.append({**templates[part["id"]], "number": number, "displayNumber": contours[0]["partDisplayNumber"]})
         layout = None
         if width is not None:
             width = width_mm(width)

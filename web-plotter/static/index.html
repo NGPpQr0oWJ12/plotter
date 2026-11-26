@@ -8,6 +8,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232459e5'/%3E%3Cpath d='M7 24V8h18v16H7Zm0-11h18m-9 0v6m-3 0h6' fill='none' stroke='white' stroke-width='1.7'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/workplaces.css">
+  <link rel="stylesheet" href="/labels.css">
   <link rel="stylesheet" href="/designer-cad.css">
   <link rel="stylesheet" href="/designer-3d.css">
   <link rel="stylesheet" href="/plotter-monochrome.css">
@@ -51,6 +52,7 @@
     <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/></symbol>
+    <symbol id="i-printer" viewBox="0 0 24 24"><path d="M7 8V3h10v5M7 17H4V9h16v8h-3"/><path d="M7 14h10v7H7zM16.5 11h.5"/></symbol>
     <symbol id="logo-la-rocca" viewBox="0 0 900 176">
         <path d="M 234.22 0.00 L 234.29 29.88 Q 234.29 30.42 233.75 30.41 Q 225.04 30.27 218.56 30.54 Q 198.08 31.39 183.48 44.66 Q 169.69 57.18 166.15 75.41 Q 165.07 80.98 165.04 95.26 Q 165.02 104.93 165.06 172.65 Q 165.06 173.21 164.50 173.21 L 136.05 173.21 Q 135.49 173.21 135.52 172.65 Q 135.62 170.97 135.37 169.51 Q 135.05 167.64 135.05 166.38 Q 135.10 149.00 134.22 130.46 Q 133.95 124.61 133.65 102.67 Q 133.55 95.79 133.72 84.05 Q 133.88 73.51 135.83 65.63 Q 138.74 53.89 141.92 47.45 Q 155.51 19.94 182.74 8.72 Q 199.27 1.91 219.26 0.00 L 234.22 0.00 Z"/>
         <path d="M 342.16 0.00 Q 372.43 2.05 393.82 21.81 Q 401.22 28.65 406.82 36.97 Q 427.45 67.64 420.45 104.69 Q 418.52 114.96 414.25 123.60 Q 409.23 133.78 403.40 141.13 C 388.27 160.20 365.55 172.49 340.83 173.18 Q 309.80 174.05 285.77 154.57 C 260.19 133.83 248.80 99.28 255.87 66.97 Q 255.99 66.39 256.58 66.44 Q 257.73 66.53 258.92 66.86 Q 270.58 70.06 283.45 74.21 A 1.09 1.09 0.0 0 1 284.21 75.31 Q 283.75 83.24 283.75 83.25 Q 282.50 110.10 301.59 128.38 C 308.73 135.22 318.90 140.23 328.96 141.99 Q 342.01 144.28 355.39 139.79 Q 364.54 136.72 372.59 129.91 C 390.47 114.76 397.14 90.24 389.15 67.43 Q 383.75 51.99 370.77 41.83 C 354.91 29.42 335.35 27.40 316.49 34.96 Q 315.86 35.22 315.57 34.60 L 303.52 8.49 A 0.89 0.89 0.0 0 1 303.98 7.30 Q 318.23 1.22 333.94 0.00 L 342.16 0.00 Z"/>
@@ -110,6 +112,9 @@
         <button class="button" id="prepare-xiao-download" type="button" disabled>Скачать DXF для Xiao</button>
         <button class="button" id="prepare-xiao-open" type="button" hidden disabled>Открыть в Xiao</button>
         <p class="help-copy" id="xiao-result" role="status" hidden></p>
+      </div>
+      <div id="label-actions" class="label-actions">
+        <button type="button" id="label-printer" class="button" aria-haspopup="dialog" aria-controls="label-printer-dialog"><svg class="icon" aria-hidden="true"><use href="#i-printer"/></svg>Принтер</button>
       </div>
     </div>
     <section class="drawing" aria-label="Раскладка">
@@ -183,9 +188,22 @@
                 <circle cx="5" cy="5" r=".75" fill="#a5a6a2"/>
               </pattern>
               <linearGradient id="plotter-roller-metal" x2="0" y2="1">
-                <stop stop-color="#555854"/><stop offset=".18" stop-color="#b1b4ae"/>
-                <stop offset=".32" stop-color="#e8eae5"/><stop offset=".52" stop-color="#c4c7c0"/>
-                <stop offset=".82" stop-color="#888c85"/><stop offset="1" stop-color="#51554f"/>
+                <stop stop-color="#626c71"/><stop offset=".15" stop-color="#bcc7ca"/>
+                <stop offset=".32" stop-color="#f0f4f3"/><stop offset=".50" stop-color="#cbd3d3"/>
+                <stop offset=".80" stop-color="#889599"/><stop offset="1" stop-color="#515d62"/>
+              </linearGradient>
+              <linearGradient id="plotter-extrusion" x2="0" y2="1">
+                <stop stop-color="#e3e8e8"/><stop offset=".30" stop-color="#acb8bc"/>
+                <stop offset=".56" stop-color="#829197"/><stop offset=".59" stop-color="#5c6b70"/>
+                <stop offset="1" stop-color="#87959a"/>
+              </linearGradient>
+              <linearGradient id="plotter-graphite" x2=".25" y2="1">
+                <stop stop-color="#526269"/><stop offset=".45" stop-color="#394950"/>
+                <stop offset="1" stop-color="#253238"/>
+              </linearGradient>
+              <linearGradient id="plotter-grip-rubber" x2="0" y2="1">
+                <stop stop-color="#303b40"/><stop offset=".29" stop-color="#657277"/>
+                <stop offset=".5" stop-color="#515e63"/><stop offset="1" stop-color="#293439"/>
               </linearGradient>
               <linearGradient id="plotter-side-metal">
                 <stop stop-color="#737771"/><stop offset=".13" stop-color="#e2e4dd"/>
@@ -213,9 +231,19 @@
                 <path d="M8-4v12m3-12v12" fill="none" stroke="#777c73" stroke-width=".8"/>
               </g>
               <g id="plotter-bridge-shoe">
-                <path d="M-6-10h11l2 3V8l-2 3H-6l-2-3V-7Z" fill="url(#plotter-enamel)" stroke="#484c46"/>
-                <path d="M-5-5h9v10h-9Z" fill="#71756e"/>
-                <use href="#plotter-fixing" x="-2" y="-7"/><use href="#plotter-fixing" x="-2" y="8"/>
+                <path d="M-7-9l3-3h8l3 3V9l-3 3h-8l-3-3Z" fill="url(#plotter-graphite)" stroke="#334147"/>
+                <path d="M-5-5h10v10H-5Z" fill="url(#plotter-extrusion)" stroke="#607178" stroke-width=".8"/>
+                <use href="#plotter-fixing" y="-8"/><use href="#plotter-fixing" y="8"/>
+              </g>
+              <g id="plotter-tool-carriage">
+                <path d="M-20-39l6-6h25l8 7v15l-5 6h-28l-6-6Z" class="plotter-carriage"/>
+                <path d="M-16-37l4-4H8l5 4v12l-3 4h-22l-4-4Z" class="plotter-carriage-cover"/>
+                <path d="M-11-35h7m-7 3h7m-7 3h7" class="plotter-carriage-vents"/>
+                <path d="M1-38h5l3 3v10l-3 3H1Z" fill="url(#plotter-side-metal)"/>
+                <path d="M-11-41H1" fill="none" stroke="#d6a467" stroke-width="2"/>
+                <use href="#plotter-fixing" x="14" y="-34"/><use href="#plotter-fixing" x="-15" y="-22"/>
+                <path d="M-6-20H6v9L3-6h-6l-3-5Z" class="plotter-tool-holder"/>
+                <path d="M-5-16H5m-9 4h8" class="plotter-tool-ring"/>
               </g>
             </defs>
             <g id="table-layer" pointer-events="none" aria-hidden="true"></g>
@@ -225,9 +253,13 @@
             <g id="path-layer"></g>
             <g id="part-highlight-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="notch-layer" pointer-events="none" aria-hidden="true"></g>
+            <g id="pass-boundaries" pointer-events="none" aria-hidden="true"></g>
+            <g id="waste-trim-layer" pointer-events="none" aria-hidden="true"></g>
             <g id="live-trace-layer" pointer-events="none" aria-hidden="true">
               <path id="live-travel-trace" class="travel-trace" vector-effect="non-scaling-stroke"/>
               <path id="live-cut-trace" class="cut-trace" vector-effect="non-scaling-stroke"/>
+              <path id="live-entry-travel" class="travel-trace" vector-effect="non-scaling-stroke"/>
+              <g id="live-verified-vertices"></g>
               <path id="live-active-segment" vector-effect="non-scaling-stroke"/>
             </g>
             <g id="simulation-layer" pointer-events="none" aria-hidden="true"></g>
@@ -358,7 +390,10 @@
       </div>
       <div class="workspace-dock">
         <section class="layout-panel" aria-labelledby="layout-title">
-          <h2 id="layout-title">Статистика раскладки</h2>
+          <div class="layout-heading">
+            <h2 id="layout-title">Статистика раскладки</h2>
+            <p class="waste-trim-info" id="waste-trim-info" hidden></p>
+          </div>
           <p id="layout-empty">Откройте чертёж для расчёта</p>
           <div class="cut-statistics" id="layout-statistics" hidden></div>
           <section class="simulation-dock" id="simulation-dock" aria-label="Симуляция раскроя" hidden>
@@ -423,6 +458,27 @@
       <button type="button" role="menuitem" id="part-menu-delete" class="part-menu-delete" data-part-action="delete" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Удалить деталь</button>
     </div>
   </div>
+
+  <dialog class="plotter-dialog label-printer-dialog" id="label-printer-dialog" aria-labelledby="label-printer-title">
+    <header class="drawing-dialog-heading"><h2 id="label-printer-title">Принтер</h2></header>
+    <div class="drawing-dialog-body label-printer-body">
+      <p>Добавьте локальный или сетевой принтер в Windows на компьютере оператора, затем обновите список.</p>
+      <div class="label-printer-controls">
+        <label class="label-input">Принтер этикеток<select aria-describedby="label-printer-status" disabled></select></label>
+        <button type="button" class="button" data-action="refresh">Обновить список</button>
+      </div>
+      <p id="label-printer-status" role="status"></p>
+      <div class="label-print-options">
+        <button type="button" id="label-auto" class="button" aria-pressed="true" hidden>Автопечать</button>
+        <button type="button" id="label-open" class="button" hidden>Скачать PDF</button>
+      </div>
+      <p id="label-print-status" role="status"></p>
+    </div>
+    <footer class="dialog-actions">
+      <button type="button" class="button" data-action="cancel" autofocus>Закрыть</button>
+      <button type="button" class="button primary" data-action="save" disabled>Сохранить принтер</button>
+    </footer>
+  </dialog>
 
   <dialog class="plotter-dialog confirm-action-dialog" id="confirm-action-dialog" aria-labelledby="confirm-action-title">
     <form method="dialog">

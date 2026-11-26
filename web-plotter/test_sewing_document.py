@@ -7,7 +7,7 @@ from unittest.mock import Mock
 from xml.etree.ElementTree import fromstring
 
 from sewing_document import _part_sheet, registry_part_document
-from sewing_pdf import render_part_preview_svg, render_sewing_pdf
+from sewing_pdf import _cut_rows, _seam_rows, render_part_preview_svg, render_sewing_pdf
 from server import Handler
 
 
@@ -29,8 +29,12 @@ class SewingDocumentTests(TestCase):
         self.assertEqual(sheet["marks"], [{"point": [120, 40]}])
 
     def test_all_pdf_sections_stay_on_portrait_a4(self):
-        path = {"points": [[0, 0], [2100, 0], [2100, 100], [0, 100]], "closed": True, "partNumber": 1}
+        path = {"points": [[0, 0], [2100, 0], [2100, 100], [0, 100]], "closed": True,
+                "partNumber": 1, "partDisplayNumber": "2/1"}
         part = _part_sheet(1, [path])
+        part["pattern"] = {"number": "A", "sewing": [{"name": "Шов", "other": "A"}]}
+        self.assertEqual(_cut_rows([part], {"paths": [path]})[0][::3], ("2/1", "Включена"))
+        self.assertIn("№ 2/1", _seam_rows([part])[0][2])
         pdf = render_sewing_pdf("Комплект", [part], workspace={"paths": [path]}, context={"widthMm": 1500})
         boxes = findall(rb"/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]", pdf)
         self.assertGreaterEqual(len(boxes), 6)

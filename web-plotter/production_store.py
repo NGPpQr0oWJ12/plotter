@@ -401,20 +401,18 @@ def restore_part_labels(workspace, source, *, check_geometry=False):
         if number is None:
             continue
         present = {field: path[field] for path in actual for field in PART_LABEL_FIELDS if field in path}
-        if "partName" in present:
-            labels[number] = present
-            continue
-        if number not in originals:
-            continue
-        original = originals[number]
-        if check_geometry and not same_part_geometry(original, actual):
-            continue
-        labels[number] = {field: path[field] for path in original for field in PART_LABEL_FIELDS if field in path}
+        original = originals.get(number)
+        if (("partName" not in present or "partDisplayNumber" not in present) and original
+                and (not check_geometry or same_part_geometry(original, actual))):
+            present = {**{field: path[field] for path in original for field in PART_LABEL_FIELDS if field in path},
+                       **present}
+        labels[number] = present
     return {**workspace, "paths": [{**labels.get(path.get("partNumber"), {}), **path} for path in workspace["paths"]]}
 
 
 def missing_part_labels(workspace):
-    return any("partNumber" in path and "partName" not in path for path in workspace["paths"])
+    return any("partNumber" in path and ("partName" not in path or "partDisplayNumber" not in path)
+               for path in workspace["paths"])
 
 
 def check_kit_geometry(source, draft):
@@ -840,6 +838,7 @@ class ProductionStore:
     def expand_parts(self, db, members, multiplier=1, *, part_records=None):
         paths, part_number, point_count = [], 0, 0
         products = {None: None}
+        numbers_by_part = defaultdict(list)
 
         def product_name(parent):
             ancestors = []
@@ -887,9 +886,14 @@ class ProductionStore:
                                **labels, **({"partRotation": "none"} if directed else {})} for path in contours]
                 for _ in range(amount):
                     part_number += 1
+                    numbers_by_part[part["id"]].append(part_number)
                     if part_records is not None:
                         part_records[part_number] = part
                     paths.extend({**path, "partNumber": part_number} for path in normalized)
+        display_numbers = {number: f"{numbers[-1]}/{copy}" if len(numbers) > 1 else str(number)
+                           for numbers in numbers_by_part.values() for copy, number in enumerate(numbers, 1)}
+        for path in paths:
+            path["partDisplayNumber"] = display_numbers[path["partNumber"]]
         return paths
 
     def collect(self, values):

@@ -1,9 +1,20 @@
 """Check that a release can save existing Plotter data without dropping fields."""
 
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
+import sqlite3
 import sys
+
+
+def check_sqlite(path, copy=None):
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError(f"{path.name}: SQLite integrity check failed")
+        if copy is not None:
+            with closing(sqlite3.connect(copy)) as target:
+                db.backup(target)
 
 
 def validate(application, state):
@@ -38,16 +49,24 @@ def validate(application, state):
             from production_store import ProductionStore
             ProductionStore(production).check()
         else:
-            # A previous release leaves the new database untouched during rollback.
-            import sqlite3
-            from contextlib import closing
-            with closing(sqlite3.connect(production.as_uri() + "?mode=ro", uri=True)) as db:
-                if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise ValueError("production.sqlite3: invalid registry database")
+            check_sqlite(production)
+
+    labels = state / "labels.sqlite3"
+    if labels.exists():
+        if (application / "label_queue.py").is_file():
+            from label_queue import LabelQueue
+            # Queue initialization can migrate records. Keep the recovery backup unchanged.
+            with TemporaryDirectory(prefix="plotter-labels-check-") as scratch:
+                path = Path(scratch) / labels.name
+                check_sqlite(labels, copy=path)
+                LabelQueue(path, load_bundle=None)
+        else:
+            # A previous release leaves the database untouched during rollback.
+            check_sqlite(labels)
 
 
 if __name__ == "__main__":
     try:
         validate(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except (ValueError, OSError, KeyError, TypeError, sqlite3.Error) as error:
         raise SystemExit(str(error)) from error

@@ -10,6 +10,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+from time import monotonic, sleep
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
@@ -17,7 +18,7 @@ import ezdxf
 
 from controller import ControllerError
 from cut_journal import CutJournal
-from server import CutProgress, PlotterServer, RollRun
+from server import CutProgress, PlotterServer, RollRun, drawing_key
 from workspace import WorkspaceConflict, WorkspaceStore
 
 EXAMPLE_PROFILE = Path(__file__).resolve().parent.parent / "research" / "machine-profile.example.json"
@@ -67,13 +68,121 @@ class ServerFlowTests(unittest.TestCase):
         return {"uploaded": True, "phase": "confirmed", "commitSent": True,
                 "points": job.point_count, "jobReceipt": "fake-receipt", "baselineEvent": {"code": 5}}
 
-    def request(self, path, data, expected=HTTPStatus.OK):
+    def request(self, path, data, expected=HTTPStatus.OK, *, headers=None):
         with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
-            client.request("POST", path, json.dumps(data).encode("utf-8"), {"Content-Type": "application/json"})
+            client.request("POST", path, json.dumps(data).encode("utf-8"),
+                           {"Content-Type": "application/json", **(headers or {})})
             response = client.getresponse()
             payload = json.loads(response.read())
         self.assertEqual(response.status, expected, payload)
         return payload
+
+    def publish_demo_material(self, name, length=60):
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": name, "entities": [
+            {"id": "outline", "type": "polyline", "layer": "0", "closed": True,
+             "points": [[0, 0], [length, 0], [length, 20], [0, 20]]}]})
+        order = self.request("/api/orders", {"action": "save", "number": name})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Ткань", "widthMm": 1380,
+                                             "members": [{"id": part["id"], "quantity": 1}]})
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        return order["cutId"]
+
+    def scoped_demo_request(self, cut_id, path, data, expected=HTTPStatus.OK):
+        return self.request("/demo/api/" + path, data, expected, headers={"X-Plotter-Demo-Cut": cut_id})
+
+    def test_scoped_demo_cuts_can_run_independently_with_private_state_and_existing_save_guards(self):
+        first = self.publish_demo_material("Длинный", 3150)
+        second = self.publish_demo_material("Короткий")
+        self.controller.reset_mock()
+        clock = [100.]
+
+        def start(cut_id):
+            select = self.scoped_demo_request(cut_id, "cut-context", {"action": "select", "cutId": cut_id})
+            job, name = self.server.workspace_drawing(select["workspace"])
+            job["cutContext"] = [cut_id, select["cutRevision"]]
+            plan = self.scoped_demo_request(cut_id, "cut-plan", {"job": job, "filename": name})
+            token = self.scoped_demo_request(cut_id, "control-session", {"action": "arm", "ready": True})["controlToken"]
+            options = {"cutId": cut_id, "controlToken": token, "planId": plan["planId"], "advanceConfirmed": True}
+            upload = self.scoped_demo_request(cut_id, "controller-upload", options)
+            self.scoped_demo_request(cut_id, "controller-operation", {**options, "action": "cut", "jobVerified": True,
+                                                                       "jobReceipt": upload["jobReceipt"]})
+            return token
+
+        with patch("demo_controller.monotonic", side_effect=lambda: clock[0]):
+            token = start(first)
+            clock[0] += 35
+            pending = self.scoped_demo_request(first, "controller-live", {})
+            self.assertEqual((pending["selectedCut"], pending["roll"]["state"], pending["roll"]["nextPage"]),
+                             (first, "advance", 2))
+            before = self.scoped_demo_request(second, "controller-live", {})
+            self.assertIsNone(before["roll"])
+            self.assertIsNone(before["cutProgress"])
+            self.assertFalse(before["cutJournal"])
+            self.scoped_demo_request(second, "controller-operation", {"action": "vacuum", "controlToken": token},
+                                     HTTPStatus.BAD_REQUEST)
+            self.scoped_demo_request(second, "cut-context", {"action": "select", "cutId": first}, HTTPStatus.CONFLICT)
+            self.scoped_demo_request(first, "cut-context", {"action": "select", "cutId": None}, HTTPStatus.CONFLICT)
+            self.scoped_demo_request(second, "controller-upload", {"cutId": first, "controlToken": token}, HTTPStatus.CONFLICT)
+            self.scoped_demo_request(second, "controller-operation", {"action": "cut", "cutId": first}, HTTPStatus.CONFLICT)
+            self.scoped_demo_request(first, "new-cut", {"revision": 0, "stopped": True}, HTTPStatus.CONFLICT)
+            start(second)
+            clock[0] += 35
+            finished = self.scoped_demo_request(second, "controller-live", {})
+            self.assertEqual((finished["selectedCut"], finished["cutProgress"]["state"]), (second, "completed"))
+            resumed = self.scoped_demo_request(first, "cut-context", {"action": "select", "cutId": first})
+            self.assertEqual(resumed["roll"], pending["roll"])
+            self.assertEqual(resumed["cutProgress"]["pages"], pending["cutProgress"]["pages"])
+            self.assertIsNone(self.request("/demo/api/controller-live", {})["selectedCut"])
+
+            for material, expected in ((first, HTTPStatus.CONFLICT), (second, HTTPStatus.OK)):
+                saved = self.server.production.workspace(material, "demo")
+                with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+                    client.request("GET", f"/api/operator-workspace?mode=demo&cutId={material}")
+                    response = client.getresponse()
+                    view = json.loads(response.read())
+                self.assertEqual(response.status, HTTPStatus.OK)
+                self.assertNotIn("roll", view)
+                self.assertEqual(view["revision"], saved["revision"])
+                if material == second:
+                    self.server.selected_cut, self.server.loaded_plan = second, ("real", "physical", 1)
+                self.request("/api/operator-workspace", {"action": "save", "cutId": material, "mode": "demo",
+                                                         "revision": saved["revision"], "workspace": saved["workspace"]}, expected)
+        self.controller.upload_job.assert_not_called()
+        self.controller.operate.assert_not_called()
+
+    def test_scoped_demo_never_replaces_live_legacy_and_can_take_over_an_empty_selection(self):
+        first = self.publish_demo_material("Прежний")
+        second = self.publish_demo_material("Новый")
+        self.request("/demo/api/cut-context", {"action": "select", "cutId": first})
+        token = self.request("/demo/api/control-session", {"action": "arm", "ready": True})["controlToken"]
+        conflict = self.scoped_demo_request(first, "cut-context", {"action": "select", "cutId": first}, HTTPStatus.CONFLICT)
+        self.assertEqual(conflict["code"], "demo_legacy_cut")
+        self.assertEqual(self.request("/demo/api/cut-context", {"action": "select", "cutId": first, "resumeOnly": True})["selectedCut"], first)
+        self.request("/demo/api/cut-context", {"action": "select", "cutId": second, "resumeOnly": True}, HTTPStatus.CONFLICT)
+        self.assertEqual(self.scoped_demo_request(second, "cut-context", {"action": "select", "cutId": second})["selectedCut"], second)
+        duplicate = self.request("/demo/api/cut-context", {"action": "select", "cutId": second}, HTTPStatus.CONFLICT)
+        self.assertEqual(duplicate["code"], "demo_cut_in_use")
+        self.request("/demo/api/control-session", {"action": "disarm", "controlToken": token})
+        self.assertEqual(self.scoped_demo_request(first, "cut-context", {"action": "select", "cutId": first})["selectedCut"], first)
+        self.assertIsNone(self.server.demo.selected_cut)
+
+    def test_scoped_demo_capacity_keeps_unfinished_and_does_not_cache_unknown_materials(self):
+        first = self.publish_demo_material("Первый")
+        second = self.publish_demo_material("Второй")
+        self.scoped_demo_request("e" * 32, "controller-live", {}, HTTPStatus.NOT_FOUND)
+        self.assertFalse(self.server.demo_scopes)
+        with patch("server.DEMO_CUT_CAPACITY", 1):
+            self.scoped_demo_request(first, "cut-context", {"action": "select", "cutId": first})
+            state = self.server.demo_scopes[first].plotter
+            state.loaded_plan = ("receipt", "plan", 1)
+            self.scoped_demo_request(second, "cut-context", {"action": "select", "cutId": second}, HTTPStatus.CONFLICT)
+            self.assertIs(self.server.demo_scopes[first].plotter, state)
+            self.assertFalse(state.label_shutdown.is_set())
+            state.loaded_plan = None
+            self.scoped_demo_request(second, "cut-context", {"action": "select", "cutId": second})
+            self.assertEqual(set(self.server.demo_scopes), {second})
+            self.assertTrue(state.label_shutdown.is_set())
 
     def save(self, workspace, revision=0):
         return self.request("/api/workspace", {"revision": revision, "workspace": workspace})["revision"]
@@ -411,7 +520,7 @@ class ServerFlowTests(unittest.TestCase):
             response = client.getresponse()
             status = json.loads(response.read())
         self.assertEqual(response.status, HTTPStatus.OK)
-        self.assertEqual(status["apiVersion"], 22)
+        self.assertEqual(status["apiVersion"], 27)
         self.assertIs(status["machine"]["liveCutProgress"], True)
         self.assertIs(status["nestingKeepsNotches"], True)
         self.assertIs(status["nestingPartRotation"], True)
@@ -429,6 +538,174 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(status["machine"]["actuators"], self.controller.actuator_snapshot.return_value)
         self.controller.read_live.assert_not_called()
         self.controller.operate.assert_not_called()
+
+    def test_label_designer_and_single_material_demo_follow_the_verified_cut(self):
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Царга", "entities": [
+            {"id": "outline", "type": "polyline", "layer": "0", "closed": True,
+             "points": [[20, 20], [80, 20], [80, 60], [20, 60]]}]})
+        order = self.request("/api/orders", {"action": "save", "number": "42"})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"],
+                             "orderRevision": order["revision"], "name": "Велюр", "widthMm": 1380,
+                             "members": [{"id": part["id"], "quantity": 1}]})
+        cut = {"cutId": order["cutId"]}
+        preview = {**cut, "kind": "part"}
+        self.assertEqual(self.request("/api/label-preview", preview)["parts"][0]["name"], "Царга")
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        self.assertTrue(self.request("/api/label-preview", preview)["image"].startswith("data:image/png;base64,"))
+        bundle = self.request("/api/label-source", {**cut, "mode": "demo"})
+        self.assertEqual(bundle["master"]["order"], bundle["master"]["ticket"])
+        def demo(path, data):
+            return self.request("/demo/api/" + path, data)
+        def pdf(path, data, expected=HTTPStatus.OK, *, base="/demo/api/"):
+            with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+                client.request("POST", base + path, json.dumps(data).encode("utf-8"),
+                               {"Content-Type": "application/json"})
+                response = client.getresponse()
+                content = response.read()
+                self.assertEqual(response.status, expected, content[:200] if response.status != expected else None)
+                return response.headers, content
+        headers, content = pdf("labels-pdf", cut)
+        self.assertEqual(headers.get_content_type(), "application/pdf")
+        self.assertEqual(len(re.findall(rb"/Type\s+/Page\b", content)), 2)
+        self.assertEqual(len(re.findall(rb"/Type\s+/Page\b", pdf("labels-pdf", {**cut, "key": "1"})[1])), 1)
+        self.assertFalse(demo("labels-status", cut)["runId"])
+        with patch.object(self.server, "central_mode", True):
+            self.assertEqual(len(re.findall(rb"/Type\s+/Page\b", pdf("labels-pdf", cut, base="/api/")[1])), 2)
+            pdf("labels-auto", cut, HTTPStatus.FORBIDDEN, base="/api/")
+        pdf("labels-auto", cut, HTTPStatus.NO_CONTENT)
+        clock = [100.]
+        with patch("demo_controller.monotonic", side_effect=lambda: clock[0]), patch("server.platform", "win32"), \
+                patch("label_printer.printers", return_value=["Thermal"]), patch("label_printer.print_label", return_value=19) as spool:
+            record = demo("cut-context", {**cut, "action": "select"})
+            self.assertTrue(demo("labels-status", cut)["enabled"])
+            source, filename = self.server.workspace_drawing(record["workspace"])
+            source["cutContext"] = [cut["cutId"], record["cutRevision"]]
+            plan = demo("cut-plan", {"job": source, "filename": filename})
+            token = demo("control-session", {"action": "arm", "ready": True})["controlToken"]
+            options = {**cut, "controlToken": token, "planId": plan["planId"]}
+            upload = demo("controller-upload", options)
+            self.assertFalse(demo("labels-status", cut)["ready"])
+            demo("controller-operation", {**options, "action": "cut", "jobVerified": True,
+                                          "jobReceipt": upload["jobReceipt"]})
+            clock[0] += 60
+            for _ in range(2):
+                self.assertEqual(demo("controller-live", {})["cutProgress"]["state"], "completed")
+            tape = demo("labels-status", cut)
+            self.assertEqual([job["kind"] for job in tape["jobs"]], ["part", "master"])
+            self.assertEqual(len(tape["ready"]), 1)
+            self.assertTrue(tape["masterReady"])
+            self.assertTrue(tape["enabled"])
+            deadline = monotonic() + 3
+            while any(job["status"] == "queued" for job in tape["jobs"]) and monotonic() < deadline:
+                sleep(.02)
+                tape = demo("labels-status", cut)
+            self.assertTrue(tape["autoMessage"])
+            spool.assert_not_called()
+            pdf("labels-auto", cut, HTTPStatus.NO_CONTENT)
+            self.request("/api/label-printers", {"printer": "Thermal"})
+            deadline = monotonic() + 3
+            while (tape["jobs"][-1]["status"] != "submitted" and monotonic() < deadline):
+                sleep(.02)
+                tape = demo("labels-status", cut)
+            self.assertEqual([job["status"] for job in tape["jobs"]], ["submitted", "submitted"])
+            self.assertEqual([call.args[4] for call in spool.call_args_list], ["Бирка №1 · заказ 42", "Мастер-бирка · заказ 42"])
+            pdf("labels-auto", {**cut, "release": "old-client-claim"}, HTTPStatus.NO_CONTENT)
+            self.controller.upload_job.assert_not_called()
+
+    def test_remote_label_relay_offer_is_scoped_to_controlled_demo_run(self):
+        cut = "f" * 32
+        state = self.server.demo
+        state.selected_cut = cut
+        with patch.object(self.server.labels, "kick"), patch.object(self.server, "central_mode", True), \
+                patch.object(self.server, "public_origin", "https://plotter.example.invalid"):
+            state.label_run = self.server.labels.begin(cut, "demo", 7, 1, [])
+            control = self.request("/demo/api/control-session", {"action": "arm", "ready": True})["controlToken"]
+            for unverified in ({"cutId": cut}, {"cutId": cut, "controlToken": "observer"}):
+                response = self.request("/demo/api/labels-status", unverified)
+                self.assertFalse(response["autoRelay"])
+                self.assertNotIn("relayKey", response)
+            payload = {"cutId": cut, "controlToken": control}
+            owner = self.request("/demo/api/labels-status", payload)
+            self.assertTrue(owner["autoRelay"])
+            with patch.object(state, "upload", return_value={"jobReceipt": "confirmed"}):
+                uploaded = self.request("/demo/api/controller-upload", payload)
+                self.assertEqual(uploaded["relayKey"], owner["relayKey"])
+                self.assertTrue(uploaded["enabled"])
+            self.request("/demo/api/labels-settings", {"cutId": cut, "enabled": False})
+            self.assertFalse(self.request("/demo/api/labels-status", payload)["autoRelay"])
+
+    def test_direct_label_requires_explicit_part_printer_and_local_windows(self):
+        part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Панель", "entities": [
+            {"id": "outline", "type": "polyline", "layer": "0", "closed": True,
+             "points": [[0, 0], [40, 0], [40, 20], [0, 20]]}]})
+        order = self.request("/api/orders", {"action": "save", "number": "42"})
+        order = self.request("/api/orders", {"action": "save-cut", "orderId": order["id"], "orderRevision": order["revision"],
+                                             "name": "Ткань", "widthMm": 1380,
+                                             "members": [{"id": part["id"], "quantity": 1}]})
+        self.request("/api/orders", {"action": "publish", "id": order["id"], "revision": order["revision"]})
+        cut = order["cutId"]
+        revision = self.server.production.workspace(cut, "demo")["cutRevision"]
+        payload = {"cutId": cut, "cutRevision": revision, "partKey": "1", "mode": "demo",
+                   "printer": "Thermal", "requestId": "direct-label-42", "confirmed": True}
+        with patch("server.platform", "win32"), patch.object(self.server, "central_mode", True), \
+                patch("label_printer.printers", return_value=["Thermal", "Other"]), \
+                patch("label_printer.print_label", return_value=42) as driver:
+            self.request("/api/label-printers", {"printer": "Thermal"})
+            for body in ({**payload, "confirmed": False}, {**payload, "partKey": "master"}, {**payload, "partKey": "99"}):
+                self.request("/api/label-print-part", body, HTTPStatus.BAD_REQUEST)
+            self.request("/demo/api/label-print-part", {**payload, "mode": "operator"}, HTTPStatus.BAD_REQUEST)
+            self.request("/api/label-print-part", {**payload, "cutRevision": revision + 1}, HTTPStatus.CONFLICT)
+            self.request("/api/label-print-part", {**payload, "printer": "Other"}, HTTPStatus.CONFLICT)
+            with patch.object(self.server, "public_origin", "https://plotter.example.invalid"):
+                self.request("/api/label-printers", {"printer": "Thermal"}, HTTPStatus.FORBIDDEN)
+                self.request("/demo/api/label-print-part", payload, HTTPStatus.FORBIDDEN)
+            driver.assert_not_called()
+            for _ in range(2):
+                result = self.request("/api/label-print-part", payload)
+                self.assertEqual((result["status"], result["spoolId"]), ("submitted", 42))
+            driver.assert_called_once()
+            self.assertTrue(driver.call_args.args[1].startswith(b"\x89PNG"))
+        self.assertFalse(self.server.labels.status(cut, "demo")["jobs"])
+
+    def test_windows_companion_requests_explicit_demo_bundle_for_direct_print(self):
+        from label_layout import defaults
+
+        origin, cut = "https://plotter.example.invalid", "a" * 32
+        payload = {"cutId": cut, "cutRevision": 7, "partKey": "1", "mode": "demo", "printer": "Thermal",
+                   "requestId": "direct-demo-label", "confirmed": True}
+        bundle = {"templates": defaults(), "parts": {"1": {"name": "Спинка"}}, "cutRevision": 7, "master": {}}
+        for local_ui in (False, True):
+            with self.subTest(local_ui=local_ui), patch("server.platform", "win32"), \
+                    patch("server.Controller", return_value=self.controller), patch("server.ssl.create_default_context"), \
+                    patch("label_printer.printers", return_value=["Thermal"]), patch("label_printer.print_label", return_value=92) as driver, \
+                    PlotterServer(0, Path(self.directory.name) / str(local_ui) / "workspace.json", profile_path=EXAMPLE_PROFILE,
+                                  companion_origin=origin, central_ca=Path("cert.pem") if local_ui else None) as helper:
+                worker = Thread(target=helper.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+                worker.start()
+                host = f"127.0.0.1:{helper.server_port}"
+                headers = {"Origin": "http://" + host if local_ui else origin, "X-Plotter-Companion": "1",
+                           "Content-Type": "application/json"}
+
+                def request(method, path, body=None):
+                    with closing(HTTPConnection(host, timeout=5)) as connection:
+                        connection.request(method, path, json.dumps(body) if body is not None else None, headers)
+                        response = connection.getresponse()
+                        data = json.loads(response.read())
+                        self.assertEqual(response.status, HTTPStatus.OK, data)
+                        self.assertEqual(response.getheader("Access-Control-Allow-Origin"), None if local_ui else origin)
+                        return data
+
+                try:
+                    with patch.object(helper.workspace, "production_request", return_value=bundle) as load:
+                        self.assertEqual(request("GET", "/api/label-printers")["preferred"], "")
+                        self.assertEqual(request("POST", "/api/label-printers", {"printer": "Thermal"})["preferred"], "Thermal")
+                        self.assertEqual(request("POST", "/api/label-print-part", payload)["status"], "submitted")
+                        self.assertEqual(request("POST", "/demo/api/label-print-part", payload)["status"], "submitted")
+                        load.assert_called_once_with("/api/label-source", {"cutId": cut, "mode": "demo", "cutRevision": 7})
+                    driver.assert_called_once()
+                finally:
+                    helper.shutdown()
+                    worker.join()
 
     def test_order_analysis_matches_operator_cut_plan(self):
         part = self.request("/api/registry", {"action": "save", "kind": "part", "name": "Панель", "entities": [
@@ -1070,6 +1347,46 @@ class ServerFlowTests(unittest.TestCase):
         self.assertIn("после округления координат Xiao до 0,001 мм", plan["uploadIssue"])
         self.upload(plan, HTTPStatus.BAD_REQUEST, advanceConfirmed=True)
         self.controller.upload_job.assert_not_called()
+
+    def test_trim_plan_identity_tracks_protected_geometry_without_route_optimization(self):
+        job = {"paths": drawing()["paths"], "optimize": False, "materialWidthMm": 200}
+        original = drawing_key(job, "test", 500, 500, 0)
+        job["paths"][0]["partNumber"] = 1
+        numbered = drawing_key(job, "test", 500, 500, 0)
+        self.assertNotEqual(original, numbered)
+        job["paths"][0]["notch"] = True
+        self.assertNotEqual(numbered, drawing_key(job, "test", 500, 500, 0))
+
+    def test_waste_trim_is_last_in_direct_job_but_absent_from_xiao_dxf(self):
+        draft = drawing()
+        draft["paths"] = [{"layer": "part", "closed": True, "partNumber": 1,
+                           "points": [[10, 10], [50, 10], [50, 30], [10, 30]]}]
+        draft["excluded"] = []
+        draft["optimization"]["nesting"] = {"widthMm": 90, "gapMm": 3, "marginMm": 6,
+                                            "rotation": "quarter", "widthExplicit": True}
+        revision = self.save(draft)
+        job, filename = self.server.workspace_drawing(self.server.workspace.read()["workspace"])
+        plan = self.request("/api/cut-plan", {"job": job, "filename": filename})
+        page, = plan["pages"]
+        self.assertEqual(page["pathEndIndices"], [5])
+        self.assertEqual(page["wasteTrim"]["pathEndIndices"], [7])
+        trim, = page["wasteTrim"]["paths"]
+        self.assertEqual(sorted(trim["points"]), [[56, 0], [56, 90]])
+        _, contents = self.server.prepare_xiao(plan["planId"])
+        path = Path(self.directory.name) / "test.dxf"
+        path.write_bytes(contents)
+        self.assertEqual(len(ezdxf.readfile(path).modelspace().query("LWPOLYLINE")), 1)
+        self.upload(plan)
+        encoded = self.controller.upload_job.call_args.args[0]
+        self.assertEqual(encoded.point_count, 7)
+        for i, (x, y) in enumerate(trim["points"], start=6):
+            point, knife_down = encoded.vertex(i)
+            self.assertEqual(point, (x + .01, y + .01))
+            self.assertEqual(knife_down, i == 7)
+        draft["optimization"]["nesting"]["widthMm"] = 80
+        self.save(draft, revision)
+        self.upload(plan, expected=HTTPStatus.CONFLICT)
+        self.controller.upload_job.assert_called_once()
 
     def test_roll_upload_advances_one_verified_page_at_a_time(self):
         _, _, plan = self.roll_plan()

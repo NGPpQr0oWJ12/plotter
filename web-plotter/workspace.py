@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -13,7 +14,7 @@ VERSION = 1
 MAX_REVISION = (1 << 53) - 1  # Exactly representable by the browser.
 # Includes 50,000 contour layer names and 250,000 points at the CAD limits.
 MAX_WORKSPACE_BYTES = 96 * 1024 * 1024
-PART_LABEL_FIELDS = ("partName", "productName")
+PART_LABEL_FIELDS = ("partName", "productName", "partDisplayNumber")
 WORKSPACE_REVISION_CONFLICT = "workspace_revision_conflict"
 WORKSPACE_REVISION_MESSAGE = "Рабочая область изменилась в другой вкладке. Обновите страницу."
 
@@ -53,8 +54,12 @@ def part_path_labels(path):
         if field not in path:
             continue
         label = path[field]
-        if (path.get("partNumber") is None or not _text(label, 255) or not label.strip()
-                or any(ord(character) < 32 for character in label)):
+        if field == "partDisplayNumber":
+            if (path.get("partNumber") is None or not isinstance(label, str)
+                    or not re.fullmatch(r"[1-9][0-9]{0,15}(?:/[1-9][0-9]{0,15})?", label)):
+                raise ValueError("Неверное обозначение детали в раскладке.")
+        elif (path.get("partNumber") is None or not _text(label, 255) or not label.strip()
+              or any(ord(character) < 32 for character in label)):
             raise ValueError("Неверное название детали или изделия в раскладке.")
         labels[field] = label
     return labels
@@ -181,7 +186,7 @@ def drawing_paths(paths):
         labels = part_path_labels(path)
         for field, label in labels.items():
             if part_labels.setdefault((part_number, field), label) != label:
-                raise ValueError("У контуров одной детали разные названия.")
+                raise ValueError("У контуров одной детали разные обозначения или названия.")
         clean_path.update(labels)
         if "partAngle" in path:
             angle = path["partAngle"]

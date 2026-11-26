@@ -1,5 +1,6 @@
 ezdxf==1.4.5
 reportlab==5.1.0
+Pillow>=10,<14
 tzdata==2026.6; sys_platform == "win32"
 shapely==2.1.2
 scipy==1.15.3; python_version < "3.14"
