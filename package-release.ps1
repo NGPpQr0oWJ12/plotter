@@ -138,6 +138,7 @@ $files = @(
     'web-plotter/static/designer-3d-fit.js',
     'web-plotter/static/designer-shortcuts.js',
     'web-plotter/static/plotter-monochrome.css',
+    'web-plotter/static/plotter.ico',
     'web-plotter/static/index.html',
     'web-plotter/static/simulation.js',
     'web-plotter/static/style.css',

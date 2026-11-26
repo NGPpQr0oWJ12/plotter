@@ -180,7 +180,7 @@ PY
     fi
     install -m 0644 "$source"/web-plotter/static/*.{css,html,js} "$final/web-plotter/static/"
     local asset
-    for asset in OpenGostTypeB-Regular.ttf OpenGost-OFL.txt three-license.txt; do
+    for asset in OpenGostTypeB-Regular.ttf OpenGost-OFL.txt three-license.txt plotter.ico; do
         if [[ -f $source/web-plotter/static/$asset ]]; then
             install -m 0644 "$source/web-plotter/static/$asset" "$final/web-plotter/static/"
         fi
