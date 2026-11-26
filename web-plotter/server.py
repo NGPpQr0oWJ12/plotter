@@ -92,6 +92,7 @@ DEMO_CUT_CAPACITY = 32
 DEMO_CUT_IDLE_SECONDS = 15 * 60
 MIME = {
     "/": ("index.html", "text/html; charset=utf-8"),
+    "/plotter.ico": ("plotter.ico", "image/x-icon"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/simulation.js": ("simulation.js", "text/javascript; charset=utf-8"),

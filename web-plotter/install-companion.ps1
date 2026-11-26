@@ -30,6 +30,26 @@ function Get-CentralOrigin([string]$Value) {
     return "https://$authority"
 }
 
+function Set-CompanionShortcut([string]$Programs, [string]$ApplicationPath, [int]$Port, [switch]$Create) {
+    if (!$Programs) { throw 'Start menu is unavailable.' }
+    $path = Join-Path $Programs 'Plotter.url'
+    $exists = [IO.File]::Exists($path)
+    if (!$exists -and !$Create) { return }
+    $icon = Join-Path $ApplicationPath 'static\plotter.ico'
+    if (!(Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'The companion icon is missing.' }
+    $contents = "[InternetShortcut]`r`nURL=http://127.0.0.1:$Port/`r`nIconFile=$icon`r`nIconIndex=0`r`n"
+    if ($exists -and [IO.File]::ReadAllText($path) -ceq $contents) { return }
+    $pending = Join-Path $Programs ('Plotter-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        # Windows INI readers use UTF-16 with a BOM for Unicode paths.
+        [IO.File]::WriteAllText($pending, $contents, [Text.Encoding]::Unicode)
+        if ($exists) { [IO.File]::Replace($pending, $path, [NullString]::Value) }
+        else { [IO.File]::Move($pending, $path) }
+    } finally {
+        if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) }
+    }
+}
+
 function Test-ControllerAddress([string]$Value) {
     $address = $null
     return ($Value -match '^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$' -and
@@ -393,14 +413,11 @@ try {
     throw $failure
 }
 
-if ($Graphical) {
+if ($Graphical -or $update) {
     try {
-        $programs = [Environment]::GetFolderPath('Programs')
-        if (!$programs) { throw 'Start menu is unavailable.' }
-        $shortcut = "[InternetShortcut]`r`nURL=http://127.0.0.1:$port/`r`n"
-        [IO.File]::WriteAllText((Join-Path $programs 'Plotter.url'), $shortcut, [Text.Encoding]::ASCII)
+        Set-CompanionShortcut ([Environment]::GetFolderPath('Programs')) $applicationPath $port -Create:$Graphical
     } catch {
-        Write-Warning 'Не удалось создать ярлык Plotter в меню «Пуск». Панель доступна по адресу http://127.0.0.1:8767/.'
+        Write-Warning 'Не удалось обновить ярлык Plotter в меню «Пуск». Панель доступна по адресу http://127.0.0.1:8767/.'
     }
 }
 Write-Host 'Plotter companion is running and will start when this Windows user signs in.'
