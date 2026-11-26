@@ -1028,6 +1028,32 @@ class ServerFlowTests(unittest.TestCase):
         self.upload(plan, HTTPStatus.CONFLICT, page=2, autoRunOff=True, advanceConfirmed=True)
         self.assertEqual(self.controller.upload_job.call_count, 2)
 
+    def test_xiao_ignores_stationary_notches_but_keeps_the_other_cut_paths(self):
+        workspace = drawing()
+        width = self.server.simulator.width
+        outline = {"layer": "Крой", "closed": True, "partNumber": 1,
+                   "points": [[10, 10], [20, 10], [20, 20], [10, 20]]}
+        artifact = {"layer": "Насечки", "notch": True, "partNumber": 1,
+                    "points": [[20, 15], [20.000001, 15]]}
+        notch = {**artifact, "points": [[20, 17], [25, 17]]}
+        next_pass = {**outline, "partNumber": 2,
+                     "points": [[x + width, y] for x, y in outline["points"]]}
+        workspace["excluded"] = []
+        workspace["optimization"]["routeApplied"] = False
+
+        for mode, extra in (("single", []), ("roll", [next_pass])):
+            with self.subTest(mode=mode):
+                workspace["paths"] = [outline, artifact, notch, *extra]
+                plan = self.preview(workspace)
+                self.assertEqual(plan["mode"], mode)
+                self.assertTrue(plan["canUpload"], plan.get("uploadIssue") or plan["issues"])
+                page = plan["pages"][0]
+                self.assertEqual([path["index"] for path in page["paths"]], [0, 2])
+                self.assertEqual(page["paths"][1]["points"], notch["points"])
+                self.assertEqual(page["pathEndIndices"], [5, 7])
+                if extra:
+                    self.assertEqual(plan["pages"][1]["pathEndIndices"], [5])
+
     def test_roll_prevalidates_a_later_section_before_transferring_the_first(self):
         workspace = drawing()
         width = self.server.simulator.width
@@ -1041,7 +1067,7 @@ class ServerFlowTests(unittest.TestCase):
         self.assertFalse(plan["canUpload"])
         self.assertTrue(plan["canPrepareXiao"])
         self.assertIn("Проход 2 нельзя загрузить", plan["uploadIssue"])
-        self.assertIn("вырождается после округления", plan["uploadIssue"])
+        self.assertIn("после округления координат Xiao до 0,001 мм", plan["uploadIssue"])
         self.upload(plan, HTTPStatus.BAD_REQUEST, advanceConfirmed=True)
         self.controller.upload_job.assert_not_called()
 

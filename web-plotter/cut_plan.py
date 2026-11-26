@@ -1,13 +1,14 @@
 """Prepare the geometry shown by the simulator before using a real controller."""
 
 from bisect import bisect_left, bisect_right
+from dataclasses import replace
 from itertools import pairwise
 from math import dist
 import re
 
 from machine import FEED_SPEED, MAX_PATHS, MAX_POINTS, PlotterError, build_plan, cut_route, number
 from route_optimizer import optimize_page_route
-from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page
+from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page, xiao_coordinates
 
 
 MAX_COORDINATE_MM = 1_000_000_000
@@ -179,6 +180,15 @@ def _path(index, layer, points, closed):
     return {"index": index, "layer": layer, "points": [list(point) for point in points], "closed": closed}
 
 
+def _stationary_notch(contour, is_notch, start_x):
+    if not is_notch or contour.closed:
+        return False
+    points = iter(contour.points)
+    x, y = next(points)
+    start = xiao_coordinates(x - start_x, y)
+    return all(xiao_coordinates(x - start_x, y) == start for x, y in points)
+
+
 def _prepare_route(result, plan, part_numbers, optimize, notch_flags):
     if not optimize:
         return
@@ -289,15 +299,21 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
             result["mode"] = "roll"
 
     if result["mode"] == "single":
+        indexed = [(index, contour) for index, contour in enumerate(plan.contours)
+                   if not _stationary_notch(contour, notch_flags[index], 0.0)]
+        if not indexed:
+            result["issues"].append({"message": "Насечки слишком малы для реза на Xiao. Добавьте контуры для раскроя.",
+                                     "indices": list(range(len(plan.contours)))})
+            return result
+        indices, contours = zip(*indexed)
         try:
-            prepare_single_page(plan, tool=4, width=width, height=height, page_add_mm=page_add)
+            prepare_single_page(replace(plan, contours=contours), tool=4, width=width, height=height, page_add_mm=page_add)
         except JobEncodingError as error:
             match = re.match(r"Контур (\d+)", str(error))
-            result["issues"].append({"message": str(error), "indices": [int(match[1]) - 1] if match else []})
+            result["issues"].append({"message": str(error), "indices": [indices[int(match[1]) - 1]] if match else []})
             return result
         page = _page(1, 0.0, last_x, 0.0)
-        page["paths"] = [_path(index, contour.layer, contour.points, contour.closed)
-                         for index, contour in enumerate(plan.contours)]
+        page["paths"] = [_path(index, contour.layer, contour.points, contour.closed) for index, contour in indexed]
         result["pages"] = [page]
         _prepare_route(result, plan, part_numbers, optimize, notch_flags)
         _calculate_totals(result, plan, job, height)
@@ -324,6 +340,8 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
             if group_low < low == group_high:
                 first_page -= 1
         if first_page == len(cuts) or high <= cuts[first_page]:
+            if _stationary_notch(contour, notch_flags[index], pages[first_page]["startX"]):
+                continue
             pieces = [(first_page, contour.points, contour.closed)]
             seams = []
         else:
