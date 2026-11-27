@@ -12,7 +12,7 @@ from time import monotonic, sleep
 from unittest.mock import Mock, patch
 from urllib.parse import quote
 
-from server import COMPANION_PROTOCOL, PlotterServer
+from server import COMPANION_PROTOCOL, PlotterServer, registry_trash_pin_digest
 
 
 EXAMPLE_PROFILE = Path(__file__).resolve().parent.parent / "research" / "machine-profile.example.json"
@@ -169,8 +169,15 @@ class SketchUpDesignTests(unittest.TestCase):
                 db.execute("UPDATE sketchup_models SET expires = 0 WHERE id = ?", (model_id,))
             model_link = f"/api/cad/3d/model?id={model_id}"
             self.assertEqual(self.request(server, "GET", model_link)[0]["name"], FILENAME)
-            deleted = self.post(server, registry, {"action": "delete", "id": moved["id"], "revision": moved["revision"]})
-            self.assertTrue(deleted["deleted"])
+            trashed = self.post(server, registry, {"action": "delete", "id": moved["id"], "revision": moved["revision"]})
+            self.assertTrue(trashed["trashedAt"])
+            self.assertEqual(self.request(server, "GET", model_link)[0]["name"], FILENAME)
+            pin = "7315"
+            salt = b"fixture-trash-3d"
+            server.registry_trash_pin = (salt, registry_trash_pin_digest(pin, salt))
+            purged = self.post(server, registry, {"action": "purge-trash", "id": trashed["id"],
+                                                  "revision": trashed["revision"], "pin": pin})
+            self.assertTrue(purged["deleted"])
             self.request(server, "GET", model_link, HTTPStatus.NOT_FOUND)
 
     def test_model_edge_splits_selectable_face_and_preserves_fabric_anchors(self):

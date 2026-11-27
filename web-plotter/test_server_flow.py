@@ -8,6 +8,7 @@ from email.message import Message
 from http import HTTPStatus
 from http.client import HTTPConnection
 from pathlib import Path
+from secrets import randbelow, token_bytes
 from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep
@@ -18,10 +19,16 @@ import ezdxf
 
 from controller import ControllerError
 from cut_journal import CutJournal
-from server import CutProgress, PlotterServer, RollRun, drawing_key
+from server import (CutProgress, PlotterServer, RollRun, drawing_key, load_designer_pin, load_registry_trash_pin,
+                    registry_trash_pin_digest)
 from workspace import WorkspaceConflict, WorkspaceStore
 
 EXAMPLE_PROFILE = Path(__file__).resolve().parent.parent / "research" / "machine-profile.example.json"
+
+
+def fixture_pin_pair():
+    value = randbelow(10_000)
+    return f"{value:04d}", f"{(value + 1) % 10_000:04d}"
 
 
 def drawing():
@@ -227,9 +234,113 @@ class ServerFlowTests(unittest.TestCase):
         moved = self.request("/api/registry", {"action": "move", "id": kit["id"], "revision": kit["revision"],
                                                "parent": folder["id"]})
         self.assertEqual(moved["members"], kit["members"])
-        self.request("/api/registry", {**part, "action": "delete"}, HTTPStatus.CONFLICT)
-        self.assertTrue(self.request("/api/registry", {**moved, "action": "delete"})["deleted"])
-        self.assertTrue(self.request("/api/registry", {**folder, "action": "delete"})["deleted"])
+        renamed = self.request("/api/registry", {"action": "rename", "id": moved["id"], "revision": moved["revision"],
+                                                 "name": "Новый комплект"})
+        self.assertEqual((renamed["name"], renamed["parent"], renamed["members"]),
+                         ("Новый комплект", folder["id"], kit["members"]))
+        self.assertTrue(self.request("/api/registry", {**folder, "action": "delete"})["trashedAt"])
+        self.assertEqual(self.server.production.registry(moved["id"])["members"], kit["members"])
+
+    def test_registry_selection_routes_move_and_trash_multiple_entries(self):
+        first, second, destination = [self.request("/api/registry", {"action": "save", "kind": "folder", "name": title})
+                                      for title in ("Первая", "Вторая", "Назначение")]
+        moved = self.request("/api/registry", {"action": "move-selection", "entries": [first, second],
+                                                "parent": destination["id"]})["entries"]
+        self.assertEqual([entry["parent"] for entry in moved], [destination["id"], destination["id"]])
+        copied = self.request("/api/registry", {"action": "copy-selection", "entries": moved, "parent": None})["entries"]
+        self.assertEqual([(entry["name"], entry["parent"], entry["revision"]) for entry in copied],
+                         [(first["name"], None, 1), (second["name"], None, 1)])
+        self.assertTrue({entry["id"] for entry in moved}.isdisjoint(entry["id"] for entry in copied))
+        trashed = self.request("/api/registry", {"action": "trash-selection", "entries": moved})["entries"]
+        self.assertEqual([entry["id"] for entry in trashed], [first["id"], second["id"]])
+        self.assertTrue(all(entry["trashedAt"] for entry in trashed))
+
+    def test_registry_trash_requires_pin_only_to_delete_permanently(self):
+        pin, wrong = fixture_pin_pair()
+        salt = b"fixture-pin-salt"
+        self.server.registry_trash_pin = (salt, registry_trash_pin_digest(pin, salt))
+        folder = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Каталог"})
+        trashed = self.request("/api/registry", {**folder, "action": "trash"})
+        self.assertTrue(trashed["trashedAt"])
+        with closing(HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)) as client:
+            client.request("GET", "/api/registry?mode=trash")
+            response = client.getresponse()
+            trash = json.loads(response.read())
+            self.assertEqual(response.status, HTTPStatus.OK)
+        self.assertEqual([entry["id"] for entry in trash["entries"]], [folder["id"]])
+        self.request("/api/registry", {**trashed, "action": "purge-trash"}, HTTPStatus.FORBIDDEN)
+        self.request("/api/registry", {"action": "empty-trash", "pin": wrong}, HTTPStatus.FORBIDDEN)
+        restored = self.request("/api/registry", {**trashed, "action": "restore-trash"})
+        self.assertEqual(restored["id"], folder["id"])
+        trashed = self.request("/api/registry", {**restored, "action": "trash"})
+        purged = self.request("/api/registry", {**trashed, "action": "purge-trash", "pin": pin})
+        self.assertTrue(purged["deleted"])
+        self.assertEqual(self.request("/api/registry", {"action": "empty-trash", "pin": pin})["deleted"], 0)
+
+    def test_designer_access_validates_pin_and_rejects_forged_or_expired_tokens(self):
+        endpoint = "/api/designer-access"
+        pin, wrong = fixture_pin_pair()
+        salt = token_bytes(16)
+        self.server.designer_pin_configured = False
+        self.server.registry_trash_pin = None
+        self.request(endpoint, {"action": "enter", "pin": pin}, HTTPStatus.SERVICE_UNAVAILABLE)
+        self.server.registry_trash_pin = (salt, registry_trash_pin_digest(pin, salt))
+        with patch("server.monotonic", return_value=1000):
+            self.request(endpoint, {"action": "enter"}, HTTPStatus.BAD_REQUEST)
+            self.request(endpoint, {"action": "enter", "pin": wrong}, HTTPStatus.FORBIDDEN)
+            token = self.request(endpoint, {"action": "enter", "pin": pin})["token"]
+            self.assertEqual(self.request(endpoint, {"action": "check", "token": token}), {"allowed": True})
+            forged = token[:-1] + ("1" if token[-1] == "0" else "0")
+            self.request(endpoint, {"action": "check", "token": forged}, HTTPStatus.UNAUTHORIZED)
+        with patch("server.monotonic", return_value=1000 + 12 * 60 * 60):
+            self.request(endpoint, {"action": "check", "token": token}, HTTPStatus.UNAUTHORIZED)
+        folder = self.request("/api/registry", {"action": "save", "kind": "folder", "name": "Реестр"})
+        self.assertEqual(folder["name"], "Реестр")
+
+    def test_designer_pin_attempt_limit_expires(self):
+        endpoint = "/api/designer-access"
+        self.server.designer_pin_configured = False
+        self.server.registry_trash_pin = (b"fixture-salt", b"test-digest")
+        pin = {"action": "enter", "pin": fixture_pin_pair()[0]}
+        with patch("server.registry_pin_matches", return_value=False) as verify:
+            with patch("server.monotonic", return_value=1000):
+                for _ in range(8):
+                    self.request(endpoint, pin, HTTPStatus.FORBIDDEN)
+                self.request(endpoint, pin, HTTPStatus.TOO_MANY_REQUESTS)
+            self.assertEqual(verify.call_count, 8)
+            with patch("server.monotonic", return_value=1030):
+                self.request(endpoint, pin, HTTPStatus.FORBIDDEN)
+            self.assertEqual(verify.call_count, 9)
+
+    def test_explicit_designer_pin_is_separate_and_invalid_config_fails_closed(self):
+        designer, trash = fixture_pin_pair()
+        variables = {}
+        for variable, pin in (("PLOTTER_DESIGNER_PIN_HASH", designer), ("PLOTTER_REGISTRY_TRASH_PIN_HASH", trash)):
+            salt = token_bytes(16)
+            variables[variable] = f"{salt.hex()}:{registry_trash_pin_digest(pin, salt).hex()}"
+        with patch.dict(os.environ, variables):
+            self.server.designer_pin_configured, self.server.designer_pin = load_designer_pin()
+            self.server.registry_trash_pin = load_registry_trash_pin()
+        enter, registry = "/api/designer-access", "/api/registry"
+        self.assertTrue(self.request(enter, {"action": "enter", "pin": designer})["token"])
+        self.request(enter, {"action": "enter", "pin": trash}, HTTPStatus.FORBIDDEN)
+        self.request(registry, {"action": "empty-trash", "pin": designer}, HTTPStatus.FORBIDDEN)
+        self.assertEqual(self.request(registry, {"action": "empty-trash", "pin": trash})["deleted"], 0)
+        with patch.dict(os.environ, {"PLOTTER_DESIGNER_PIN_HASH": ""}):
+            self.server.designer_pin_configured, self.server.designer_pin = load_designer_pin()
+        self.request(enter, {"action": "enter", "pin": trash}, HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(self.request(registry, {"action": "empty-trash", "pin": trash})["deleted"], 0)
+
+    def test_windows_designer_pin_file_distinguishes_absent_from_invalid(self):
+        with patch("server.os") as system, patch("server.DESIGNER_PIN_PATH") as path:
+            system.name, system.environ = "nt", {}
+            path.read_text.side_effect = FileNotFoundError
+            self.assertEqual(load_designer_pin(), (False, None))
+            path.read_text.side_effect = PermissionError
+            self.assertEqual(load_designer_pin(), (True, None))
+            path.read_text.side_effect = None
+            path.read_text.return_value = "bad setting"
+            self.assertEqual(load_designer_pin(), (True, None))
 
     def test_local_companion_serves_ui_and_only_allows_same_origin_mutations(self):
         with patch("server.Controller", return_value=self.controller), patch("server.ssl.create_default_context"), \
@@ -261,6 +372,21 @@ class ServerFlowTests(unittest.TestCase):
                     save.side_effect = WorkspaceConflict("shared revision advanced")
                     self.assertEqual(json.loads(request("POST", "/api/workspace", HTTPStatus.CONFLICT, headers, payload)),
                                      {"error": "shared revision advanced"})
+
+                companion.registry_trash_pin = None
+                access_path = "/api/designer-access"
+                with patch.object(companion.workspace.opener, "open") as open_central:
+                    enter = {"action": "enter", "pin": fixture_pin_pair()[0]}
+                    open_central.return_value = io.BytesIO(b'{"token":"central-token"}')
+                    self.assertEqual(json.loads(request("POST", access_path, HTTPStatus.OK, headers, json.dumps(enter))),
+                                     {"token": "central-token"})
+                    forwarded = open_central.call_args.args[0]
+                    self.assertEqual((forwarded.selector, json.loads(forwarded.data)), (access_path, enter))
+                    for status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS,
+                                   HTTPStatus.SERVICE_UNAVAILABLE):
+                        open_central.side_effect = HTTPError("", status, status.phrase, {}, io.BytesIO(b'{"error":"central"}'))
+                        result = request("POST", access_path, status, headers, json.dumps({"action": "check", "token": "expired"}))
+                        self.assertEqual(json.loads(result), {"error": "central"})
 
                 workspace_error = "Рабочая область изменилась в другой вкладке. Обновите страницу."
                 record_error = "Запись изменилась в другой вкладке. Заново откройте её."
@@ -933,11 +1059,14 @@ class ServerFlowTests(unittest.TestCase):
     def test_demo_runs_a_roll_without_calling_the_real_controller_or_journal(self):
         workspace = drawing()
         workspace["paths"] = [
-            {"layer": "Крой", "closed": False, "points": [[x, 50], [x + 10, 70]]}
+            {"layer": "Крой", "closed": True, "points": [[x, 50], [x + 10, 50], [x + 10, 70], [x, 70]]}
             for x in (20, 2600)
         ]
         workspace["excluded"] = []
+        workspace["optimization"]["nesting"] = {"widthMm": 1380, "gapMm": 3, "marginMm": 0,
+                                                  "rotation": "quarter", "widthExplicit": True}
         self.save(workspace)
+        job, filename = self.server.workspace_drawing(self.server.workspace.read()["workspace"])
         self.controller.reset_mock()
         clock = [100.0]
 
@@ -945,10 +1074,13 @@ class ServerFlowTests(unittest.TestCase):
             return self.request("/demo/api/" + path, data, expected)
 
         with patch("demo_controller.monotonic", side_effect=lambda: clock[0]):
-            plan = demo("cut-plan", {"job": {"paths": workspace["paths"], "optimize": True},
-                                     "filename": workspace["source"]["filename"]})
+            plan = demo("cut-plan", {"job": job, "filename": filename})
             self.assertTrue(plan["canUpload"])
             self.assertEqual(len(plan["pages"]), 2)
+            for page in plan["pages"]:
+                trim, = page["wasteTrim"]["paths"]
+                self.assertEqual([point[1] for point in trim["points"]], [-30, 1420])
+                self.assertEqual(page["wasteTrim"]["pathEndIndices"], [7])
             armed = demo("control-session", {"action": "arm", "ready": True})
             token = armed["controlToken"]
             options = {"planId": plan["planId"], "controlToken": token}

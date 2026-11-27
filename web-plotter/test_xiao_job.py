@@ -1,3 +1,4 @@
+from dataclasses import replace
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -10,8 +11,9 @@ from xiao_job import (
 ENDPOINT = ("192.0.2.10", 1234)
 
 
-def prepare(*contours, tool=4, units="mm"):
-    return encode_job(contours, tool=tool, units=units, width=2400, height=1750)
+def prepare(*contours, tool=4, units="mm", waste_trim_count=0):
+    return encode_job(contours, tool=tool, units=units, width=2400, height=1750,
+                      waste_trim_count=waste_trim_count)
 
 
 class XiaoJobTests(unittest.TestCase):
@@ -69,6 +71,28 @@ class XiaoJobTests(unittest.TestCase):
                 self.assertIn(f"(0,4,{x + 0.01:.3f},{y + 0.01:.3f},1.00)".encode("ascii"), job.chunks[0].payload)
                 self.assertEqual(finish.packet, end)
                 self.assertEqual(plan.contours[0].points[0], origin)
+
+    def test_single_page_waste_trim_preserves_signed_y_and_vertex_indices(self):
+        plan = build_plan({"paths": [{"points": [[0, 0], [10, 20]]}]}, 2400, 1750)
+        trim = Contour(((5, -30), (5, 1420)), False, "Обрезка отхода")
+        plan = replace(plan, contours=(*plan.contours, trim))
+        job, finish = prepare_single_page(plan, tool=4, width=2400, height=1750, page_add_mm=0.12,
+                                          waste_trim_count=1)
+        self.assertEqual(job.path_end_indices, (2, 4))
+        self.assertEqual(job.vertex(2), ((10.01, 20.01), True))
+        self.assertEqual(job.vertex(3), ((5.01, -29.99), False))
+        self.assertEqual(job.vertex(4), ((5.01, 1420.01), True))
+        self.assertEqual(finish.packet, b"end10120)\0")
+
+    def test_only_trailing_waste_trim_contours_can_use_bounded_negative_y(self):
+        trim = Contour(((5, -30), (5, 1420)), False, "Обрезка отхода")
+        below_limit = Contour(((5, -30.001), (5, 1420)), False, trim.layer)
+        negative_x = Contour(((-1, -30), (5, 1420)), False, trim.layer)
+        above_limit = Contour(((5, -30), (5, 1750)), False, trim.layer)
+        for contours, count in [((trim,), 0), ((trim, self.line), 1), ((below_limit,), 1),
+                                ((negative_x,), 1), ((above_limit,), 1), ((trim,), 2)]:
+            with self.subTest(contours=contours, count=count), self.assertRaises(JobEncodingError):
+                prepare(*contours, waste_trim_count=count)
 
     def test_single_page_rejects_repeats_feed_and_page_extent_outside_x_limit(self):
         for points, overrides in [([[0, 0], [10, 20]], {"repeats": 2}),

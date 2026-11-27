@@ -29,6 +29,27 @@ from workspace import (MAX_REVISION, MAX_WORKSPACE_BYTES, PART_LABEL_FIELDS, WOR
 SCHEMA_VERSION = 1
 MAX_QUANTITY = 50_000
 REGISTRY_BACKUP_VERSION = 1
+REGISTRY_TIMESTAMP_FIELDS = ("createdAt", "updatedAt")
+REGISTRY_FOLDER_COLORS = {"yellow", "blue", "green", "pink", "violet", "gray"}
+REGISTRY_SUBTREE = """
+    WITH RECURSIVE registry_subtree(id) AS (
+        SELECT id FROM registry WHERE id=:root OR (
+            :root IS NULL AND (json_type(data, '$.trashedAt')='text'
+                OR (:include_archived AND json_type(data, '$.archivedAt')='text'))
+        )
+        UNION
+        SELECT registry.id FROM registry JOIN registry_subtree ON registry.parent=registry_subtree.id
+    )
+"""
+REGISTRY_SUMMARY_COLUMNS = """
+    id, kind, parent, name, revision,
+    json_extract(data, '$.createdAt') AS createdAt, json_extract(data, '$.updatedAt') AS updatedAt,
+    CASE WHEN kind = 'folder' THEN data
+         WHEN kind = 'part' AND json_type(data, '$.pattern') = 'object' THEN
+              json_object('patternId', json_extract(data, '$.pattern.id'),
+                          'patternQuantity', json_extract(data, '$.pattern.quantity'))
+         ELSE '{}' END AS data
+"""
 MOSCOW_TIME = timezone(timedelta(hours=3))
 RECORD_REVISION_MESSAGE = "Запись изменилась в другой вкладке. Заново откройте её."
 KIT_LAYOUT_SCHEMA = """
@@ -196,12 +217,30 @@ def tree_order(records):
     return ordered
 
 
+def registry_folder_color(value):
+    if not isinstance(value, str) or value not in REGISTRY_FOLDER_COLORS:
+        raise ValueError("Выберите допустимый цвет папки.")
+    return value
+
+
 def validate_registry_entry(record):
     kind = record["kind"]
-    data = object_value(record["data"])
+    data = object_value(record["data"]).copy()
+    for field in (*REGISTRY_TIMESTAMP_FIELDS, "trashedAt", "archivedAt"):
+        if field in data:
+            stamp = data.pop(field)
+            try:
+                if not isinstance(stamp, str) or not re.fullmatch(
+                        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", stamp):
+                    raise ValueError
+                datetime.fromisoformat(stamp[:-1] + "+00:00")
+            except ValueError:
+                raise ValueError("Некорректная дата записи в резервной копии реестра.") from None
     if kind == "folder":
-        if data.keys() - {"model"} or type(data.get("model", False)) is not bool:
+        if data.keys() - {"model", "color"} or type(data.get("model", False)) is not bool:
             raise ValueError("Некорректная папка в резервной копии реестра.")
+        if "color" in data:
+            registry_folder_color(data["color"])
     elif kind == "kit":
         backup_object(data, {"members"})
         members = backup_list(data["members"])
@@ -494,7 +533,7 @@ class ProductionStore:
         row = db.execute("SELECT * FROM registry WHERE id = ?", (key(record_id),)).fetchone()
         if row is None:
             raise RecordNotFound("Запись в реестре не найдена.")
-        return row_data(row)
+        return {**dict.fromkeys(REGISTRY_TIMESTAMP_FIELDS), **row_data(row)}
 
     @staticmethod
     def model_attachment(db, drawing_id):
@@ -639,7 +678,8 @@ class ProductionStore:
             raise ValueError("Резервная копия содержит модель SketchUp без чертежа.")
 
         with self.connect(write=True) as db:
-            revisions = {row["id"]: row for row in db.execute("SELECT id, kind, revision FROM registry")}
+            revisions = {row["id"]: row for row in db.execute(
+                "SELECT id, kind, revision, json_extract(data, '$.createdAt') AS createdAt FROM registry")}
             self.check_registry_restore_references(db, records, revisions)
             slot_revisions = {(row["kit_id"], row["width_mm"], row["quantity"]): row["revision"]
                               for row in db.execute("SELECT kit_id, width_mm, quantity, revision FROM kit_layouts")}
@@ -655,11 +695,14 @@ class ProductionStore:
             for identifier in ordered:
                 record = records[identifier]
                 old = revisions.get(identifier)
+                data = contents[identifier]
+                if old and old["createdAt"] is not None and old["createdAt"] != record["data"].get("createdAt"):
+                    data = encode({**record["data"], "createdAt": old["createdAt"]})
                 db.execute("INSERT INTO registry VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                            "kind=excluded.kind, parent=excluded.parent, name=excluded.name, "
                            "revision=excluded.revision, data=excluded.data",
                            (identifier, record["kind"], record["parent"], record["name"],
-                            backup_revision(record["revision"], old["revision"] if old else None), contents[identifier]))
+                             backup_revision(record["revision"], old["revision"] if old else None), data))
             db.execute("PRAGMA defer_foreign_keys=ON")
             db.executemany("DELETE FROM registry WHERE id=?", ((identifier,) for identifier in revisions.keys() - records.keys()))
             for selector, slot in slots.items():
@@ -700,12 +743,53 @@ class ProductionStore:
                 elif entry["kind"] == "drawing":
                     entry.update(self.model_attachment(db, entry["id"]))
                 return entry
-            rows = db.execute("SELECT id, kind, parent, name, revision, CASE WHEN kind = 'folder' THEN data "
-                              "WHEN kind = 'part' AND json_type(data, '$.pattern') = 'object' THEN "
-                              "json_object('patternId', json_extract(data, '$.pattern.id'), "
-                              "'patternQuantity', json_extract(data, '$.pattern.quantity')) "
-                              "ELSE '{}' END AS data FROM registry")
+            rows = db.execute(REGISTRY_SUBTREE + "SELECT " + REGISTRY_SUMMARY_COLUMNS +
+                              "FROM registry WHERE id NOT IN (SELECT id FROM registry_subtree)",
+                              {"root": None, "include_archived": True})
             return {"entries": sorted(map(row_data, rows), key=lambda r: (r["name"].casefold(), r["id"]))}
+
+    def registry_trash(self):
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT entry.id, entry.kind, entry.parent, entry.name, entry.revision, parent.name AS parentName,
+                       json_extract(entry.data, '$.trashedAt') AS trashedAt,
+                       json_extract(entry.data, '$.createdAt') AS createdAt,
+                       json_extract(entry.data, '$.updatedAt') AS updatedAt,
+                       json_extract(entry.data, '$.color') AS color
+                FROM registry AS entry LEFT JOIN registry AS parent ON parent.id=entry.parent
+                WHERE json_type(entry.data, '$.trashedAt')='text' ORDER BY trashedAt DESC, entry.id
+            """)
+            return {"entries": list(map(dict, rows))}
+
+    @staticmethod
+    def registry_entry_in_trash(db, identifier):
+        return db.execute("""
+            WITH RECURSIVE ancestry(id, parent, unavailable) AS (
+                SELECT id, parent, json_type(data, '$.trashedAt')='text'
+                    OR json_type(data, '$.archivedAt')='text' FROM registry WHERE id=?
+                UNION
+                SELECT registry.id, registry.parent, json_type(registry.data, '$.trashedAt')='text'
+                    OR json_type(registry.data, '$.archivedAt')='text'
+                FROM registry JOIN ancestry ON registry.id=ancestry.parent
+            )
+            SELECT 1 FROM ancestry WHERE unavailable LIMIT 1
+        """, (identifier,)).fetchone() is not None
+
+    def validate_registry_parent(self, db, parent, record_ids):
+        ancestors = set(record_ids)
+        while parent is not None:
+            parent = key(parent)
+            if parent in ancestors:
+                raise ValueError("Нельзя переместить папку внутрь неё самой.")
+            ancestors.add(parent)
+            folder = self.registry_record(db, parent)
+            if folder["kind"] != "folder":
+                raise ValueError("Выберите папку реестра.")
+            if folder.get("archivedAt"):
+                raise WorkspaceConflict("Папка назначения удалена.")
+            if folder.get("trashedAt"):
+                raise WorkspaceConflict("Сначала восстановите папку назначения из корзины.")
+            parent = folder["parent"]
 
     def save_registry(self, payload, *, allow_3d=False):
         record_id = payload.get("id")
@@ -716,6 +800,8 @@ class ProductionStore:
             if record_id is not None:
                 old = self.registry_record(db, record_id)
                 check_revision(payload.get("revision"), old["revision"])
+                if self.registry_entry_in_trash(db, record_id):
+                    raise WorkspaceConflict("Сначала восстановите запись из корзины.")
             if moving:
                 if old is None:
                     raise ValueError("Выберите запись для перемещения.")
@@ -729,16 +815,13 @@ class ProductionStore:
                     raise ValueError("Тип существующей записи изменить нельзя.")
             else:
                 record_id = uid()
-            ancestor = parent
-            while ancestor is not None:
-                if ancestor == record_id:
-                    raise ValueError("Нельзя переместить папку внутрь неё самой.")
-                folder = self.registry_record(db, ancestor)
-                if folder["kind"] != "folder":
-                    raise ValueError("Выберите папку реестра.")
-                ancestor = folder["parent"]
+            self.validate_registry_parent(db, parent, (record_id,))
             if kind == "folder":
                 data = {"model": payload.get("model") is True}
+                if "color" in payload:
+                    data["color"] = registry_folder_color(payload["color"])
+                elif old is not None and "color" in old:
+                    data["color"] = old["color"]
             elif kind == "kit":
                 data = {"members": self.members(db, payload.get("members", old and old["members"]), ("part",))}
             elif old is not None and "entities" not in payload:
@@ -777,6 +860,11 @@ class ProductionStore:
                     if "entities" not in payload:
                         prepared = prepare_design(data["entities"])
                     data["entities"], data["paths"] = center_part_geometry(data["entities"], prepared)
+            data["updatedAt"] = utc_now()
+            if old is None:
+                data["createdAt"] = data["updatedAt"]
+            elif old["createdAt"] is not None:
+                data["createdAt"] = old["createdAt"]
             revision = 1 if old is None else old["revision"] + 1
             if old is None:
                 db.execute("INSERT INTO registry VALUES (?, ?, ?, ?, ?, ?)",
@@ -804,6 +892,131 @@ class ProductionStore:
                            "SET model_id=excluded.model_id, markup=excluded.markup", (record_id, model_id, state))
             return {**self.registry_record(db, record_id), **self.model_attachment(db, record_id)}
 
+    def active_registry_selection_roots(self, db, selection):
+        if not isinstance(selection, list) or not selection:
+            raise ValueError("Выберите записи реестра.")
+        records = {row["id"]: row for row in db.execute("SELECT id, parent, revision FROM registry")}
+        unavailable = self.registry_subtree(db, include_archived=True)
+        selected = {}
+        for item in selection:
+            item = object_value(item)
+            identifier = key(item.get("id"))
+            record = records.get(identifier)
+            if record is None:
+                raise RecordNotFound("Запись в реестре не найдена.")
+            check_revision(item.get("revision"), record["revision"])
+            if identifier in unavailable:
+                raise WorkspaceConflict("Сначала восстановите запись из корзины.")
+            selected[identifier] = record
+        roots = []
+        for record in selected.values():
+            ancestor = record["parent"]
+            seen = set()
+            while ancestor is not None and ancestor not in selected:
+                if ancestor in seen:
+                    raise ValueError("Циклическая иерархия папок реестра.")
+                seen.add(ancestor)
+                ancestor = records[ancestor]["parent"]
+            if ancestor is None:
+                roots.append(record)
+        return roots
+
+    def move_registry_selection(self, payload):
+        parent = payload.get("parent")
+        with self.connect(write=True) as db:
+            roots = self.active_registry_selection_roots(db, payload.get("entries"))
+            self.validate_registry_parent(db, parent, (record["id"] for record in roots))
+            now = utc_now()
+            result = []
+            for record in roots:
+                if record["parent"] != parent:
+                    row = db.execute("UPDATE registry SET parent=?, revision=revision+1, "
+                                     "data=json_set(data, '$.updatedAt', ?) WHERE id=? RETURNING " + REGISTRY_SUMMARY_COLUMNS,
+                                     (parent, now, record["id"])).fetchone()
+                    result.append(row_data(row))
+            return {"entries": result}
+
+    def copy_registry_selection(self, payload):
+        parent = payload.get("parent")
+        with self.connect(write=True) as db:
+            roots = self.active_registry_selection_roots(db, payload.get("entries"))
+            root_ids = [record["id"] for record in roots]
+            self.validate_registry_parent(db, parent, root_ids)
+            rows = db.execute(REGISTRY_SUBTREE + """
+                , copy_sources(id, depth) AS (
+                    SELECT value, 0 FROM json_each(:roots)
+                    UNION ALL
+                    SELECT registry.id, copy_sources.depth+1 FROM registry
+                    JOIN copy_sources ON registry.parent=copy_sources.id
+                    WHERE registry.id NOT IN (SELECT id FROM registry_subtree)
+                )
+                SELECT registry.id, registry.kind, registry.parent, registry.name, copy_sources.depth
+                FROM registry JOIN copy_sources ON registry.id=copy_sources.id
+                ORDER BY copy_sources.depth, registry.rowid
+            """, {"root": None, "include_archived": True, "roots": encode(root_ids)}).fetchall()
+            copied_ids = {row["id"]: uid() for row in rows}
+            names = {row["name"].casefold() for row in db.execute(
+                "SELECT name FROM registry WHERE parent IS ? "
+                "AND json_type(data, '$.trashedAt') IS NULL AND json_type(data, '$.archivedAt') IS NULL", (parent,))}
+            has_models = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawing_models'").fetchone()
+            now = utc_now()
+            kits = []
+            for row in rows:
+                old_id = row["id"]
+                copied_id = copied_ids[old_id]
+                title = row["name"]
+                if row["depth"] == 0:
+                    duplicate = 1
+                    while title.casefold() in names:
+                        suffix = " — копия" if duplicate == 1 else f" — копия {duplicate}"
+                        title = row["name"][:255 - len(suffix)].rstrip() + suffix
+                        duplicate += 1
+                    names.add(title.casefold())
+                db.execute("INSERT INTO registry SELECT ?, kind, ?, ?, 1, "
+                           "json_set(json_remove(data, '$.trashedAt', '$.archivedAt'), '$.createdAt', ?, '$.updatedAt', ?) "
+                           "FROM registry WHERE id=?",
+                           (copied_id, copied_ids.get(row["parent"], parent), title, now, now, old_id))
+                if row["kind"] == "kit":
+                    kit = self.layout_kit(db, old_id)
+                    members = [{**member, "id": copied_ids.get(member["id"], member["id"])} for member in kit["members"]]
+                    db.execute("UPDATE registry SET data=json_set(data, '$.members', json(?)) WHERE id=?",
+                               (encode(members), copied_id))
+                    kits.append((kit, copied_id))
+                if row["kind"] == "drawing" and has_models:
+                    db.execute("INSERT INTO drawing_models SELECT ?, model_id, markup FROM drawing_models WHERE drawing_id=?",
+                               (copied_id, old_id))
+            for kit, copied_id in kits:
+                self.copy_kit_layouts(db, kit, self.layout_kit(db, copied_id))
+            result = [row_data(db.execute("SELECT " + REGISTRY_SUMMARY_COLUMNS + "FROM registry WHERE id=?",
+                                          (copied_ids[identifier],)).fetchone()) for identifier in root_ids]
+            return {"entries": result}
+
+    def trash_registry_selection(self, payload):
+        with self.connect(write=True) as db:
+            roots = self.active_registry_selection_roots(db, payload.get("entries"))
+            now = utc_now()
+            result = []
+            for record in roots:
+                row = db.execute("UPDATE registry SET revision=revision+1, "
+                                 "data=json_set(data, '$.trashedAt', ?, '$.updatedAt', ?) WHERE id=? RETURNING " +
+                                 REGISTRY_SUMMARY_COLUMNS, (now, now, record["id"])).fetchone()
+                result.append({**row_data(row), "trashedAt": now})
+            return {"entries": result}
+
+    def rename_registry(self, payload):
+        record_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            entry = self.registry_record(db, record_id)
+            check_revision(payload.get("revision"), entry["revision"])
+            if self.registry_entry_in_trash(db, record_id):
+                raise WorkspaceConflict("Сначала восстановите запись из корзины.")
+            title = name(payload.get("name"))
+            if title != entry["name"]:
+                db.execute("UPDATE registry SET name=?, revision=revision+1, "
+                           "data=json_set(data, '$.updatedAt', ?) WHERE id=?", (title, utc_now(), record_id))
+                entry = self.registry_record(db, record_id)
+            return {**entry, **self.model_attachment(db, record_id)}
+
     def delete_registry(self, payload):
         record_id = key(payload.get("id"))
         with self.connect(write=True) as db:
@@ -811,16 +1024,112 @@ class ProductionStore:
             check_revision(payload.get("revision"), entry["revision"])
             if db.execute("SELECT 1 FROM registry WHERE parent=? LIMIT 1", (record_id,)).fetchone():
                 raise WorkspaceConflict("Сначала переместите или удалите содержимое папки.")
-            if entry["kind"] == "folder":
-                rows = db.execute("SELECT data FROM orders")
-                if any(json.loads(row["data"]).get("modelId") == record_id for row in rows):
-                    raise WorkspaceConflict("Изделие используется в нарядах.")
-            if entry["kind"] in ("part", "kit"):
-                rows = db.execute("SELECT data FROM registry WHERE kind='kit' UNION ALL SELECT data FROM cuts")
-                if any(member["id"] == record_id for row in rows for member in json.loads(row["data"]).get("members", ())):
-                    raise WorkspaceConflict("Запись используется в комплектах или нарядах.")
-            db.execute("DELETE FROM registry WHERE id=?", (record_id,))
+            records = {record_id: entry["kind"]}
+            models, members = self.registry_delete_references(db, records)
+            if models:
+                raise WorkspaceConflict("Изделие используется в нарядах.")
+            if members:
+                raise WorkspaceConflict("Запись используется в комплектах или нарядах.")
+            self.delete_registry_records(db, records)
             return {"id": record_id, "deleted": True}
+
+    def trash_registry(self, payload):
+        record_id = key(payload.get("id"))
+        with self.connect(write=True) as db:
+            entry = self.registry_record(db, record_id)
+            check_revision(payload.get("revision"), entry["revision"])
+            if self.registry_entry_in_trash(db, record_id):
+                raise WorkspaceConflict("Запись уже в корзине.")
+            now = utc_now()
+            db.execute("UPDATE registry SET revision=revision+1, "
+                       "data=json_set(data, '$.trashedAt', ?, '$.updatedAt', ?) WHERE id=?", (now, now, record_id))
+            return self.registry_record(db, record_id)
+
+    def require_trashed_registry_entry(self, db, payload):
+        entry = self.registry_record(db, payload.get("id"))
+        check_revision(payload.get("revision"), entry["revision"])
+        if not entry.get("trashedAt"):
+            raise WorkspaceConflict("Выберите запись в корзине.")
+        return entry
+
+    def restore_trashed_registry(self, payload):
+        with self.connect(write=True) as db:
+            entry = self.require_trashed_registry_entry(db, payload)
+            parent = entry["parent"]
+            if parent is not None and self.registry_entry_in_trash(db, parent):
+                parent = None
+            db.execute("UPDATE registry SET parent=?, revision=revision+1, "
+                       "data=json_remove(json_set(data, '$.updatedAt', ?), '$.trashedAt') WHERE id=?",
+                       (parent, utc_now(), entry["id"]))
+            return self.registry_record(db, entry["id"])
+
+    def purge_registry_trash(self, payload):
+        with self.connect(write=True) as db:
+            entry = self.require_trashed_registry_entry(db, payload)
+            self.purge_registry_records(db, self.registry_subtree(db, entry["id"]))
+            return {"id": entry["id"], "deleted": True}
+
+    def empty_registry_trash(self):
+        with self.connect(write=True) as db:
+            return self.purge_registry_records(db, self.registry_subtree(db))
+
+    @staticmethod
+    def registry_subtree(db, root=None, *, include_archived=False):
+        rows = db.execute(REGISTRY_SUBTREE + "SELECT registry.id, registry.kind FROM registry "
+                          "JOIN registry_subtree ON registry.id=registry_subtree.id",
+                          {"root": root, "include_archived": include_archived})
+        return {row["id"]: row["kind"] for row in rows}
+
+    def purge_registry_records(self, db, records):
+        models, members = self.registry_delete_references(db, records)
+        retained = models | members
+        if retained:
+            parents = dict(db.execute("SELECT id, parent FROM registry"))
+            # Preserve the path to the product folder for labels of existing cut pieces.
+            for identifier in tuple(retained):
+                parent = parents[identifier]
+                while parent in records and parent not in retained:
+                    retained.add(parent)
+                    parent = parents[parent]
+            now = utc_now()
+            db.executemany(
+                "UPDATE registry SET revision=revision+1, "
+                "data=json_set(json_remove(data, '$.trashedAt'), '$.archivedAt', ?) WHERE id=? "
+                "AND (json_type(data, '$.archivedAt') IS NULL OR json_type(data, '$.trashedAt')='text')",
+                ((now, identifier) for identifier in retained),
+            )
+        deleted = {identifier: kind for identifier, kind in records.items() if identifier not in retained}
+        self.delete_registry_records(db, deleted)
+        return {"deleted": len(deleted), **({"retained": len(retained)} if retained else {})}
+
+    @staticmethod
+    def registry_delete_references(db, records):
+        kinds = set(records.values())
+        models, members = set(), set()
+        if "folder" in kinds:
+            models = {json.loads(row["data"]).get("modelId") for row in db.execute("SELECT data FROM orders")}
+        if kinds.intersection(("part", "kit")):
+            for row in db.execute("SELECT data FROM cuts"):
+                members.update(member["id"] for member in json.loads(row["data"]).get("members", ()))
+            for row in db.execute("SELECT id, data FROM registry WHERE kind='kit'"):
+                if row["id"] not in records or row["id"] in members:
+                    members.update(member["id"] for member in json.loads(row["data"]).get("members", ()))
+        return records.keys() & models, records.keys() & members
+
+    @staticmethod
+    def delete_registry_records(db, records):
+        kinds = set(records.values())
+        attached = set()
+        if "drawing" in kinds and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawing_models'").fetchone():
+            attached = {row["model_id"] for row in db.execute("SELECT drawing_id, model_id FROM drawing_models")
+                        if row["drawing_id"] in records}
+        db.execute("PRAGMA defer_foreign_keys=ON")
+        db.executemany("DELETE FROM registry WHERE id=?", ((identifier,) for identifier in records))
+        if attached:
+            db.executemany("DELETE FROM sketchup_models WHERE id=? AND NOT EXISTS "
+                           "(SELECT 1 FROM drawing_models WHERE model_id=sketchup_models.id)",
+                           ((identifier,) for identifier in attached))
 
     def members(self, db, values, allowed):
         if not isinstance(values, list) or not 0 < len(values) <= MAX_ENTITIES:
@@ -907,6 +1216,30 @@ class ProductionStore:
             part = previous_part if previous_part and previous_part["id"] == member["id"] else self.registry_record(db, member["id"])
             digest.update(encode(part["paths"]).encode("utf-8"))
         return digest.hexdigest()
+
+    def copy_kit_layouts(self, db, source_kit, copied_kit):
+        if db.execute("SELECT 1 FROM kit_layouts WHERE kit_id=? LIMIT 1", (source_kit["id"],)).fetchone() is None:
+            return
+        basis = self.kit_layout_basis(db, source_kit)
+        slots = db.execute("SELECT width_mm, quantity, data FROM kit_layouts WHERE kit_id=? AND basis=?",
+                           (source_kit["id"], basis)).fetchall()
+        if not slots:
+            return
+        copied_basis = self.kit_layout_basis(db, copied_kit)
+        for slot in slots:
+            amount = slot["quantity"]
+            draft = json.loads(slot["data"])
+            paths = self.expand_parts(db, [{"id": copied_kit["id"], "quantity": amount}])
+            try:
+                check_kit_geometry(paths, draft)
+            except ValueError:
+                continue
+            draft["source"]["filename"] = self.kit_layout_filename(copied_kit, copied_basis, amount)
+            draft["paths"] = [{key: value for key, value in path.items() if key not in PART_LABEL_FIELDS}
+                              for path in draft["paths"]]
+            draft = restore_part_labels(draft, paths)
+            db.execute("INSERT INTO kit_layouts VALUES (?, ?, ?, 1, ?, ?)",
+                       (copied_kit["id"], slot["width_mm"], amount, copied_basis, encode(draft)))
 
     def preserve_centered_kit_layouts(self, db, previous_part):
         kits = db.execute("SELECT DISTINCT registry.* FROM registry JOIN kit_layouts ON kit_layouts.kit_id=registry.id, "

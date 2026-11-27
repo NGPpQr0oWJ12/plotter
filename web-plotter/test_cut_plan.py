@@ -12,6 +12,25 @@ def rectangle(x0, y0, x1, y1, layer="Крой"):
 
 
 class CutPlanTests(unittest.TestCase):
+    def test_extended_trim_reaches_beyond_the_fabric_without_cutting_through_a_part(self):
+        job = {"paths": [rectangle(20, 10, 220, 40)], "materialWidthMm": 1380, "optimize": False}
+        plan = prepare_cut_plan(job, 100, 1650, 1, extended_waste_trim=True)
+        baseline = prepare_cut_plan(job, 100, 1650, 1)
+        first, _, last = plan["pages"]
+        self.assertEqual([page["paths"] for page in plan["pages"]], [page["paths"] for page in baseline["pages"]])
+        self.assertEqual(plan["material"], baseline["material"])
+        self.assertEqual([path["points"] for path in first["wasteTrim"]["paths"]],
+                         [[[99, -30], [99, 10]], [[99, 40], [99, 1420]]])
+        trim, = last["wasteTrim"]["paths"]
+        self.assertEqual(trim["points"], [[230, -30], [230, 1420]])
+
+        for height, fabric in ((1400, 1380), (1650, 1450)):
+            with self.subTest(height=height, fabric=fabric):
+                supported_job = {**job, "materialWidthMm": fabric}
+                plan = prepare_cut_plan(supported_job, 100, height, 1, extended_waste_trim=True)
+                trim, = plan["pages"][-1]["wasteTrim"]["paths"]
+                self.assertEqual(trim["points"], [[230, 0], [230, fabric]])
+
     def test_waste_trim_uses_free_intervals_between_full_part_footprints(self):
         outer = rectangle(20, 10, 220, 40)
         hole = rectangle(55, 15, 170, 30, "Отверстие")

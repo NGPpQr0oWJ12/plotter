@@ -12,6 +12,7 @@ MAX_PATHS = 10_000
 MAX_POINTS = 250_000
 MAX_REPEATED_POINTS = 1_000_000
 FEED_SPEED = 150.0
+MIN_WASTE_TRIM_Y_MM = -30.0
 
 
 class PlotterError(ValueError):
@@ -86,7 +87,7 @@ def order_contours(contours, start):
     return ordered
 
 
-def build_plan(job, width, height, start=(0.0, 0.0)):
+def build_plan(job, width, height, start=(0.0, 0.0), *, waste_trim_count=0):
     if not isinstance(job, dict):
         raise PlotterError("Передайте параметры задания.")
     paths = job.get("paths")
@@ -102,6 +103,8 @@ def build_plan(job, width, height, start=(0.0, 0.0)):
     optimize = job.get("optimize", False)
     if type(optimize) is not bool:
         raise PlotterError("Укажите, нужно ли оптимизировать порядок контуров.")
+    if type(waste_trim_count) is not int or not 0 <= waste_trim_count <= len(paths) or (waste_trim_count and optimize):
+        raise PlotterError("Отрезы отходов должны идти после контуров деталей.")
 
     contours = []
     point_count = 0
@@ -118,15 +121,16 @@ def build_plan(job, width, height, start=(0.0, 0.0)):
         if point_count > MAX_POINTS or point_count * repeats > MAX_REPEATED_POINTS:
             raise PlotterError("Слишком много точек в задании. Уменьшите чертёж или число циклов.")
         points = []
+        lower_y = MIN_WASTE_TRIM_Y_MM if index > len(paths) - waste_trim_count else 0.0
         for point in path["points"]:
             if not isinstance(point, list) or len(point) != 2:
                 raise PlotterError(f"Контур {index}: у каждой точки должны быть координаты X и Y.")
             try:
                 x = number(point[0], "X", -0.000001, width + 0.000001)
-                y = number(point[1], "Y", -0.000001, height + 0.000001)
+                y = number(point[1], "Y", lower_y - 0.000001, height + 0.000001)
             except PlotterError as error:
                 raise PlotterError(f"Контур {index} выходит за поле {width:g} × {height:g} мм ({error}).") from error
-            x, y = max(0.0, min(width, x)), max(0.0, min(height, y))
+            x, y = max(0.0, min(width, x)), max(lower_y, min(height, y))
             if not points or points[-1] != (x, y):
                 points.append((x, y))
                 min_x, max_x = min(min_x, x), max(max_x, x)

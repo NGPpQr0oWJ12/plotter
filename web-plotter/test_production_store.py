@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from production_store import MOSCOW_TIME, ProductionStore, RecordNotFound, check_kit_geometry, verify_arrangement
 from workspace import WorkspaceConflict
@@ -146,6 +147,270 @@ class ProductionTests(unittest.TestCase):
                 self.store.restore_registry(snapshot)
             self.assertEqual(self.store.export_registry(), original)
             self.assertEqual(self.store.workspace(cut, "design"), workspace)
+
+    def test_folder_color_and_registry_timestamps_follow_edit_move_and_restore(self):
+        created = "2026-11-27T10:00:00.000Z"
+        edited_at = "2026-11-27T10:01:00.000Z"
+        moved_at = "2026-11-27T10:02:00.000Z"
+        with patch("production_store.utc_now", side_effect=(created, edited_at, moved_at)):
+            saved = self.store.save_registry({"kind": "folder", "name": "Новая папка", "color": "blue",
+                                               "createdAt": "2000-01-01T00:00:00.000Z"})
+            edited = self.store.save_registry({"id": saved["id"], "revision": saved["revision"],
+                                                "kind": "folder", "name": "Переименовано"})
+            moved = self.store.save_registry({"action": "move", "id": edited["id"], "revision": edited["revision"],
+                                               "parent": self.folder["id"]})
+        self.assertEqual((saved["createdAt"], saved["updatedAt"]), (created, created))
+        self.assertEqual((edited["color"], edited["createdAt"], edited["updatedAt"]), ("blue", created, edited_at))
+        self.assertEqual((moved["color"], moved["createdAt"], moved["updatedAt"]), ("blue", created, moved_at))
+        target = ProductionStore(self.store.path.with_name("restored.sqlite3"))
+        target.restore_registry(self.store.export_registry())
+        self.assertEqual(target.registry(moved["id"]), moved)
+        listed = {entry["id"]: entry for entry in target.registry()["entries"]}
+        self.assertEqual(listed[moved["id"]], moved)
+        for record in (self.part, self.kit):
+            self.assertEqual(listed[record["id"]]["createdAt"], record["createdAt"])
+            self.assertEqual(listed[record["id"]]["updatedAt"], record["updatedAt"])
+        with self.assertRaisesRegex(ValueError, "цвет папки"):
+            target.save_registry({**moved, "color": "invalid"})
+        self.assertEqual(target.registry(moved["id"]), moved)
+
+    def test_legacy_registry_dates_remain_unknown_until_observed(self):
+        legacy = self.store.export_registry()
+        identifier = self.model["id"]
+        entry, = (record for record in legacy["entries"] if record["id"] == identifier)
+        del entry["data"]["createdAt"], entry["data"]["updatedAt"]
+        target = ProductionStore(self.store.path.with_name("restored.sqlite3"))
+        target.restore_registry(legacy)
+        old = target.registry(identifier)
+        self.assertIsNone(old["createdAt"])
+        self.assertIsNone(old["updatedAt"])
+        now = "2026-11-27T10:00:00.000Z"
+        with patch("production_store.utc_now", return_value=now):
+            saved = target.save_registry({**old, "name": "Лекала"})
+        self.assertIsNone(saved["createdAt"])
+        self.assertEqual(saved["updatedAt"], now)
+        self.store.restore_registry(legacy)
+        self.assertEqual(self.store.registry(identifier)["createdAt"], self.model["createdAt"])
+
+    def test_registry_trash_hides_folder_descendants_and_keeps_linked_kit_usable(self):
+        expected_paths = self.store.collect([self.member(self.kit)])
+        moved = self.store.trash_registry(self.folder)
+        active = {entry["id"] for entry in self.store.registry()["entries"]}
+        self.assertFalse({self.folder["id"], self.part["id"]} & active)
+        self.assertEqual(self.store.collect([self.member(self.kit)]), expected_paths)
+        trashed, = self.store.registry_trash()["entries"]
+        self.assertEqual((trashed["id"], trashed["revision"], trashed["parent"], trashed["parentName"], trashed["trashedAt"]),
+                         (moved["id"], moved["revision"], self.model["id"], self.model["name"], moved["trashedAt"]))
+        with self.assertRaises(WorkspaceConflict):
+            self.store.restore_trashed_registry(self.folder)
+        with self.assertRaisesRegex(WorkspaceConflict, "корзины"):
+            self.store.save_registry({**self.part, "name": "Скрытая деталь"})
+        with self.assertRaisesRegex(WorkspaceConflict, "корзины"):
+            self.store.save_registry({"kind": "folder", "name": "Новая", "parent": self.folder["id"]})
+        restored = self.store.restore_trashed_registry(trashed)
+        self.assertEqual((restored["parent"], restored["createdAt"]), (self.model["id"], self.folder["createdAt"]))
+        self.assertNotIn("trashedAt", restored)
+        self.assertEqual(self.store.registry_trash(), {"entries": []})
+        self.assertIn(self.part["id"], {entry["id"] for entry in self.store.registry()["entries"]})
+
+    def test_nested_trash_survives_archive_and_restores_child_to_desktop(self):
+        child = self.store.trash_registry(self.folder)
+        parent = self.store.trash_registry(self.model)
+        target = ProductionStore(self.store.path.with_name("restored.sqlite3"))
+        target.restore_registry(self.store.export_registry())
+        self.assertEqual({item["id"]: item["trashedAt"] for item in target.registry_trash()["entries"]},
+                         {child["id"]: child["trashedAt"], parent["id"]: parent["trashedAt"]})
+        restored = target.restore_trashed_registry(child)
+        self.assertIsNone(restored["parent"])
+        self.assertEqual(target.registry(self.part["id"])["parent"], child["id"])
+        remaining, = target.registry_trash()["entries"]
+        self.assertEqual(remaining["id"], parent["id"])
+
+    def test_purge_folder_keeps_parts_referenced_by_another_kit(self):
+        paths = self.store.collect([self.member(self.kit)])
+        expendable = self.store.save_registry({"kind": "folder", "name": "Без ссылок", "parent": self.folder["id"]})
+        folder = self.store.trash_registry(self.folder)
+        self.assertEqual(self.store.purge_registry_trash(folder), {"id": folder["id"], "deleted": True})
+        self.assertEqual(self.store.registry_trash(), {"entries": []})
+        self.assertEqual({entry["id"] for entry in self.store.registry()["entries"]},
+                         {self.model["id"], self.kit["id"]})
+        self.assertEqual(self.store.registry(self.kit["id"])["members"], self.kit["members"])
+        self.assertEqual(self.store.collect([self.member(self.kit)]), paths)
+        with self.assertRaises(RecordNotFound):
+            self.store.registry(expendable["id"])
+        archived_part = self.store.registry(self.part["id"])
+        with self.assertRaises(WorkspaceConflict):
+            self.store.trash_registry(archived_part)
+        with self.assertRaises(WorkspaceConflict):
+            self.store.move_registry_selection({"entries": [archived_part], "parent": None})
+        with self.assertRaises(WorkspaceConflict):
+            self.store.move_registry_selection({"entries": [self.kit], "parent": folder["id"]})
+        self.store.check()
+
+    def test_empty_trash_keeps_order_model_and_cut_kit_with_its_parts(self):
+        kit = self.store.save_registry({**self.kit, "action": "move", "parent": self.folder["id"]})
+        cut_id = self.add_cut("Обивка")
+        before = self.store.workspace(cut_id, "design")
+        paths = self.store.collect([self.member(kit)])
+        spare = self.store.save_registry({"kind": "folder", "name": "Свободная"})
+        child = self.store.save_registry({"kind": "folder", "name": "Дочерняя", "parent": spare["id"]})
+        self.store.trash_registry(spare)
+        self.store.trash_registry(self.folder)
+        self.store.trash_registry(self.model)
+        self.assertEqual(self.store.empty_registry_trash(), {"deleted": 2, "retained": 4})
+        self.assertEqual(self.store.registry_trash(), {"entries": []})
+        self.assertEqual(self.store.registry(), {"entries": []})
+        self.assertEqual(self.store.empty_registry_trash(), {"deleted": 0})
+        for record in (spare, child):
+            with self.subTest(identifier=record["id"]), self.assertRaises(RecordNotFound):
+                self.store.registry(record["id"])
+        order = self.store.orders(self.order["id"])
+        self.assertEqual(order["modelId"], self.model["id"])
+        self.assertEqual(order["cuts"][0]["members"], [self.member(kit)])
+        self.assertEqual(self.store.workspace(cut_id, "design"), before)
+        self.assertEqual(self.store.collect([self.member(kit)]), paths)
+        self.store.restore_registry(self.store.export_registry())
+        self.assertEqual(self.store.registry(), {"entries": []})
+        self.assertEqual(self.store.collect([self.member(kit)]), paths)
+        self.store.check()
+
+    def test_empty_trash_removes_both_a_kit_and_its_unreferenced_parts(self):
+        self.store.trash_registry(self.folder)
+        self.store.trash_registry(self.kit)
+        self.assertEqual(self.store.empty_registry_trash(), {"deleted": 3})
+        for record in (self.folder, self.part, self.kit):
+            with self.subTest(identifier=record["id"]), self.assertRaises(RecordNotFound):
+                self.store.registry(record["id"])
+
+    def test_purge_drops_sketchup_data_after_its_last_drawing_is_removed(self):
+        model = self.store.stage_model(self.backup_model())
+        drawings = [self.store.save_registry({"kind": "drawing", "name": name, "entities": self.part["entities"],
+                    "model3d": {"id": model, "state": {}}}, allow_3d=True) for name in ("Первый", "Второй")]
+        for drawing in drawings:
+            trashed = self.store.trash_registry(drawing)
+            self.assertEqual(self.store.purge_registry_trash(trashed), {"id": drawing["id"], "deleted": True})
+            if drawing is drawings[0]:
+                self.assertTrue(self.store.model(model))
+        with self.assertRaises(RecordNotFound):
+            self.store.model(model)
+
+    def test_move_registry_selection_is_atomic_and_keeps_nested_structure(self):
+        destination = self.store.save_registry({"kind": "folder", "name": "Назначение"})
+        selection = [self.kit, self.folder, self.part]
+        before = self.store.export_registry()
+        stale = {**self.part, "revision": self.part["revision"] + 1}
+        with self.assertRaises(WorkspaceConflict):
+            self.store.move_registry_selection({"entries": [self.kit, self.folder, stale], "parent": destination["id"]})
+        with self.assertRaisesRegex(ValueError, "внутрь"):
+            self.store.move_registry_selection({"entries": selection, "parent": self.folder["id"]})
+        self.assertEqual(self.store.export_registry(), before)
+        moved = self.store.move_registry_selection({"entries": selection, "parent": destination["id"]})["entries"]
+        self.assertEqual([(entry["id"], entry["parent"], entry["revision"]) for entry in moved],
+                         [(entry["id"], destination["id"], entry["revision"] + 1) for entry in selection[:2]])
+        self.assertEqual(self.store.registry(self.part["id"]), self.part)
+        self.assertEqual(self.store.move_registry_selection({"entries": [*moved, self.part], "parent": destination["id"]}),
+                         {"entries": []})
+
+    def test_trash_registry_selection_checks_all_entries_and_marks_only_roots(self):
+        selection = [self.kit, self.folder, self.part]
+        stale = {**self.part, "revision": self.part["revision"] + 1}
+        with self.assertRaises(WorkspaceConflict):
+            self.store.trash_registry_selection({"entries": [self.kit, self.folder, stale]})
+        self.assertEqual(self.store.registry_trash(), {"entries": []})
+        result = self.store.trash_registry_selection({"entries": selection})["entries"]
+        self.assertEqual([entry["id"] for entry in result], [self.kit["id"], self.folder["id"]])
+        self.assertEqual(len({entry["trashedAt"] for entry in result}), 1)
+        self.assertEqual(self.store.registry(self.part["id"]), self.part)
+        self.assertEqual({entry["id"] for entry in self.store.registry()["entries"]}, {self.model["id"]})
+        with self.assertRaisesRegex(WorkspaceConflict, "корзины"):
+            self.store.trash_registry_selection({"entries": [self.model, self.part]})
+        self.assertEqual({entry["id"] for entry in self.store.registry_trash()["entries"]}, {self.kit["id"], self.folder["id"]})
+
+    def test_copy_registry_selection_clones_active_tree_references_and_saved_kit_layout(self):
+        model = self.store.save_registry({**self.model, "color": "violet"})
+        hidden_part = self.store.save_registry({"kind": "part", "name": "Скрытая деталь", "parent": self.folder["id"],
+                                               "entities": self.part["entities"]})
+        external_part = self.store.save_registry({"kind": "part", "name": "Внешняя деталь", "entities": self.part["entities"]})
+        kit = self.store.save_registry({**self.kit, "members": [self.member(self.part), self.member(hidden_part),
+                                                              self.member(external_part)]})
+        layout = self.save_backup_layout()
+        trashed_part = self.store.trash_registry(hidden_part)
+        self.store.purge_registry_trash(trashed_part)
+        hidden_folder = self.store.save_registry({"kind": "folder", "name": "Скрытая папка", "parent": self.folder["id"]})
+        self.store.save_registry({"kind": "folder", "name": "Скрытый потомок", "parent": hidden_folder["id"]})
+        self.store.trash_registry(hidden_folder)
+        model_id = self.store.stage_model(self.backup_model())
+        drawing = self.store.save_registry({"kind": "drawing", "name": "Модель", "parent": self.folder["id"],
+                                            "entities": self.part["entities"], "model3d": {"id": model_id, "state": {}}},
+                                           allow_3d=True)
+        now = "2026-11-27T10:03:00.000Z"
+        with patch("production_store.utc_now", return_value=now):
+            copied_model, copied_kit = self.store.copy_registry_selection({"entries": [model, kit, self.part], "parent": None})["entries"]
+        self.assertEqual((copied_model["name"], copied_model["model"], copied_model["color"]),
+                         (f"{model['name']} — копия", True, "violet"))
+        self.assertNotEqual(copied_model["id"], model["id"])
+        self.assertEqual((copied_model["createdAt"], copied_model["updatedAt"], copied_model["revision"]), (now, now, 1))
+        entries = self.store.registry()["entries"]
+        folder, = (entry for entry in entries if entry["parent"] == copied_model["id"])
+        children = {entry["kind"]: entry for entry in entries if entry["parent"] == folder["id"]}
+        self.assertEqual(set(children), {"drawing", "part"})
+        copied_part = self.store.registry(children["part"]["id"])
+        copied_drawing = self.store.registry(children["drawing"]["id"])
+        self.assertNotEqual(copied_part["id"], self.part["id"])
+        self.assertEqual(copied_part["paths"], self.part["paths"])
+        self.assertEqual(copied_drawing["model3d"], drawing["model3d"])
+        self.assertEqual(copied_drawing["entities"], drawing["entities"])
+        copied_kit = self.store.registry(copied_kit["id"])
+        self.assertEqual(copied_kit["members"], [self.member(copied_part), self.member(hidden_part), self.member(external_part)])
+        copied_layout = self.store.kit_layout(copied_kit["id"], 1500, 1)
+        self.assertTrue(copied_layout["valid"])
+        self.assertEqual(copied_layout["revision"], 1)
+        self.assertTrue(copied_layout["workspace"]["source"]["filename"].startswith(f"kit-{copied_kit['id']}-"))
+        self.assertEqual([path["points"] for path in copied_layout["workspace"]["paths"]],
+                         [path["points"] for path in layout["workspace"]["paths"]])
+        self.assertEqual(copied_layout["workspace"]["paths"][0]["productName"], copied_model["name"])
+        self.assertEqual(self.store.kit_layout(kit["id"], 1500, 1), layout)
+        target = ProductionStore(self.store.path.with_name("restored-copy.sqlite3"))
+        target.restore_registry(self.store.export_registry())
+        self.assertEqual(target.kit_layout(copied_kit["id"], 1500, 1), copied_layout)
+        target.check()
+
+    def test_copy_registry_selection_is_atomic_and_numbers_destination_collisions(self):
+        selection = [self.model, self.part]
+        before = self.store.export_registry()
+        with self.assertRaises(WorkspaceConflict):
+            self.store.copy_registry_selection({"entries": [self.model, {**self.part, "revision": 0}], "parent": None})
+        with self.assertRaisesRegex(ValueError, "внутрь"):
+            self.store.copy_registry_selection({"entries": selection, "parent": self.folder["id"]})
+        self.assertEqual(self.store.export_registry(), before)
+        copies = [self.store.copy_registry_selection({"entries": selection, "parent": None})["entries"] for _ in range(2)]
+        self.assertEqual([copy[0]["name"] for copy in copies], [f"{self.model['name']} — копия", f"{self.model['name']} — копия 2"])
+        self.assertTrue(all(len(copy) == 1 for copy in copies))
+
+    def test_registry_rename_changes_only_title_revision_and_edit_time(self):
+        folder = self.store.save_registry({**self.folder, "color": "violet"})
+        model = self.store.stage_model(self.backup_model())
+        drawing = self.store.save_registry({"kind": "drawing", "name": "Чертёж", "entities": self.part["entities"],
+                                            "model3d": {"id": model, "state": {}}}, allow_3d=True)
+        layout = self.save_backup_layout()
+        now = "2026-11-27T10:03:00.000Z"
+        with patch("production_store.utc_now", return_value=now):
+            for entry in (folder, self.part, drawing, self.kit):
+                with self.subTest(kind=entry["kind"]):
+                    title = entry["name"] + " новая"
+                    payload = {"id": entry["id"], "revision": entry["revision"], "name": f" {title} "}
+                    renamed = self.store.rename_registry(payload)
+                    self.assertEqual(renamed, {**entry, "name": title, "revision": entry["revision"] + 1, "updatedAt": now})
+                    self.assertEqual(self.store.rename_registry({**payload, "revision": renamed["revision"]}), renamed)
+                    with self.assertRaises(WorkspaceConflict):
+                        self.store.rename_registry(payload)
+        saved_layout = self.store.kit_layout(self.kit["id"], 1500, 1)
+        self.assertTrue(saved_layout["valid"])
+        self.assertEqual(saved_layout["workspace"], layout["workspace"])
+        self.store.trash_registry(self.store.registry(folder["id"]))
+        part = self.store.registry(self.part["id"])
+        with self.assertRaisesRegex(WorkspaceConflict, "корзины"):
+            self.store.rename_registry({**part, "name": "Скрытая деталь"})
 
     def test_registry_tree_and_conflicting_writes(self):
         with self.assertRaises(ValueError):
@@ -321,6 +586,8 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual((stale["saved"], stale["valid"], stale["revision"]), (True, False, 1))
         self.assertFalse(self.store.registry(self.kit["id"])["layouts"][0]["valid"])
         self.assertNotEqual(stale["workspace"]["source"]["filename"], saved["workspace"]["source"]["filename"])
+        copied, = self.store.copy_registry_selection({"entries": [self.kit], "parent": None})["entries"]
+        self.assertEqual(self.store.registry(copied["id"])["layouts"], [])
         self.add_cut("Новый размер детали")
         self.assertFalse(self.order["cuts"][-1]["prepared"])
         self.assertEqual(self.store.workspace(cut_id, "design"), before)
