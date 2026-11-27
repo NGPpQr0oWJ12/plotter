@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 from base64 import b64encode
 from bisect import bisect_right
+from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from email.message import Message
 import gzip
-from hashlib import sha256
+from hashlib import scrypt, sha256
+from hmac import compare_digest, digest as hmac_digest
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -18,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import re
+from secrets import token_bytes, token_hex
 import shutil
 import ssl
 import subprocess
@@ -87,6 +90,8 @@ DEFAULT_FABRIC_WIDTH_MM = 1380
 ROLL_PASS_LENGTH_MM = 2450
 PREVIEW_PAGE_ADD_MM = 0.12
 WORKSPACE_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "Plotter" / "workspace.json"
+REGISTRY_TRASH_PIN_PATH = WORKSPACE_PATH.with_name("registry-trash-pin.hash")
+DESIGNER_PIN_PATH = WORKSPACE_PATH.with_name("designer-pin.hash")
 MAX_JSON = 16 * 1024 * 1024
 DEMO_CUT_CAPACITY = 32
 DEMO_CUT_IDLE_SECONDS = 15 * 60
@@ -122,6 +127,8 @@ MIME = {
     "/plotter-monochrome.css": ("plotter-monochrome.css", "text/css; charset=utf-8"),
 }
 PRODUCTION_ROUTES = {"/api/registry", "/api/orders", "/api/operator-workspace"}
+DESIGNER_ACCESS_SECONDS = 12 * 60 * 60
+DESIGNER_PIN_RETRY_SECONDS = 30
 WORKSPACE_IN_USE = "workspace_in_use"
 LOGGER = logging.getLogger("plotter")
 
@@ -130,6 +137,40 @@ class RequestError(PlotterError):
     def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
         super().__init__(message)
         self.status = status
+
+
+def load_pin_setting(variable, path):
+    setting = os.environ.get(variable)
+    if setting is None and os.name == "nt":
+        try:
+            setting = path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            return True, None
+    if setting is None:
+        return False, None
+    if not re.fullmatch(r"[a-f0-9]{32}:[a-f0-9]{64}", setting):
+        return True, None
+    return True, tuple(bytes.fromhex(value) for value in setting.split(":"))
+
+
+def load_registry_trash_pin():
+    return load_pin_setting("PLOTTER_REGISTRY_TRASH_PIN_HASH", REGISTRY_TRASH_PIN_PATH)[1]
+
+
+def load_designer_pin():
+    return load_pin_setting("PLOTTER_DESIGNER_PIN_HASH", DESIGNER_PIN_PATH)
+
+
+def registry_trash_pin_digest(pin, salt):
+    return scrypt(pin.encode("ascii"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+
+
+def registry_pin_matches(pin, setting):
+    salt, expected = setting
+    return (isinstance(pin, str) and re.fullmatch(r"[0-9]{4}", pin) is not None
+            and compare_digest(registry_trash_pin_digest(pin, salt), expected))
 
 
 def https_origin(value):
@@ -220,7 +261,8 @@ class CompanionWorkspace:
             return json.loads(contents)
         except HTTPError as error:
             with error:
-                if error.code in (400, 404, 409, 413, 415, 422):
+                designer_access_error = endpoint == "/api/designer-access" and error.code in (401, 403, 429, 503)
+                if error.code in (400, 404, 409, 413, 415, 422) or designer_access_error:
                     try:
                         response = json.loads(error.read(4096))
                         message = response.get("error")
@@ -310,7 +352,7 @@ class CutProgress:
                 "events": list(self.events)}
 
 
-def drawing_key(job, filename, width, height, page_add, *, roll=False):
+def drawing_key(job, filename, width, height, page_add, *, roll=False, extended_waste_trim=False):
     # A view or preferences save must not invalidate an unchanged drawing.
     paths = [{"layer": path.get("layer", "0"), "closed": path.get("closed", False),
               "points": [[float(x), float(y)] for x, y in path["points"]]} for path in job["paths"]]
@@ -327,6 +369,8 @@ def drawing_key(job, filename, width, height, page_add, *, roll=False):
     if trims_planned:
         margin = job.get("materialMarginMm") or DEFAULT_WASTE_MARGIN_MM
         document.append(["waste-trim-v1", float(job["materialWidthMm"]), float(margin)])
+        if extended_waste_trim:
+            document.append("extended-waste-trim-v1")
     if roll:
         document.append(ROLL_PASS_LENGTH_MM)
     if "cutContext" in job:
@@ -370,8 +414,10 @@ def describe_section_continuations(plan, job):
 
 def encode_cut_section(page, width, height, page_add):
     local_limit = section_local_limit(width, page_add)
-    plan = build_plan({"paths": translated_page_paths(page, local_limit)}, width, height)
-    return prepare_single_page(plan, tool=CUT_TOOL, width=width, height=height, page_add_mm=page_add)
+    trim_count = len(page.get("wasteTrim", {}).get("paths", []))
+    plan = build_plan({"paths": translated_page_paths(page, local_limit)}, width, height, waste_trim_count=trim_count)
+    return prepare_single_page(plan, tool=CUT_TOOL, width=width, height=height, page_add_mm=page_add,
+                               waste_trim_count=trim_count)
 
 
 def demo_drawing():
@@ -478,6 +524,7 @@ class PlotterState:
         bounds = board.get("workrectMm", config["workrectMm"])
         width, height = bounds["x"], bounds["y"]
         self.demo_mode = demo
+        self.extended_waste_trim = demo or (not central and board.get("extendedWasteTrim") is True)
         self.demo_cut_id = demo_cut_id
         self.central_mode = central
         self.companion_mode = companion
@@ -1035,7 +1082,8 @@ class PlotterState:
         if workspace is not None:
             job, filename = self.workspace_drawing(workspace)
             current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
-                                  self.controller.upload_page_add(), roll=self.roll is not None)
+                                  self.controller.upload_page_add(), roll=self.roll is not None,
+                                  extended_waste_trim=self.extended_waste_trim)
         if current != self.loaded_plan[1]:
             self.loaded_plan = None
 
@@ -1044,8 +1092,10 @@ class PlotterState:
             raise RequestError("Укажите имя текущего чертежа.")
         width, height = self.simulator.width, self.simulator.height
         plan = prepare_cut_plan(job, width, height, PREVIEW_PAGE_ADD_MM if page_add is None else page_add,
-                                roll_pass_length_mm=ROLL_PASS_LENGTH_MM)
-        plan["planId"] = drawing_key(job, filename, width, height, page_add, roll=plan["mode"] == "roll")
+                                roll_pass_length_mm=ROLL_PASS_LENGTH_MM,
+                                extended_waste_trim=self.extended_waste_trim)
+        plan["planId"] = drawing_key(job, filename, width, height, page_add, roll=plan["mode"] == "roll",
+                                    extended_waste_trim=self.extended_waste_trim)
         if self.companion_mode or self.central_mode:
             plan["exportPlanId"] = drawing_key(job, filename, width, height, None, roll=True)
         plan["filename"] = filename
@@ -1247,7 +1297,8 @@ class PlotterState:
                 return {**self.cut_status(), "feedMm": roll.feed_after_mm}
             job, filename = self.current_drawing(data.get("cutId"), for_machine=True)
             page_add = self.controller.upload_page_add()
-            current = drawing_key(job, filename, self.simulator.width, self.simulator.height, page_add, roll=True)
+            current = drawing_key(job, filename, self.simulator.width, self.simulator.height, page_add, roll=True,
+                                  extended_waste_trim=self.extended_waste_trim)
             if current != roll.plan_id:
                 raise RequestError("Сохранённая раскладка изменилась. Подготовьте её заново.", HTTPStatus.CONFLICT)
             if roll.material_advanced:
@@ -1300,7 +1351,8 @@ class PlotterState:
             roll = self.roll
             page_number = roll.page if roll else 1
             current = drawing_key(job, filename, self.simulator.width, self.simulator.height,
-                                  self.controller.upload_page_add(), roll=roll is not None)
+                                  self.controller.upload_page_add(), roll=roll is not None,
+                                  extended_waste_trim=self.extended_waste_trim)
             if (self.loaded_plan != (data.get("jobReceipt"), current, page_number) or data.get("planId") != current
                     or roll and (roll.state != "ready" or roll.plan_id != current)):
                 raise RequestError("Текущая раскладка ещё не загружена на станок.", HTTPStatus.CONFLICT)
@@ -1370,6 +1422,11 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
         self.demo_saves = set()
         self.legacy_demo_selection = None
         self.demo_scopes_closed = False
+        self.registry_trash_pin = load_registry_trash_pin()
+        self.designer_pin_configured, self.designer_pin = load_designer_pin()
+        self.designer_access_key = token_bytes(32)
+        self.designer_pin_lock = Lock()
+        self.designer_pin_failures = deque(maxlen=8)
         self.production = self.demo.production = ProductionStore(Path(workspace_path).with_name("production.sqlite3"))
         self.labels = self.demo.labels = LabelQueue(
             Path(workspace_path).with_name("labels.sqlite3"), self.label_bundle, local_spool=self.local_label_spooling,
@@ -1395,6 +1452,38 @@ class PlotterServer(PlotterState, ThreadingHTTPServer):
             self.hosts.add(urlsplit(self.public_origin).netloc)
             if urlsplit(self.public_origin).port is None:
                 self.hosts.add(urlsplit(self.public_origin).netloc + ":443")
+
+    def designer_access(self, data):
+        action = data.get("action")
+        if action not in ("enter", "check"):
+            raise RequestError("Выберите действие для входа конструктора.")
+        setting = self.designer_pin if self.designer_pin_configured else self.registry_trash_pin
+        if setting is None:
+            message = ("ПИН-код входа конструктора настроен неверно." if self.designer_pin_configured
+                       else "ПИН-код входа конструктора не настроен на сервере.")
+            raise RequestError(message, HTTPStatus.SERVICE_UNAVAILABLE)
+        if action == "enter":
+            pin = data.get("pin")
+            if pin in (None, ""):
+                raise RequestError("Введите ПИН-код конструктора.")
+            with self.designer_pin_lock:
+                now = monotonic()
+                failures = self.designer_pin_failures
+                if len(failures) == failures.maxlen and now - failures[0] < DESIGNER_PIN_RETRY_SECONDS:
+                    raise RequestError("Слишком много попыток входа. Повторите через полминуты.", HTTPStatus.TOO_MANY_REQUESTS)
+                if not registry_pin_matches(pin, setting):
+                    failures.append(now)
+                    raise RequestError("Неверный ПИН-код конструктора.", HTTPStatus.FORBIDDEN)
+            claims = f"{int(now) + DESIGNER_ACCESS_SECONDS}.{token_hex(16)}"
+            signature = hmac_digest(self.designer_access_key, claims.encode("ascii"), "sha256").hex()
+            return {"token": f"{claims}.{signature}"}
+        token = data.get("token")
+        match = isinstance(token, str) and re.fullmatch(r"(([0-9]{1,16})\.[a-f0-9]{32})\.([a-f0-9]{64})", token)
+        if match and int(match[2]) > monotonic():
+            signature = hmac_digest(self.designer_access_key, match[1].encode("ascii"), "sha256").hex()
+            if compare_digest(signature, match[3]):
+                return {"allowed": True}
+        raise RequestError("Сеанс конструктора завершён. Введите ПИН-код снова.", HTTPStatus.UNAUTHORIZED)
 
     @staticmethod
     def demo_scope_idle(scope):
@@ -1886,6 +1975,11 @@ class Handler(BaseHTTPRequestHandler):
             data = self.json_body(4096)
             self.server.app_updates.start(data.get("version"), self.server.verify_update_idle, revision=data.get("revision"))
             self.json_response(self.server.app_updates.status(), HTTPStatus.ACCEPTED)
+        elif path == "/api/designer-access":
+            data = self.json_body(4096)
+            result = (self.server.workspace.production_request(path, data) if self.server.local_companion_ui
+                      else self.server.designer_access(data))
+            self.json_response(result)
         elif path in ("/api/import", "/api/cad/import"):
             name = parse_qs(query, max_num_fields=4).get("filename", [""])[0]
             if not name or len(name) > 255 or re.search(r"[/\\\x00-\x1f]", name):
@@ -2330,7 +2424,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         store = self.server.production
         if path == "/api/registry":
-            if params.get("mode") == "kit-layout":
+            if params.get("mode") == "trash":
+                self.json_response(store.registry_trash())
+            elif params.get("mode") == "kit-layout":
                 try:
                     width, amount = float(params.get("widthMm", "")), int(params.get("quantity", ""))
                 except ValueError as error:
@@ -2377,8 +2473,24 @@ class Handler(BaseHTTPRequestHandler):
         verify = self.server.verify_production_layout
         if path == "/api/registry" and action in ("save", "move"):
             result = store.save_registry(data, allow_3d=self.server.sketchup_design)
-        elif path == "/api/registry" and action == "delete":
-            result = store.delete_registry(data)
+        elif path == "/api/registry" and action == "move-selection":
+            result = store.move_registry_selection(data)
+        elif path == "/api/registry" and action == "copy-selection":
+            result = store.copy_registry_selection(data)
+        elif path == "/api/registry" and action == "rename":
+            result = store.rename_registry(data)
+        elif path == "/api/registry" and action in ("delete", "trash"):
+            result = store.trash_registry(data)
+        elif path == "/api/registry" and action == "trash-selection":
+            result = store.trash_registry_selection(data)
+        elif path == "/api/registry" and action == "restore-trash":
+            result = store.restore_trashed_registry(data)
+        elif path == "/api/registry" and action in ("purge-trash", "empty-trash"):
+            if self.server.registry_trash_pin is None:
+                raise RequestError("ПИН-код корзины не настроен на сервере.", HTTPStatus.SERVICE_UNAVAILABLE)
+            if not registry_pin_matches(data.get("pin"), self.server.registry_trash_pin):
+                raise RequestError("Неверный ПИН-код корзины.", HTTPStatus.FORBIDDEN)
+            result = store.purge_registry_trash(data) if action == "purge-trash" else store.empty_registry_trash()
         elif path == "/api/registry" and action == "collect":
             result = store.collect(data.get("members"))
         elif path == "/api/registry" and action == "save-kit-layout":

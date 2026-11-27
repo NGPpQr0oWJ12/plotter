@@ -11,7 +11,7 @@ const helpers = ["makeDrawingProgressModel", "snapshotRunPlan"].map(name =>
 test("trim is a separate final knife operation in simulation, time and live telemetry", () => {
   runInNewContext(`${scripts("simulation.js")}\n${helpers}
     const regular = {index: 0, points: [[0, 2], [5, 2]], closed: false};
-    const trim = {operation: "wasteTrim", points: [[6, 0], [6, 7]], closed: false};
+    const trim = {operation: "wasteTrim", points: [[6, -30], [6, 1420]], closed: false};
     const page = {number: 1, startX: 0, feedAfterMm: 10, paths: [regular], pathEndIndices: [2],
       wasteTrim: {paths: [trim], pathEndIndices: [4]}};
     const plan = {pages: [page], estimatedWorkSeconds: 20, cutSpeedMmS: 2, travelSpeedMmS: 4, feedSpeedMmS: 10};
@@ -28,6 +28,7 @@ test("trim is a separate final knife operation in simulation, time and live tele
     sim.buildTimeline(plan);
     assert.equal(sim.moves.at(-1).phase, "feed");
     assert.equal(sim.moves.at(-2).from, trim.points[0]);
+    assert.equal(sim.moves.at(-2).to, trim.points[1]);
     assert.equal(sim.moves.at(-2).phase, "cut");
     assert.equal(sim.moves.at(-3).phase, "travel");
     assert.equal(sim.moves.at(-2).short, false);

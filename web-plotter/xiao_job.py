@@ -7,7 +7,7 @@ import re
 import socket
 from time import monotonic, sleep
 
-from machine import Contour, MAX_PATHS, MAX_POINTS, Plan, cut_route
+from machine import Contour, MAX_PATHS, MAX_POINTS, MIN_WASTE_TRIM_Y_MM, Plan, cut_route
 
 
 INITIAL_PACKET = b"hpgl1\x00"
@@ -15,7 +15,7 @@ BLOCK_POINT_LIMIT = 50
 BLOCK_APPEND_THRESHOLD = 912
 ACK_TIMEOUT = 1.5
 COORDINATE_OFFSET_MM = 0.01
-GRAPH_POINT = re.compile(rb"\(([01]),\d+,([\d.]+),([\d.]+),[\d.]+\)")
+GRAPH_POINT = re.compile(rb"\(([01]),\d+,([\d.]+),(-?[\d.]+),[\d.]+\)")
 
 
 class JobEncodingError(ValueError):
@@ -89,7 +89,8 @@ def xiao_coordinates(x: float, y: float) -> tuple[str, str]:
     return f"{x + COORDINATE_OFFSET_MM:.3f}", f"{y + COORDINATE_OFFSET_MM:.3f}"
 
 
-def _point_coordinates(contour: Contour, number: int, width: float, height: float) -> list[tuple[str, str]]:
+def _point_coordinates(contour: Contour, number: int, width: float, height: float,
+                       *, min_y: float) -> list[tuple[str, str]]:
     if type(contour) is not Contour or type(contour.points) is not tuple or type(contour.closed) is not bool:
         raise JobEncodingError(f"Контур {number}: ожидается подготовленная геометрия.")
     if not contour.points:
@@ -100,7 +101,7 @@ def _point_coordinates(contour: Contour, number: int, width: float, height: floa
         if type(point) is not tuple or len(point) != 2:
             raise JobEncodingError(f"Контур {number}: ожидаются две координаты точки.")
         x, y = point
-        if not (_valid_mm(x) and _valid_mm(y) and x <= width and y <= height):
+        if not (_valid_mm(x) and x <= width and type(y) in (int, float) and min_y <= y <= height):
             raise JobEncodingError(f"Контур {number} выходит за рабочее поле.")
         x_text, y_text = xiao_coordinates(x, y)
         if float(x_text) > width or float(y_text) > height:
@@ -116,8 +117,9 @@ def _point_coordinates(contour: Contour, number: int, width: float, height: floa
 
 def encode_job(
     contours: tuple[Contour, ...], *, tool: int, units: str, width: float, height: float,
+    waste_trim_count: int = 0,
 ) -> EncodedJob:
-    """Serialize geometry in a single working coordinate system, without choosing a page advance."""
+    """Serialize one page, permitting the extended Y range for trailing waste trims."""
     if units != "mm":
         raise JobEncodingError("Передайте координаты задания в миллиметрах.")
     if type(tool) is not int or not 1 <= tool <= 8:
@@ -126,12 +128,16 @@ def encode_job(
         raise JobEncodingError("Укажите положительные размеры рабочего поля в миллиметрах.")
     if type(contours) is not tuple or not 1 <= len(contours) <= MAX_PATHS:
         raise JobEncodingError(f"Допустимо от 1 до {MAX_PATHS} контуров.")
+    if type(waste_trim_count) is not int or not 0 <= waste_trim_count <= len(contours):
+        raise JobEncodingError("Некорректное число контуров обрезки отхода.")
 
     chunks = []
     path_end_indices = []
     index = 0
+    part_count = len(contours) - waste_trim_count
     for number, contour in enumerate(contours, start=1):
-        points = _point_coordinates(contour, number, width, height)
+        min_y = MIN_WASTE_TRIM_Y_MM if number > part_count else 0.0
+        points = _point_coordinates(contour, number, width, height, min_y=min_y)
         if index + len(points) > MAX_POINTS:
             raise JobEncodingError(f"В задании более {MAX_POINTS} точек с учётом замыканий.")
         body = bytearray(_counter(index))
@@ -172,6 +178,7 @@ def finalization(*, paged: bool, last_page: bool = True, page_distance_mm: float
 def prepare_single_page(
     plan: Plan, *, tool: int, width: float, height: float, page_add_mm: float,
     page_x_offset_mm: float = 0.0,
+    waste_trim_count: int = 0,
 ) -> tuple[EncodedJob, JobFinalization]:
     """Prepare the first and final X page for the saved one-head, auto-aligned profile."""
     if not isinstance(plan, Plan):
@@ -185,7 +192,8 @@ def prepare_single_page(
     if not _valid_mm(page_x_offset_mm) or page_x_offset_mm != 0:
         raise JobEncodingError("Для прямой отправки нужно нулевое смещение страницы Xiao по X.")
 
-    job = encode_job(plan.contours, tool=tool, units="mm", width=width, height=height)
+    job = encode_job(plan.contours, tool=tool, units="mm", width=width, height=height,
+                     waste_trim_count=waste_trim_count)
     page_end = plan.bounds["maxX"] + page_add_mm
     if page_end > width:
         raise JobEncodingError(f"Контуры с добавкой страницы {page_add_mm:g} мм выходят за поле по X.")

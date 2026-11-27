@@ -10,7 +10,8 @@ import re
 from shapely import LineString, Polygon, STRtree, box, get_parts
 from shapely.errors import GEOSException
 
-from machine import FEED_SPEED, MAX_PATHS, MAX_POINTS, PlotterError, build_plan, cut_route, number
+from machine import (FEED_SPEED, MAX_PATHS, MAX_POINTS, MIN_WASTE_TRIM_Y_MM, PlotterError,
+                     build_plan, cut_route, number)
 from route_optimizer import optimize_page_route
 from xiao_job import COORDINATE_OFFSET_MM, JobEncodingError, prepare_single_page, xiao_coordinates
 
@@ -23,6 +24,7 @@ MAX_UNSPLIT_MARK_MM = 10
 XIAO_GRID_MM = 0.001
 TRIM_CLEARANCE_MM = XIAO_GRID_MM + EPSILON_MM
 DEFAULT_WASTE_MARGIN_MM = 10
+MAX_WASTE_TRIM_Y_MM = 1420.0
 
 
 def section_local_limit(width, page_add):
@@ -252,7 +254,7 @@ def _ambiguous_trim_groups(shapes, contours, outlines, part_numbers, notch_flags
 
 
 def _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, page,
-                        boundary, machine_x, local_limit, fabric_end, final):
+                        boundary, machine_x, local_limit, trim_start, trim_end, final):
     start = page["startX"]
     effective_x = start + machine_x - COORDINATE_OFFSET_MM
     rounding = XIAO_GRID_MM / 2 + EPSILON_MM
@@ -266,9 +268,10 @@ def _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, pa
                 return None, False
             blocked.append((y0 - TRIM_CLEARANCE_MM, y1 + TRIM_CLEARANCE_MM))
     ambiguous = bool(blocked)
-    strip = box(min_x, -TRIM_CLEARANCE_MM, max_x, fabric_end + TRIM_CLEARANCE_MM)
-    raw_line = LineString([(boundary, -TRIM_CLEARANCE_MM), (boundary, fabric_end + TRIM_CLEARANCE_MM)])
-    rounded_line = LineString([(machine_x, -TRIM_CLEARANCE_MM), (machine_x, fabric_end + TRIM_CLEARANCE_MM)])
+    low_y, high_y = trim_start - TRIM_CLEARANCE_MM, trim_end + TRIM_CLEARANCE_MM
+    strip = box(min_x, low_y, max_x, high_y)
+    raw_line = LineString([(boundary, low_y), (boundary, high_y)])
+    rounded_line = LineString([(machine_x, low_y), (machine_x, high_y)])
     contacts = _trim_contact_vertices(page, boundary)
     for index in tree.query(strip):
         shape, contour = shapes[index], contours[index]
@@ -301,16 +304,15 @@ def _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, pa
     return blocked, ambiguous
 
 
-def _trim_free_bands(blocked, fabric_end):
-    start = 0.0
+def _trim_free_bands(blocked, start, end):
     for low, high in sorted(blocked):
-        if low >= fabric_end:
+        if low >= end:
             break
         if low > start:
             yield start, low
         start = max(start, high)
-    if start < fabric_end:
-        yield start, fabric_end
+    if start < end:
+        yield start, end
 
 
 def _inward_trim_y(y, *, upward):
@@ -322,7 +324,7 @@ def _inward_trim_y(y, *, upward):
     return y
 
 
-def _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags):
+def _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags, *, extended_waste_trim):
     pages = result["pages"]
     for page in pages:
         page["wasteTrim"] = {"paths": [], "issues": []}
@@ -344,6 +346,10 @@ def _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, n
     if plan.bounds["maxY"] > fabric + EPSILON_MM:
         skip_all("Контуры выходят за указанную ширину полотна. Отрез отходов пропущен.")
         return
+    trim_start, trim_end = 0.0, fabric_end
+    if (extended_waste_trim and fabric <= MAX_WASTE_TRIM_Y_MM
+            and float(xiao_coordinates(0, MAX_WASTE_TRIM_Y_MM)[1]) <= height):
+        trim_start, trim_end = MIN_WASTE_TRIM_Y_MM, MAX_WASTE_TRIM_Y_MM
 
     contours = plan.contours
     shapes = [Polygon(contour.points) if contour.closed else LineString(contour.points) for contour in contours]
@@ -367,17 +373,17 @@ def _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, n
             continue
         try:
             blocked, ambiguous = _trim_blocked_bands(shapes, tree, contours, outlines, markers, uncertain, page,
-                                                     x, encoded_x, local_limit, fabric_end, final)
+                                                     x, encoded_x, local_limit, trim_start, trim_end, final)
         except GEOSException:
             blocked, ambiguous = None, False
         if blocked is None:
             trim["issues"].append("Граница прохода пересекает незамкнутый или неоднозначный контур.")
             continue
-        if final and any(low <= fabric_end and high >= 0 for low, high in blocked):
+        if final and any(low <= trim_end and high >= trim_start for low, high in blocked):
             trim["issues"].append("После округления Xiao не осталось свободной линии для полного отреза отходов.")
             continue
         paths = []
-        for low, high in _trim_free_bands(blocked, fabric_end):
+        for low, high in _trim_free_bands(blocked, trim_start, trim_end):
             low, high = _inward_trim_y(low, upward=True), _inward_trim_y(high, upward=False)
             if high - low > EPSILON_MM and xiao_coordinates(local_x, low) != xiao_coordinates(local_x, high):
                 paths.append({"points": [[x, low], [x, high]], "closed": False,
@@ -449,7 +455,7 @@ def _calculate_totals(result, plan, job, height):
                   material=material, repairableContourCount=repaired)
 
 
-def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=None):
+def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=None, extended_waste_trim=False):
     """Return ordered contours in global mm, page boundaries and model timing.
 
     Roll pages describe a preview, not a verified hardware transfer sequence.
@@ -526,7 +532,8 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
         page = _page(1, 0.0, last_x, 0.0)
         page["paths"] = [_path(index, contour.layer, contour.points, contour.closed) for index, contour in indexed]
         result["pages"] = [page]
-        _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags)
+        _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags,
+                         extended_waste_trim=extended_waste_trim)
         _prepare_route(result, plan, part_numbers, optimize, notch_flags)
         _calculate_totals(result, plan, job, height)
         return result
@@ -572,7 +579,8 @@ def prepare_cut_plan(job, width, height, page_add_mm, *, roll_pass_length_mm=Non
             pages[page_index]["paths"].append(_path(index, contour.layer, points, closed))
         result["seams"].extend({"x": x, "y": y, "index": index} for x, y in seams)
     result["pages"] = pages
-    _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags)
+    _plan_waste_trim(result, plan, job, width, height, page_add, part_numbers, notch_flags,
+                     extended_waste_trim=extended_waste_trim)
     _prepare_route(result, plan, part_numbers, optimize, notch_flags)
     _calculate_totals(result, plan, job, height)
     return result
